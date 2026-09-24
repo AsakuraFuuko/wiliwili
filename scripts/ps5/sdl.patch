@@ -1,5 +1,5 @@
 diff --git a/src/video/ps5/SDL_ps5osmesa.c b/src/video/ps5/SDL_ps5osmesa.c
-index db0c8a04f..72e40dde0 100644
+index db0c8a04f..3a5a74859 100644
 --- a/src/video/ps5/SDL_ps5osmesa.c
 +++ b/src/video/ps5/SDL_ps5osmesa.c
 @@ -30,11 +30,24 @@
@@ -120,13 +120,63 @@ index db0c8a04f..72e40dde0 100644
      if (!ctx) {
          SDL_SetError("Failed to create context");
          return NULL;
+diff --git a/src/video/ps5/SDL_ps5tilemap.c b/src/video/ps5/SDL_ps5tilemap.c
+index 1cf6ef4e8..31ae985ea 100644
+--- a/src/video/ps5/SDL_ps5tilemap.c
++++ b/src/video/ps5/SDL_ps5tilemap.c
+@@ -25,6 +25,9 @@
+ 
+ #include <immintrin.h>
+ 
++/* Temporary: the linear-blit experiment below checks for a marker file. */
++#include <unistd.h>
++
+ #include "../SDL_sysvideo.h"
+ 
+ #define PS5_TILE_WIDTH  512
 diff --git a/src/video/ps5/SDL_ps5video.c b/src/video/ps5/SDL_ps5video.c
-index 58fbfb505..c3be72eca 100644
+index 58fbfb505..2596dae98 100644
 --- a/src/video/ps5/SDL_ps5video.c
 +++ b/src/video/ps5/SDL_ps5video.c
-@@ -202,11 +202,11 @@ static int PS5_VideoInit(_THIS)
-     memset(&vattr, 0, sizeof(vattr));
+@@ -24,6 +24,8 @@
+ #ifdef SDL_VIDEO_DRIVER_PS5
  
+ #include <errno.h>
++/* Temporary: the memory-type experiment below checks for marker files. */
++#include <unistd.h>
+ 
+ #include "SDL_ps5video.h"
+ #include "SDL_ps5keyboard.h"
+@@ -68,6 +70,7 @@ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
+ {
+     PS5_DeviceData *device_data = (PS5_DeviceData *)_this->driverdata;
+     static uint32_t frame_id = 0;
++    static uint32_t completed = 0;
+     uint8_t idx = frame_id % 2;
+     SDL_Surface *surface;
+     struct kevent evt;
+@@ -101,8 +104,18 @@ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
+         return SDL_SetError("sceVideoOutSubmitFlip: %s", strerror(errno));
+     }
+ 
+-    if (sceKernelWaitEqueue(device_data->evt_queue, &evt, 1, &junk, 0)) {
+-        return SDL_SetError("sceKernelWaitEqueue: %s", strerror(errno));
++    /* Keep one frame in flight: wait for the flip of the *previous* frame.
++       Waiting for the frame that was just submitted returns only after that
++       buffer has been scanned out and released, which costs two vertical blanks
++       on this video-out path and pins the loop at half the panel rate: the
++       interface ran at 30 fps (frame 33.4 ms, of which 29.8 ms was this wait)
++       while the frame itself needed 3.5 ms. Waiting one frame behind keeps the
++       same frame work inside a single blank interval. */
++    while (completed < frame_id) {
++        if (sceKernelWaitEqueue(device_data->evt_queue, &evt, 1, &junk, 0)) {
++            return SDL_SetError("sceKernelWaitEqueue: %s", strerror(errno));
++        }
++        ++completed;
+     }
+     frame_id++;
+ 
+@@ -204,16 +217,30 @@ static int PS5_VideoInit(_THIS)
      sceSystemServiceHideSplashScreen();
      device_data->handle = sceVideoOutOpen(0xff, 0, 0, NULL);
      if (device_data->handle < 0) {
@@ -134,7 +184,30 @@ index 58fbfb505..c3be72eca 100644
 +        return SDL_SetError("sceVideoOutOpen(%d): %s (errno=%d)", device_data->handle, strerror(errno), errno);
      }
 -    device_data->memsize = 0x4000000;
+-    if (sceKernelAllocateMainDirectMemory(device_data->memsize, 0x20000, 3,
 +    device_data->memsize = 2 * PS5_Tilemap_BufferSize(mode.w, mode.h);
-     if (sceKernelAllocateMainDirectMemory(device_data->memsize, 0x20000, 3,
++    /* Temporary experiment: the CPU write bandwidth into the video-out buffer
++     * decides whether a 1080p frame fits in the 16.6 ms budget. Measure the
++     * memory type / mapping flags that the allocation ends up with by flipping
++     * them through marker files in the installation directory. */
++    int memory_type = 3;
++    int map_flags = 0;
++    if (access("/data/homebrew/wiliwili/memtype1", F_OK) == 0) {
++        memory_type = 1;
++    } else if (access("/data/homebrew/wiliwili/memtype2", F_OK) == 0) {
++        memory_type = 2;
++    }
++    if (access("/data/homebrew/wiliwili/mapflags1", F_OK) == 0) {
++        map_flags = 1;
++    }
++    if (sceKernelAllocateMainDirectMemory(device_data->memsize, 0x20000, memory_type,
                                            &device_data->paddr)) {
          return SDL_SetError("sceKernelAllocateMainDirectMemory: %s",
+                             strerror(errno));
+     }
+ 
+-    if (sceKernelMapDirectMemory(&vaddr, device_data->memsize, 0x33, 0,
++    if (sceKernelMapDirectMemory(&vaddr, device_data->memsize, 0x33, map_flags,
+                                  device_data->paddr, 0x20000)) {
+         return SDL_SetError("sceKernelMapDirectMemory: %s", strerror(errno));
+     }

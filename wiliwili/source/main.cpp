@@ -44,7 +44,6 @@ static void wiliwili_terminate_handler() {
 }
 #endif
 
-
 #include <cpr/cpr.h>
 #include <cstdlib>
 #include <cstring>

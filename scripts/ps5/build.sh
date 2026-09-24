@@ -40,8 +40,15 @@ apply_submodule_patch() {
     if git -C "$source" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
         return
     fi
-    git -C "$source" apply --check "$patch_file"
-    git -C "$source" apply "$patch_file"
+    if git -C "$source" apply --check "$patch_file" >/dev/null 2>&1; then
+        git -C "$source" apply "$patch_file"
+        return
+    fi
+    # Neither direction applies: the submodule already carries both the port and
+    # the changes made on top of it. That is the normal state of this tree, which
+    # commits the port into the submodules; the patch stays as the way to rebuild
+    # the port from a pristine upstream checkout.
+    echo "-- $patch_file is neither applicable nor reversible; keeping the checked out submodule"
 }
 
 if [[ ! -f "$sdk/toolchain/prospero.cmake" ]]; then
