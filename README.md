@@ -15,15 +15,12 @@
 </p>
 
 - - -
-
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/xfangfang/wiliwili)](https://github.com/xfangfang/wiliwili/releases)
-![GitHub All Releases](https://img.shields.io/github/downloads/xfangfang/wiliwili/total)
-![GitHub stars](https://img.shields.io/github/stars/xfangfang/wiliwili?style=flat)
 ![GitHub forks](https://img.shields.io/github/forks/xfangfang/wiliwili)
 [![Crowdin](https://badges.crowdin.net/wiliwili/localized.svg)](https://crowdin.com/project/wiliwili)
 ![NS](https://img.shields.io/badge/-Nintendo%20Switch-e4000f?style=flat&logo=Nintendo%20Switch)
 ![PSV](https://img.shields.io/badge/-PSVita-003791?style=flat&logo=PlayStation)
 ![PS4](https://img.shields.io/badge/-PS4-003791?style=flat&logo=PlayStation)
+![PS5](https://img.shields.io/badge/-PS5-003791?style=flat&logo=PlayStation)
 ![MS](https://img.shields.io/badge/-Windows%207+-357ec7?style=flat&logo=Windows)
 ![mac](https://img.shields.io/badge/-macOS%2010.11+-black?style=flat&logo=Apple)
 ![Linux](https://img.shields.io/badge/-Linux-lightgrey?style=flat&logo=Linux&logoColor=white)
@@ -33,7 +30,6 @@
 [![Flathub](https://img.shields.io/flathub/v/cn.xfangfang.wiliwili)](https://flathub.org/apps/cn.xfangfang.wiliwili)
 [![nightly.link](https://img.shields.io/badge/nightly.link-%E6%B5%8B%E8%AF%95%E7%89%88-green)](https://nightly.link/xfangfang/wiliwili/workflows/build.yaml/dev)
 [![layout](https://img.shields.io/badge/wiliwili-自定义布局-yellow)](https://github.com/xfangfang/wiliwili_theme)
-
 <br>
 
 # 特点
@@ -85,6 +81,12 @@ hbmenu 自行选择路径。
 下载 `wiliwili-PS4.pkg` 安装即可：[wiliwili releases](https://github.com/xfangfang/wiliwili/releases)
 
 只支持软解，如果想播放 4k@60 需要在设置中开启低画质解码。
+
+### PS5
+
+通过 `ps5-payload-sdk` 和 `ps5-payload-websrv` 以 payload 方式运行。资源会嵌入 ELF；运行配置、OSMesa 和 CA 证书位于 `/data/homebrew/wiliwili/`。
+
+构建、安装 OSMesa 与 CA 证书并加载的命令见下方“交叉编译 PS5 payload”。
 
 ### PC
 
@@ -343,6 +345,49 @@ docker run --rm -v $(pwd):/src/ xfangfang/wiliwili_ps4_builder:latest \
 ```
 
 </details>
+
+### 交叉编译 PS5 payload
+
+需要安装 [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)、`cmake`、`ninja`、`git`、`curl` 和 `python3`。构建脚本固定使用 `ps5-payload-dev/SDL` 的 `37acbcac579944f196c1620c44b108cf52985749`，并修复 PS5 视频驱动的直接显存分配、OSMesa 默认路径、VideoOut 错误诊断和 OSMesa 退出生命周期。
+
+```shell
+export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+./scripts/ps5/build.sh
+```
+
+产物在 `build-ps5/ps5/`：默认包含 `wiliwili.elf`（全部资源内置）、`osmesa-installer.elf`、`libOSMesa.so.8`、`ca-bundle.crt`、`icon0.png` 和 `homebrew.js`。PS5 上需要先运行 [ps5-payload-websrv](https://github.com/ps5-payload-dev/websrv)；随后从构建主机执行：
+
+```shell
+./scripts/ps5/deploy.sh <PS5_IP>
+```
+
+部署会把应用安装为 `/data/homebrew/wiliwili/wiliwili.elf`，并写入 websrv 自动发现所需的图标和启动扩展。
+
+手柄启动需要在 PS5 上一次性安装 [Homebrew Launcher PKG](https://github.com/ps5-payload-dev/websrv/raw/refs/heads/master/homebrew/IV9999-FAKE00000_00-HOMEBREWLOADER01.pkg)。每次 PS5 重启后重新越狱并加载 `websrv`，从 PS5 主界面打开 Homebrew Launcher；`wiliwili` 会自动出现在列表中，用方向键选择、按 × 启动，按 ○ 返回。首次部署旧版本后重新执行一次 `deploy.sh`，即可生成该列表项。
+
+首次部署完成后，应用文件已保存在 PS5 的 `/data/homebrew/wiliwili/`。PS5 重启并重新加载 `websrv` 后，只需启动应用，不需要再次上传：
+
+```shell
+./scripts/ps5/start.sh <PS5_IP>
+```
+
+该脚本通过 websrv 的 `/hbldr` 以前台 BigApp 启动 `/data/homebrew/wiliwili/wiliwili.elf`。如果应用文件尚未部署，先运行上面的 `deploy.sh`；`/elfldr` 仅用于首次安装 OSMesa、CA bundle、应用文件和手柄启动元数据，不用于日常启动。
+
+如需将资源从 ELF 中拆出，构建时设置 `WILIWILI_PS5_EXTERNAL_RESOURCES=1`。此时构建包会生成 `build-ps5/ps5/resources/`，应用运行时从 `/data/homebrew/wiliwili/resources/` 读取资源。外置资源模式必须使用 FTP 部署，脚本会递归上传整个 `resources/` 目录。
+
+PS5 外置资源部署前，先在 Payload Manager 中加载 `websrv` 和 `zftpd`。zftpd 的 PS5 默认 FTP 端口是 `2120`；如果端口被占用，它会顺延到后续端口，按主机屏幕提示填写实际端口。PS5 重启后这些 payload 需要重新加载。
+
+```shell
+WILIWILI_PS5_EXTERNAL_RESOURCES=1 ./scripts/ps5/build.sh
+WILIWILI_PS5_FTP_PORT=2120 ./scripts/ps5/deploy.sh <PS5_IP>
+```
+
+如果使用非默认构建目录，另设 `WILIWILI_PS5_BUNDLE=/绝对路径/ps5`。
+
+部署脚本会同时安装 CA bundle 到 `/data/homebrew/wiliwili/ca-bundle.crt`，HTTPS 请求保持证书校验；不要通过关闭 TLS 校验来规避证书错误。
+- PS5 的 OSMesa 会注册进程退出清理回调；SDL 退出时只释放函数表，不调用 `dlclose`，让动态库保持映射到进程结束，避免 payload loader 的卸载实现触发退出阶段跳转到失效代码。
+
+默认内置资源模式通过临时 HTTP 服务安装 OSMesa、CA bundle、应用 ELF 和手柄启动元数据，再通过 websrv 的 `/hbldr` 以前台 BigApp 启动 `wiliwili.elf`。外置资源模式改用 FTP 上传所有文件后再通过 `/hbldr` 启动；若 PS5 无法访问自动探测出的主机地址，设置 `WILIWILI_LOCAL_HOST=<主机局域网 IP>` 后重试。应用配置保存在 `/data/homebrew/wiliwili/config/`。
 
 ### GLFW or SDL
 

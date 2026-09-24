@@ -1,0 +1,140 @@
+diff --git a/src/video/ps5/SDL_ps5osmesa.c b/src/video/ps5/SDL_ps5osmesa.c
+index db0c8a04f..72e40dde0 100644
+--- a/src/video/ps5/SDL_ps5osmesa.c
++++ b/src/video/ps5/SDL_ps5osmesa.c
+@@ -30,11 +30,24 @@
+ #define OSMESA_Y_UP 0x11
+ #endif
+ 
+-#define DEFAULT_OSMESA "libOSMesa.so.8"
++#ifndef OSMESA_FORMAT
++#define OSMESA_FORMAT 0x22
++#define OSMESA_DEPTH_BITS 0x30
++#define OSMESA_STENCIL_BITS 0x31
++#define OSMESA_PROFILE 0x33
++#define OSMESA_CORE_PROFILE 0x34
++#define OSMESA_COMPAT_PROFILE 0x35
++#define OSMESA_CONTEXT_MAJOR_VERSION 0x36
++#define OSMESA_CONTEXT_MINOR_VERSION 0x37
++#endif
++
++
++#define DEFAULT_OSMESA "/data/homebrew/wiliwili/lib/libOSMesa.so.8"
+ 
+ struct SDL_GLDriverData
+ {
+     void* (*OSMesaGetProcAddress)(const char*);
++    void* (*OSMesaCreateContextAttribs)(const int*, void*);
+     void* (*OSMesaCreateContext)(GLenum, void*);
+     void (*OSMesaPixelStore)(GLint, GLint);
+     void (*OSMesaPostprocess)(void*, const char*, unsigned);
+@@ -54,7 +67,12 @@ static int OSMesa_LoadLibrary(_THIS, const char *path)
+         return SDL_SetError("OSMesa library already loaded");
+     }
+ 
+-    path = DEFAULT_OSMESA;
++    if (!path || !*path) {
++        path = SDL_getenv("SDL_OSMESA_LIBRARY");
++        if (!path || !*path) {
++            path = DEFAULT_OSMESA;
++        }
++    }
+     handle = _this->gl_config.dll_handle = dlopen(path, RTLD_LAZY);
+     if (!handle) {
+       return SDL_SetError("%s: %s", path, dlerror());
+@@ -73,6 +91,11 @@ static int OSMesa_LoadLibrary(_THIS, const char *path)
+         return SDL_SetError("%s", dlerror());
+     }
+ 
++    _this->gl_data->OSMesaCreateContextAttribs = dlsym(handle, "OSMesaCreateContextAttribs");
++    if (!_this->gl_data->OSMesaCreateContextAttribs) {
++        return SDL_SetError("%s", dlerror());
++    }
++
+     _this->gl_data->OSMesaCreateContext = dlsym(handle, "OSMesaCreateContext");
+     if (!_this->gl_data->OSMesaCreateContext) {
+         return SDL_SetError("%s", dlerror());
+@@ -103,9 +126,19 @@ static int OSMesa_LoadLibrary(_THIS, const char *path)
+         return SDL_SetError("%s", dlerror());
+     }
+ 
+-    // Create a minimal dummy context so glGetString can be invoked without
+-    // having to set a real context.
+-    ctx = _this->gl_data->OSMesaCreateContext(GL_RGBA, NULL);
++    // OSMesaCreateContext defaults to an OpenGL 1.x context.  NanoVG needs
++    // shader support, so request the version selected by SDL explicitly.
++    const int attribs[] = {
++        OSMESA_FORMAT, GL_RGBA,
++        OSMESA_DEPTH_BITS, 24,
++        OSMESA_STENCIL_BITS, 8,
++        OSMESA_PROFILE, _this->gl_config.profile_mask == SDL_GL_CONTEXT_PROFILE_CORE
++            ? OSMESA_CORE_PROFILE : OSMESA_COMPAT_PROFILE,
++        OSMESA_CONTEXT_MAJOR_VERSION, _this->gl_config.major_version < 2 ? 2 : _this->gl_config.major_version,
++        OSMESA_CONTEXT_MINOR_VERSION, _this->gl_config.major_version < 2 ? 1 : _this->gl_config.minor_version,
++        0
++    };
++    ctx = _this->gl_data->OSMesaCreateContextAttribs(attribs, NULL);
+     if (!ctx) {
+         return SDL_SetError("Failed to create dummy context");
+     }
+@@ -119,7 +152,9 @@ static int OSMesa_LoadLibrary(_THIS, const char *path)
+ static void OSMesa_UnloadLibrary(_THIS)
+ {
+     if (_this->gl_config.dll_handle) {
+-        dlclose(_this->gl_config.dll_handle);
++        /* Mesa's atexit callbacks outlive SDL. The payload loader neither
++           finalizes them on dlclose nor honors RTLD_NODELETE, so keep the
++           library mapped until process exit. */
+ 	_this->gl_config.dll_handle = NULL;
+     }
+ 
+@@ -132,7 +167,11 @@ static void OSMesa_UnloadLibrary(_THIS)
+ static void* OSMesa_GetProcAddress(_THIS, const char *proc)
+ {
+     if (_this->gl_data) {
+-        return _this->gl_data->OSMesaGetProcAddress(proc);
++        void* address = _this->gl_data->OSMesaGetProcAddress(proc);
++        if (!address) {
++            address = dlsym(_this->gl_config.dll_handle, proc);
++        }
++        return address;
+     }
+     return NULL;
+ }
+@@ -181,7 +220,17 @@ static SDL_GLContext OSMesa_CreateContext(_THIS, SDL_Window * window)
+         ctx_share = NULL;
+     }
+ 
+-    ctx = _this->gl_data->OSMesaCreateContext(GL_RGBA, ctx_share);
++    const int attribs[] = {
++        OSMESA_FORMAT, GL_RGBA,
++        OSMESA_DEPTH_BITS, 24,
++        OSMESA_STENCIL_BITS, 8,
++        OSMESA_PROFILE, _this->gl_config.profile_mask == SDL_GL_CONTEXT_PROFILE_CORE
++            ? OSMESA_CORE_PROFILE : OSMESA_COMPAT_PROFILE,
++        OSMESA_CONTEXT_MAJOR_VERSION, _this->gl_config.major_version < 2 ? 2 : _this->gl_config.major_version,
++        OSMESA_CONTEXT_MINOR_VERSION, _this->gl_config.major_version < 2 ? 1 : _this->gl_config.minor_version,
++        0
++    };
++    ctx = _this->gl_data->OSMesaCreateContextAttribs(attribs, ctx_share);
+     if (!ctx) {
+         SDL_SetError("Failed to create context");
+         return NULL;
+diff --git a/src/video/ps5/SDL_ps5video.c b/src/video/ps5/SDL_ps5video.c
+index 58fbfb505..c3be72eca 100644
+--- a/src/video/ps5/SDL_ps5video.c
++++ b/src/video/ps5/SDL_ps5video.c
+@@ -202,11 +202,11 @@ static int PS5_VideoInit(_THIS)
+     memset(&vattr, 0, sizeof(vattr));
+ 
+     sceSystemServiceHideSplashScreen();
+     device_data->handle = sceVideoOutOpen(0xff, 0, 0, NULL);
+     if (device_data->handle < 0) {
+-        return SDL_SetError("sceVideoOutOpen: %s", strerror(errno));
++        return SDL_SetError("sceVideoOutOpen(%d): %s (errno=%d)", device_data->handle, strerror(errno), errno);
+     }
+-    device_data->memsize = 0x4000000;
++    device_data->memsize = 2 * PS5_Tilemap_BufferSize(mode.w, mode.h);
+     if (sceKernelAllocateMainDirectMemory(device_data->memsize, 0x20000, 3,
+                                           &device_data->paddr)) {
+         return SDL_SetError("sceKernelAllocateMainDirectMemory: %s",

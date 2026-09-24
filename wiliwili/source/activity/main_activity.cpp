@@ -16,6 +16,13 @@
 
 #include <borealis/core/touch/tap_gesture.hpp>
 
+#if defined(PS5)
+extern "C" void wiliwili_boot_log(const char*);
+#define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
+#else
+#define WILI_BOOT_LOG(message) (void)0
+#endif
+
 #include "activity/main_activity.hpp"
 #include "utils/activity_helper.hpp"
 #include "utils/dialog_helper.hpp"
@@ -26,6 +33,7 @@
 MainActivity::~MainActivity() { brls::Logger::debug("del MainActivity"); }
 
 void MainActivity::onContentAvailable() {
+    WILI_BOOT_LOG("main activity: content available");
     this->registerAction(
         "Settings", brls::ControllerButton::BUTTON_BACK,
         [](brls::View* view) -> bool {
@@ -106,4 +114,5 @@ void MainActivity::onContentAvailable() {
         }
     });
     this->inboxBtn->addGestureRecognizer(new brls::TapGestureRecognizer(this->inboxBtn));
+    WILI_BOOT_LOG("main activity: content ready");
 }

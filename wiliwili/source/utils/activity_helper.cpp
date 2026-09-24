@@ -17,6 +17,13 @@
 #include "fragment/mine_collection_video_list.hpp"
 #include "fragment/inbox_view.hpp"
 #include "utils/activity_helper.hpp"
+
+#if defined(PS5)
+extern "C" void wiliwili_boot_log(const char*);
+#define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
+#else
+#define WILI_BOOT_LOG(message) (void)0
+#endif
 #include "utils/config_helper.hpp"
 
 #include "presenter/video_detail.hpp"

@@ -3,6 +3,7 @@
 //
 
 #include "utils/number_helper.hpp"
+#include <unistd.h>
 #include <pystring.h>
 #include <chrono>
 #include <random>

@@ -207,6 +207,9 @@ void ImageHelper::requestImage() {
     CURL* curl = session.GetCurlHolder()->handle;
     curl_easy_setopt(curl, CURLOPT_SHARE, ImageThreadPool::instance().getShare());
     curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, bilibili::HTTP::DNS_CACHE_TIMEOUT);
+#ifdef PS5
+    curl_easy_setopt(curl, CURLOPT_CAINFO, bilibili::HTTP::CA_BUNDLE);
+#endif
     session.SetTimeout(cpr::Timeout{bilibili::HTTP::TIMEOUT});
     session.SetConnectTimeout(cpr::ConnectTimeout{bilibili::HTTP::CONNECTION_TIMEOUT});
     session.SetVerifySsl(bilibili::HTTP::VERIFY);

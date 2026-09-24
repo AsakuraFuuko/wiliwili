@@ -10,7 +10,46 @@
 */
 
 #include <borealis.hpp>
+#ifdef PS5
+#include <ps5/klog.h>
+extern "C" int sceSystemServiceLoadExec(const char*, const char**);
+/* Single logging entry point for the port. The payload build has no console
+ * output, so its checkpoints go to the kernel log, which the build host reads
+ * back over klogsrv while the application is still running. */
+extern "C" void wiliwili_boot_log(const char* message) {
+    klog_puts(message);
+}
+#define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
+#else
+#define WILI_BOOT_LOG(message) (void)0
+#endif
 
+#ifdef PS5
+#include <exception>
+#include <string>
+/* An uncaught exception would otherwise abort without saying why. */
+static void wiliwili_terminate_handler() {
+    if (auto current = std::current_exception()) {
+        try {
+            std::rethrow_exception(current);
+        } catch (const std::exception& error) {
+            wiliwili_boot_log((std::string("terminate: ") + error.what()).c_str());
+        } catch (...) {
+            wiliwili_boot_log("terminate: unknown exception");
+        }
+    } else {
+        wiliwili_boot_log("terminate: no active exception");
+    }
+    abort();
+}
+#endif
+
+
+#include <cpr/cpr.h>
+#include <cstdlib>
+#include <cstring>
+#include <sys/socket.h>
+#include <netdb.h>
 #include "utils/config_helper.hpp"
 #include "utils/activity_helper.hpp"
 #include "view/mpv_core.hpp"
@@ -20,6 +59,13 @@
 #endif
 
 int main(int argc, char* argv[]) {
+#ifdef PS5
+    klog_puts("wiliwili: main entered");
+#endif
+#ifdef PS5
+    std::set_terminate(wiliwili_terminate_handler);
+#endif
+
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "-d") == 0) {
             brls::Logger::setLogLevel(brls::LogLevel::LOG_DEBUG);
@@ -103,7 +149,10 @@ int main(int argc, char* argv[]) {
     // Cleanup curl and Check whether restart is required
     ProgramConfig::instance().exit(argv);
 
-    // Exit
+    // Return control to the Homebrew Launcher instead of leaving VideoOut owned by this process.
+#ifdef PS5
+    sceSystemServiceLoadExec("exit", nullptr);
+#endif
     return EXIT_SUCCESS;
 }
 

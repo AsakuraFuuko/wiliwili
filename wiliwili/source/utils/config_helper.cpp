@@ -4,7 +4,7 @@
 
 #ifdef IOS
 #include <CoreFoundation/CoreFoundation.h>
-#elif defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
+#elif defined(__APPLE__) || defined(__linux__) || defined(_WIN32) || defined(PS5)
 #include <unistd.h>
 #include <borealis/platforms/desktop/desktop_platform.hpp>
 #if defined(_WIN32)
@@ -24,6 +24,14 @@
 #include "utils/thread_helper.hpp"
 #include "utils/image_helper.hpp"
 #include "utils/config_helper.hpp"
+
+#if defined(PS5)
+extern "C" void wiliwili_boot_log(const char*);
+#define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
+#else
+#define WILI_BOOT_LOG(message) (void)0
+#endif
+
 
 #include "pystring.h"
 #include "utils/crash_helper.hpp"
@@ -122,7 +130,7 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::APP_LANG,
      {"app_lang",
       {
-#if defined(__SWITCH__) || defined(__PSV__) || defined(PS4)
+#if defined(__SWITCH__) || defined(__PSV__) || defined(PS4) || defined(PS5)
           brls::LOCALE_AUTO,
 #endif
           brls::LOCALE_EN_US,
@@ -134,7 +142,7 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
           brls::LOCALE_IT,
       },
       {},
-#if defined(__SWITCH__) || defined(__PSV__) || defined(PS4)
+#if defined(__SWITCH__) || defined(__PSV__) || defined(PS4) || defined(PS5)
       0}},
 #else
       4}},
@@ -172,7 +180,7 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     /// bool
     {SettingItem::APP_SWAP_ABXY, {"app_swap_abxy", {}, {}, 0}},
     {SettingItem::GAMEPAD_VIBRATION, {"gamepad_vibration", {}, {}, 1}},
-#if defined(IOS) || defined(__PSV__)
+#if defined(IOS) || defined(__PSV__) || defined(PS5)
     {SettingItem::HIDE_BOTTOM_BAR, {"hide_bottom_bar", {}, {}, 1}},
 #else
     {SettingItem::HIDE_BOTTOM_BAR, {"hide_bottom_bar", {}, {}, 0}},
@@ -516,7 +524,7 @@ void ProgramConfig::load() {
 
     // 初始化自定义手柄按键映射
 #ifdef IOS
-#elif defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
+#elif defined(__APPLE__) || defined(__linux__) || defined(_WIN32) || defined(PS5)
     brls::DesktopPlatform::GAMEPAD_DB = getConfigDir() + "/gamecontrollerdb.txt";
 #endif
 
@@ -687,7 +695,7 @@ void ProgramConfig::load() {
     if (langData != brls::LOCALE_AUTO && i18nData.count(langData)) {
         brls::Platform::APP_LOCALE_DEFAULT = langData;
     } else {
-#if !defined(__SWITCH__) && !defined(__PSV__) && !defined(PS4)
+#if !defined(__SWITCH__) && !defined(__PSV__) && !defined(PS4) && !defined(PS5)
         brls::Platform::APP_LOCALE_DEFAULT = brls::LOCALE_ZH_HANS;
 #endif
     }
@@ -1075,7 +1083,7 @@ void ProgramConfig::init() {
 
     if (access(brls::FontLoader::USER_ICON_PATH.c_str(), F_OK) == -1) {
         // 自定义字体不存在，使用内置字体
-#if defined(__PSV__) || defined(PS4)
+#if defined(__PSV__) || defined(PS4) || defined(PS5)
         brls::FontLoader::USER_ICON_PATH = BRLS_ASSET("font/keymap_ps.ttf");
 #else
         std::string icon = getSettingItem(SettingItem::KEYMAP, std::string{"xbox"});
@@ -1121,6 +1129,10 @@ void ProgramConfig::init() {
 std::string ProgramConfig::getHomePath() {
 #if defined(__SWITCH__)
     return "/";
+#elif defined(PS5)
+    // Everything the application writes lives next to the installed ELF; the
+    // system partitions are read-only for a payload.
+    return "/data/homebrew/wiliwili";
 #elif defined(_WIN32)
     return std::string(getenv("HOMEPATH"));
 #else
@@ -1133,6 +1145,8 @@ std::string ProgramConfig::getConfigDir() {
     return "/config/wiliwili";
 #elif defined(PS4)
     return "/data/wiliwili";
+#elif defined(PS5)
+    return "/data/homebrew/wiliwili/config";
 #elif defined(__PSV__)
     return "ux0:/data/wiliwili";
 #elif defined(IOS)
@@ -1184,7 +1198,7 @@ void ProgramConfig::exit(char* argv[]) {
     WSACleanup();
 #endif
 #ifdef IOS
-#elif defined(PS4)
+#elif defined(PS4) || defined(PS5)
 #elif __PSV__
 #elif defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
     if (!brls::DesktopPlatform::RESTART_APP) return;

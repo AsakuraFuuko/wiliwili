@@ -1,0 +1,260 @@
+diff --git a/library/CMakeLists.txt b/library/CMakeLists.txt
+index c0c46c47..92b7db12 100644
+--- a/library/CMakeLists.txt
++++ b/library/CMakeLists.txt
+@@ -43,7 +43,7 @@ if (USE_BOOST_FILESYSTEM)
+         list(APPEND BRLS_PLATFORM_OPTION -DUSE_BOOST_FILESYSTEM)
+     endif()
+ elseif ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.1) OR
+-    (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT WIN32) AND NOT PLATFORM_ANDROID AND NOT PLATFORM_PS4)
++    (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT WIN32) AND NOT PLATFORM_ANDROID AND NOT PLATFORM_PS4 AND NOT PLATFORM_PS5)
+     list(APPEND BRLS_PLATFORM_LIBS stdc++fs)
+ endif ()
+ 
+@@ -196,6 +196,14 @@ elseif(PLATFORM_PS4)
+     else ()
+         set(BRLS_PLATFORM_RESOURCES_PATH "\"/app0/resources/\"")
+     endif ()
++elseif(PLATFORM_PS5)
++    find_package(SDL2 CONFIG REQUIRED)
++    list(APPEND BOREALIS_SOURCE
++            ${BOREALIS_PATH}/lib/platforms/sdl
++            ${BOREALIS_PATH}/lib/platforms/desktop)
++    list(APPEND BRLS_PLATFORM_LIBS SDL2::SDL2-static)
++    list(APPEND BRLS_PLATFORM_OPTION -D__SDL2__ -DPS5 -D__PS5__ -DPROSPERO)
++    set(BRLS_PLATFORM_RESOURCES_PATH "\"${BRLS_RESOURCES_DIR}/resources/\"")
+ elseif(PLATFORM_ANDROID)
+     find_library(SDL2 NAMES SDL2 SDL2main)
+     list(APPEND BOREALIS_SOURCE
+diff --git a/library/cmake/commonOption.cmake b/library/cmake/commonOption.cmake
+index 092460ce..0cab46a1 100644
+--- a/library/cmake/commonOption.cmake
++++ b/library/cmake/commonOption.cmake
+@@ -13,6 +13,7 @@ option(PLATFORM_ANDROID "build for Android" OFF)
+ option(PLATFORM_PSV "build for psv" OFF)
+ option(PLATFORM_PS4 "build for ps4" OFF)
+ option(PLATFORM_SWITCH "build for switch" OFF)
++option(PLATFORM_PS5 "build for PS5" OFF)
+ 
+ # OpenGL options
+ option(USE_EGL "Using EGL instead of native GL." OFF)
+diff --git a/library/cmake/toolchain.cmake b/library/cmake/toolchain.cmake
+index 13227946..a0d3e5f0 100644
+--- a/library/cmake/toolchain.cmake
++++ b/library/cmake/toolchain.cmake
+@@ -76,6 +76,42 @@ elseif(PLATFORM_PS4)
+     set(OPENORBIS $ENV{OPENORBIS} CACHE BOOL "OPENORBIS")
+     set(CMAKE_TOOLCHAIN_FILE "${OPENORBIS}/cmake/ps4.cmake" CACHE PATH "toolchain file")
+     add_definitions(-DPS4 -D__PS4__)
++elseif(PLATFORM_PS5)
++    message(STATUS "building for PS5")
++    set(USE_SDL2 ON)
++    set(USE_GLFW OFF)
++    set(USE_LIBROMFS ON CACHE BOOL "using libromfs to bundle resources" FORCE)
++    if (NOT LIBROMFS_PREBUILT_GENERATOR)
++        set(LIBROMFS_PREBUILT_GENERATOR "${BOREALIS_DIR}/libromfs-generator" CACHE FILEPATH "prebuilt libromfs generator")
++    endif ()
++    check_libromfs_generator()
++    if (NOT USE_GL2 AND NOT USE_GL3 AND NOT USE_GLES2 AND NOT USE_GLES3)
++        set(USE_GL2 ON)
++    endif ()
++    if (NOT PS5_PAYLOAD_SDK)
++        if (DEFINED ENV{PS5_PAYLOAD_SDK})
++            set(PS5_PAYLOAD_SDK "$ENV{PS5_PAYLOAD_SDK}" CACHE PATH "PS5 payload SDK path")
++        elseif (EXISTS "/opt/ps5-payload-sdk/toolchain/prospero.cmake")
++            set(PS5_PAYLOAD_SDK "/opt/ps5-payload-sdk" CACHE PATH "PS5 payload SDK path")
++        else ()
++            message(FATAL_ERROR "Please set PS5_PAYLOAD_SDK to your PS5 payload SDK path")
++        endif ()
++    endif ()
++    if (NOT EXISTS "${PS5_PAYLOAD_SDK}/toolchain/prospero.cmake")
++        message(FATAL_ERROR "PS5_PAYLOAD_SDK does not contain toolchain/prospero.cmake")
++    endif ()
++    if (NOT PS5_SDL2_PREFIX)
++        message(FATAL_ERROR "Please set PS5_SDL2_PREFIX to the patched SDL2 prefix built by scripts/ps5/build.sh")
++    endif ()
++    if (NOT EXISTS "${PS5_SDL2_PREFIX}/lib/cmake/SDL2/SDL2Config.cmake")
++        message(FATAL_ERROR "PS5_SDL2_PREFIX does not contain lib/cmake/SDL2/SDL2Config.cmake")
++    endif ()
++    set(CMAKE_TOOLCHAIN_FILE "${PS5_PAYLOAD_SDK}/toolchain/prospero.cmake" CACHE PATH "toolchain file")
++    list(PREPEND CMAKE_PREFIX_PATH "${PS5_SDL2_PREFIX}")
++    list(APPEND CMAKE_PREFIX_PATH "${PS5_PAYLOAD_SDK}/target/user/homebrew")
++    set(SDL2_DIR "${PS5_SDL2_PREFIX}/lib/cmake/SDL2" CACHE PATH "SDL2 package directory" FORCE)
++    add_definitions(-DPS5 -D__PS5__ -DPROSPERO)
++    add_compile_options(-Wno-error=pedantic -Wno-psabi)
+ elseif (PLATFORM_SWITCH)
+     message(STATUS "building for SWITCH")
+     if (NOT DEFINED ENV{DEVKITPRO})
+diff --git a/library/lib/platforms/sdl/sdl_input.cpp b/library/lib/platforms/sdl/sdl_input.cpp
+index 52b31e18..abddc2d2 100644
+--- a/library/lib/platforms/sdl/sdl_input.cpp
++++ b/library/lib/platforms/sdl/sdl_input.cpp
+@@ -404,7 +404,7 @@ SDLInputManager::SDLInputManager(SDL_Window* window)
+ {
+ 
+     int32_t flags = SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER;
+-#ifndef __WINRT__
++#if !defined(__WINRT__) && !defined(PS5_NATIVE_APP)
+     flags |= SDL_INIT_HAPTIC;
+ #endif
+     if (SDL_Init(flags) < 0)
+@@ -602,6 +602,15 @@ void SDLInputManager::runloopStart()
+ 
+ void SDLInputManager::sendRumble(unsigned short controller, unsigned short lowFreqMotor, unsigned short highFreqMotor)
+ {
++#if defined(PS5_NATIVE_APP)
++    // The ps5-opengl SDL2 build has no haptic backend, so rumble requests are
++    // accepted and ignored; the settings toggle still works, it just has no
++    // effect on this platform.
++    (void)controller;
++    (void)lowFreqMotor;
++    (void)highFreqMotor;
++    return;
++#endif
+     if (controllers.size() <= controller) return;
+     SDL_GameController* c = controllers[controller].second;
+ 
+diff --git a/library/lib/platforms/sdl/sdl_platform.cpp b/library/lib/platforms/sdl/sdl_platform.cpp
+index b858d0e0..d7ee4a76 100644
+--- a/library/lib/platforms/sdl/sdl_platform.cpp
++++ b/library/lib/platforms/sdl/sdl_platform.cpp
+@@ -61,6 +61,16 @@ SDLPlatform::SDLPlatform()
+         chdir(base_path);
+         SDL_free(base_path);
+     }
++#endif
++#ifdef PS5
++    VideoContext::FULLSCREEN = true;
++#if defined(PS5_NATIVE_APP)
++    // Installed titles use the ps5-opengl SDL2 bridge, whose driver presents
++    // through EGL/AGC instead of the payload build's VideoOut path.
++    SDL_SetHint(SDL_HINT_VIDEODRIVER, "ps5-g19");
++#else
++    SDL_SetHint(SDL_HINT_VIDEODRIVER, "ps5");
++#endif
+ #endif
+ 
+     // Init sdl
+@@ -107,6 +117,12 @@ SDLPlatform::SDLPlatform()
+ 
+ void SDLPlatform::createWindow(std::string windowTitle, uint32_t windowWidth, uint32_t windowHeight, float windowXPos, float windowYPos)
+ {
++#if defined(PS5_NATIVE_APP)
++    // The ps5-opengl SDL2 bridge owns exactly one fixed 1920x1080 EGL surface,
++    // so the window and the UI geometry share that size.
++    windowWidth  = 1920;
++    windowHeight = 1080;
++#endif
+     this->videoContext = new SDLVideoContext(windowTitle, windowWidth, windowHeight, windowXPos, windowYPos);
+     this->inputManager = new SDLInputManager(this->videoContext->getSDLWindow());
+     this->imeManager   = new SDLImeManager(&this->otherEvent);
+diff --git a/library/lib/platforms/sdl/sdl_video.cpp b/library/lib/platforms/sdl/sdl_video.cpp
+index 61193b39..1dcf3520 100644
+--- a/library/lib/platforms/sdl/sdl_video.cpp
++++ b/library/lib/platforms/sdl/sdl_video.cpp
+@@ -18,6 +18,11 @@
+ #include <borealis/core/logger.hpp>
+ #include <borealis/core/thread.hpp>
+ #include <borealis/platforms/sdl/sdl_video.hpp>
++
++#if defined(PS5_NATIVE_APP)
++#include <cstdio>
++extern "C" void wiliwili_boot_log(const char*);
++#endif
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+@@ -169,14 +174,26 @@ SDLVideoContext::SDLVideoContext(std::string windowTitle, uint32_t windowWidth,
+ 
+     if (SDL_Init(SDL_INIT_VIDEO) < 0)
+     {
+-        Logger::error("sdl: failed to initialize");
+-        return;
++        fatal(std::string("sdl: failed to initialize: ") + SDL_GetError());
+     }
+ 
+     // Create window
++#if defined(PS5_NATIVE_APP)
++    // The ps5-opengl SDL2 bridge owns exactly one fixed-size EGL surface and
++    // rejects resize and high-DPI window flags.
++    Uint32 windowFlags = SDL_WINDOW_SHOWN;
++#else
+     Uint32 windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI;
++#endif
+ #ifdef BOREALIS_USE_OPENGL
+-#ifdef __SWITCH__
++#if defined(PS5_NATIVE_APP)
++    // The ps5-opengl SDL2 bridge accepts exactly one GL 3.3 Core context with
++    // default flags; it presents that context through EGL.
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
++    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
++#elif defined(__SWITCH__)
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+@@ -241,7 +258,10 @@ SDLVideoContext::SDLVideoContext(std::string windowTitle, uint32_t windowWidth,
+ #endif
+     if (VideoContext::FULLSCREEN)
+     {
+-#ifdef __WINRT__
++#if defined(PS5_NATIVE_APP)
++        // The bridge presents fullscreen through EGL and rejects window-level
++        // fullscreen/resize flags.
++#elif defined(__WINRT__)
+         windowFlags |= SDL_WINDOW_FULLSCREEN;
+ #else
+         windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+@@ -268,20 +288,48 @@ SDLVideoContext::SDLVideoContext(std::string windowTitle, uint32_t windowWidth,
+             windowFlags);
+     }
+ 
++#if defined(PS5_NATIVE_APP)
++    if (this->window)
++    {
++        int realisedWidth = 0, realisedHeight = 0;
++        SDL_GetWindowSize(this->window, &realisedWidth, &realisedHeight);
++        char realised[64];
++        std::snprintf(realised, sizeof(realised), "sdl: window %dx%d", realisedWidth, realisedHeight);
++        wiliwili_boot_log(realised);
++    }
++#endif
+     if (!this->window)
+     {
+-        fatal("sdl: failed to create window");
++        fatal(std::string("sdl: failed to create window: ") + SDL_GetError());
+     }
+ #ifdef BOREALIS_USE_OPENGL
++#if defined(PS5_NATIVE_APP)
++    // The ps5-opengl bridge validates the requested attributes at creation
++    // time, so they are set immediately before the context is created.
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
++    wiliwili_boot_log("sdl: requesting 3.3 core context");
++#endif
+     // Configure window
+     SDL_GLContext context = SDL_GL_CreateContext(window);
+-    SDL_GL_MakeCurrent(window, context);
++    if (!context)
++    {
++        fatal(std::string("sdl: failed to create OpenGL context: ") + SDL_GetError());
++    }
++    if (SDL_GL_MakeCurrent(window, context) != 0)
++    {
++        fatal(std::string("sdl: failed to make OpenGL context current: ") + SDL_GetError());
++    }
+ #endif
+     SDL_AddEventWatch(sdlWindowEventWatcher, window);
+ #ifdef BOREALIS_USE_OPENGL
+ #if !defined(__PSV__) && !defined(PS4)
+     // Load OpenGL routines using glad
+-    gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress);
++    if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress))
++    {
++        fatal(std::string("sdl: failed to load OpenGL functions: ") + SDL_GetError());
++    }
+ #endif
+ 
+     Logger::info("sdl: GL Vendor: {}", (const char*)glGetString(GL_VENDOR));

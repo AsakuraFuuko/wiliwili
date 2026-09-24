@@ -6,6 +6,13 @@
 #include <borealis/core/thread.hpp>
 
 #include "fragment/home_recommends.hpp"
+
+#if defined(PS5)
+extern "C" void wiliwili_boot_log(const char*);
+#define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
+#else
+#define WILI_BOOT_LOG(message) (void)0
+#endif
 #include "view/recycling_grid.hpp"
 #include "view/video_card.hpp"
 #include "utils/number_helper.hpp"
@@ -100,7 +107,9 @@ HomeRecommends::HomeRecommends() {
         this->recyclingGrid->showSkeleton();
         this->requestData(true);
     });
+    WILI_BOOT_LOG("recommends: requesting data");
     this->requestData();
+    WILI_BOOT_LOG("recommends: request issued");
 }
 
 void HomeRecommends::onCreate() {
@@ -113,6 +122,8 @@ void HomeRecommends::onCreate() {
 }
 
 void HomeRecommends::onRecommendVideoList(const bilibili::RecommendVideoListResultWrapper& originalResult) {
+    WILI_BOOT_LOG("recommends: callback enter");
+    WILI_BOOT_LOG("recommends: callback filtering");
     // 过滤up主
     bilibili::RecommendVideoListResultWrapper result;
     result.requestIndex = originalResult.requestIndex;

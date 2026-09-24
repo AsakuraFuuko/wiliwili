@@ -4,9 +4,10 @@ set(BOREALIS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/library/borealis)
 set(BOREALIS_LIBRARY ${BOREALIS_DIR}/library)
 
 # Include Platform common options
-# wiliwili only support PLATFORM_DESKTOP and PLATFORM_SWITCH
+# wiliwili supports PLATFORM_DESKTOP, PLATFORM_SWITCH, PLATFORM_PS4 and PLATFORM_PS5
 # example: cmake -B build -DPLATFORM_DESKTOP=ON
 include(${BOREALIS_LIBRARY}/cmake/commonOption.cmake)
+cmake_dependent_option(PS5_EXTERNAL_RESOURCES "Load PS5 resources from the filesystem" OFF "PLATFORM_PS5" OFF)
 
 # NintendoSwitch
 cmake_dependent_option(BUILTIN_NSP "Built in NSP forwarder" OFF "PLATFORM_SWITCH" OFF)
@@ -72,6 +73,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/extra.cmake)
 
 # toolchain
 include(${BOREALIS_LIBRARY}/cmake/toolchain.cmake)
+
+if (PLATFORM_PS5 AND PS5_EXTERNAL_RESOURCES)
+    # The PS5 toolchain defaults to libromfs; external-resource builds opt out
+    # after the toolchain has initialized so all resource loaders use the path.
+    set(USE_LIBROMFS OFF CACHE BOOL "using libromfs to bundle resources" FORCE)
+endif ()
 
 # Git Info
 git_info(GIT_TAG_VERSION GIT_TAG_SHORT)
@@ -142,6 +149,11 @@ else ()
     message(STATUS "Found libmpv: ${MPV_VERSION} ${MPV_INCLUDE_DIRS} ${MPV_STATIC_LIBRARIES}")
     list(APPEND APP_PLATFORM_INCLUDE ${MPV_INCLUDE_DIRS})
     list(APPEND APP_PLATFORM_LIB ${MPV_STATIC_LIBRARIES})
+    # mpv's pkg-config metadata names the SDK SDL2 archive. On PS5 it must not
+    # preempt the patched SDL2::SDL2-static target added by Borealis.
+    if (PLATFORM_PS5)
+        list(REMOVE_ITEM APP_PLATFORM_LIB SDL2)
+    endif ()
     link_directories(${MPV_LIBRARY_DIRS})
     if (PLATFORM_IOS)
         list(APPEND APP_PLATFORM_LIB "-framework CoreMedia -framework CoreText -framework VideoToolbox")
@@ -179,6 +191,8 @@ if (CUSTOM_RESOURCES_DIR)
     set(BRLS_RESOURCES_DIR ${CUSTOM_RESOURCES_DIR})
 elseif (INSTALL)
     set(BRLS_RESOURCES_DIR ${CMAKE_INSTALL_PREFIX}/share/wiliwili)
+elseif (PLATFORM_PS5)
+    set(BRLS_RESOURCES_DIR "/data/homebrew/wiliwili")
 else ()
     set(BRLS_RESOURCES_DIR ".")
 endif ()
@@ -300,6 +314,13 @@ elseif (PLATFORM_PS4)
             COMMAND "${CMAKE_COMMAND}" -E rename ${CMAKE_BINARY_DIR}/ps4/resources/i18n/ja-RYU ${CMAKE_BINARY_DIR}/ps4/resources/i18n/RYU
     )
     add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}.data)
+elseif (PLATFORM_PS5)
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "wiliwili.elf")
+    add_custom_target(${PROJECT_NAME}.ps5
+        DEPENDS ${PROJECT_NAME}
+        COMMAND "${CMAKE_COMMAND}" -E make_directory ${CMAKE_BINARY_DIR}/ps5
+        COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:${PROJECT_NAME}> ${CMAKE_BINARY_DIR}/ps5/wiliwili.elf
+    )
 elseif (PLATFORM_SWITCH)
     set(BUILD_FONT_DIR ${CMAKE_BINARY_DIR}/resources/font)
     if (GIT_TAG_VERSION)

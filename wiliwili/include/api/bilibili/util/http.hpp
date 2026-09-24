@@ -13,6 +13,13 @@
 #include "utils/number_helper.hpp"
 #include <pystring.h>
 
+#if defined(PS5)
+extern "C" void wiliwili_boot_log(const char *message);
+#define WILI_HTTP_TRACE(message) wiliwili_boot_log(message)
+#else
+#define WILI_HTTP_TRACE(message) (void)0
+#endif
+
 namespace bilibili {
 
 using Cookies = std::map<std::string, std::string>;
@@ -77,6 +84,10 @@ public:
     static inline cpr::VerifySsl VERIFY;
     static inline std::string PROTOCOL = "https:";
     static inline CurlSharedObject CURL_SHARE;
+#ifdef PS5
+    // The bundle is installed next to the application by scripts/ps5/deploy.sh.
+    static constexpr char CA_BUNDLE[] = "/data/homebrew/wiliwili/ca-bundle.crt";
+#endif
 
     static std::string getEncodedCookie(const cpr::Cookies& cookies);
 
@@ -85,6 +96,9 @@ public:
         CURL* curl = session->GetCurlHolder()->handle;
         curl_easy_setopt(curl, CURLOPT_SHARE, HTTP::CURL_SHARE.getShare());
         curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, HTTP::DNS_CACHE_TIMEOUT);
+#ifdef PS5
+        curl_easy_setopt(curl, CURLOPT_CAINFO, HTTP::CA_BUNDLE);
+#endif
         session->SetTimeout(cpr::Timeout{bilibili::HTTP::TIMEOUT});
         session->SetConnectTimeout(cpr::ConnectTimeout{bilibili::HTTP::CONNECTION_TIMEOUT});
         session->SetHeader(bilibili::HTTP::HEADERS);
@@ -115,6 +129,7 @@ public:
             });
     }
 
+
     static void _cpr_get(const std::string& url, const cpr::Parameters& parameters = {},
                           const std::function<void(const cpr::Response&)>& callback = nullptr,
                           const ErrorCallback& error                                = nullptr) {
@@ -124,6 +139,12 @@ public:
 
         session->GetCallback(
             [callback, error](const cpr::Response& r) {
+                {
+                    char message[96];
+                    std::snprintf(message, sizeof(message), "http: code=%ld err=%d",
+                                  (long)r.status_code, (int)r.error.code);
+                    WILI_HTTP_TRACE(message);
+                }
                 if (r.error) {
                     ERROR_MSG(r.error.message, -1);
                     return;
@@ -140,7 +161,9 @@ public:
     static int parseJson(const cpr::Response& r, const std::function<void(ReturnType)>& callback = nullptr,
                           const ErrorCallback& error = nullptr) {
         try {
+            WILI_HTTP_TRACE("http: parsing json");
             nlohmann::json res = nlohmann::json::parse(r.text);
+            WILI_HTTP_TRACE("http: json parsed");
             int code           = res.at("code").get<int>();
             if (code == 0) {
                 if (res.contains("data") && (res.at("data").is_object() || res.at("data").is_array())) {

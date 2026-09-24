@@ -37,6 +37,8 @@ std::string APPVersion::getPlatform() {
     return "iOS";
 #elif defined(__APPLE__)
     return "macOS";
+#elif defined(PS5)
+    return "PS5";
 #elif defined(PS4)
     return "PS4";
 #elif defined(__linux__)
@@ -137,6 +139,9 @@ void APPVersion::checkUpdate(int delay, bool showUpToDateDialog) {
                     brls::Logger::error("check update failed: {} {} {}", r.status_code, r.text.c_str(), e.what());
                 }
             },
+#ifdef PS5
+            cpr::Ssl(cpr::ssl::CaInfo{cpr::fs::path{bilibili::HTTP::CA_BUNDLE}}),
+#endif
             bilibili::HTTP::VERIFY, bilibili::HTTP::PROXIES, cpr::Url{url}, cpr::Timeout{10000});
     });
 }
