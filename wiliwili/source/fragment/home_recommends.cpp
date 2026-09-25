@@ -108,8 +108,12 @@ HomeRecommends::HomeRecommends() {
         this->requestData(true);
     });
     WILI_BOOT_LOG("recommends: requesting data");
+#ifdef WILIWILI_SKIP_HOME_REQUEST
+    WILI_BOOT_LOG("recommends: request skipped (bisect)");
+#else
     this->requestData();
     WILI_BOOT_LOG("recommends: request issued");
+#endif
 }
 
 void HomeRecommends::onCreate() {

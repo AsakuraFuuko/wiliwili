@@ -1,0 +1,14 @@
+/*
+ * wiliwili PS5 native application - dynamic symbol policy.
+ * Copyright (C) 2026 wiliwili contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * The application links the payload libc, libc++, ffmpeg, mpv and Mesa
+ * statically, so every one of their global symbols would otherwise land in
+ * .dynsym. The PS5 module converter only publishes imports: application
+ * exports are not supported, therefore everything stays local.
+ */
+{
+    local:
+        *;
+};

@@ -80,6 +80,20 @@ public:
     inline static const std::string note_raw_ext    = "@256h" IMAGE_EXT;
     static constexpr float note_small               = 0.5f;
 #endif
+#elif defined(PS5_NATIVE_APP)
+    /* Texture uploads on the native GL stack cost roughly 90 MB/s, so a grid
+     * cover is fetched at the size the card actually shows (the 1080p layout
+     * uses ~340x190 cards) instead of the desktop-sized variant: four times
+     * less data per upload and no visible loss. */
+    inline static const std::string h_ext           = "@336w_189h_1c" IMAGE_EXT;
+    inline static const std::string v_ext           = "@156w_210h_1c" IMAGE_EXT;
+    inline static const std::string face_ext        = "@48w_48h_1c_1s" IMAGE_EXT;
+    inline static const std::string face_large_ext  = "@80w_80h_1c_1s" IMAGE_EXT;
+    inline static const std::string emoji_size1_ext = "@24w_24h" IMAGE_EXT;
+    inline static const std::string emoji_size2_ext = "@36w_36h" IMAGE_EXT;
+    inline static const std::string note_ext        = "@270w_270h_85q_!note-comment-multiple" IMAGE_EXT;
+    inline static const std::string note_raw_ext    = "@!web-comment-note" IMAGE_EXT;
+    static constexpr float note_small               = 2.5f;
 #else
     inline static const std::string h_ext           = "@672w_378h_1c" IMAGE_EXT;
     inline static const std::string v_ext           = "@312w_420h_1c" IMAGE_EXT;
@@ -103,6 +117,12 @@ protected:
      * 图片请求结束时调用
      */
     void clean();
+
+public:
+    /* Uploads at most one queued texture. Called once per frame by the render
+     * loop: doing it inline from the network callback blocks the loop for the
+     * length of the whole queue and freezes the interface. */
+    static void drainUploads();
 
 private:
     bool isCancel{};

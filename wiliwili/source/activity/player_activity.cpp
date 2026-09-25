@@ -3,6 +3,13 @@
 //
 
 #include <utility>
+
+#if defined(PS5) || defined(PS5_NATIVE_APP)
+extern "C" void wiliwili_boot_log(const char*);
+#define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
+#else
+#define WILI_BOOT_LOG(message) (void)0
+#endif
 #include <cstdlib>
 #include <fmt/format.h>
 #include <borealis/views/dialog.hpp>

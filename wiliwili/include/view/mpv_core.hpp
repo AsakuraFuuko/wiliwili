@@ -342,6 +342,9 @@ public:
     std::string hwCurrent;
     std::string filepath;
     std::string currentShaderProfile;                      // 当前着色器脚本名
+    /// native GL 路线的颜色交换着色器路径（空 = 该路线不需要）；见 mpv_core.cpp 的 init()
+    static std::string colorSwapShaderPath();
+
     std::string currentShader;                             // 当前着色器脚本
     std::vector<std::vector<std::string>> currentSetting;  // 当前着色器脚本附加的mpv配置
 

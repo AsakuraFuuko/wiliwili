@@ -12,8 +12,9 @@
 #include "bilibili/util/wbi.hpp"
 #include "utils/number_helper.hpp"
 #include <pystring.h>
+#include <thread>
 
-#if defined(PS5)
+#if defined(PS5_NATIVE_APP)
 extern "C" void wiliwili_boot_log(const char *message);
 #define WILI_HTTP_TRACE(message) wiliwili_boot_log(message)
 #else
@@ -85,8 +86,12 @@ public:
     static inline std::string PROTOCOL = "https:";
     static inline CurlSharedObject CURL_SHARE;
 #ifdef PS5
-    // The bundle is installed next to the application by scripts/ps5/deploy.sh.
+#if defined(PS5_NATIVE_APP)
+    // Installed titles read their read-only payload from the application image.
+    static constexpr char CA_BUNDLE[] = "/app0/assets/ca-bundle.crt";
+#else
     static constexpr char CA_BUNDLE[] = "/data/homebrew/wiliwili/ca-bundle.crt";
+#endif
 #endif
 
     static std::string getEncodedCookie(const cpr::Cookies& cookies);
@@ -104,6 +109,31 @@ public:
         session->SetHeader(bilibili::HTTP::HEADERS);
         session->SetProxies(bilibili::HTTP::PROXIES);
         session->SetVerifySsl(bilibili::HTTP::VERIFY);
+#if defined(PS5_NATIVE_APP)
+        /* curl's own trace is the only way to see where a request dies inside
+         * the platform runtime: the request runs on a worker thread and the
+         * process is gone before anything else can report. */
+        // session->SetVerbose(cpr::Verbose{true});  // noisy: re-enable when tracing TLS
+        session->SetDebugCallback(cpr::DebugCallback{
+            [](cpr::DebugCallback::InfoType type, std::string data, intptr_t) {
+                if (type != cpr::DebugCallback::InfoType::TEXT)
+                    return;
+                for (size_t at = 0; at < data.size();) {
+                    size_t end = data.find('\n', at);
+                    if (end == std::string::npos)
+                        end = data.size();
+                    if (end > at) {
+                        char line[200];
+                        int length = snprintf(line, sizeof(line), "curl: %.*s",
+                                              (int)std::min<size_t>(end - at, 160),
+                                              data.c_str() + at);
+                        (void)length;
+                        wiliwili_boot_log(line);
+                    }
+                    at = end + 1;
+                }
+            }});
+#endif
         return session;
     }
 
@@ -130,6 +160,28 @@ public:
     }
 
 
+    /**
+     * Run one request on a dedicated thread using curl's easy interface.
+     *
+     * cpr's callback API drives curl's multi interface from its own pool. That
+     * path faults inside the platform runtime for an installed title, so the
+     * request is performed with the blocking interface instead and the
+     * callback still runs off the calling thread, matching cpr's contract.
+     */
+    static void runAsync(const std::shared_ptr<cpr::Session>& session,
+                         const std::function<void(const cpr::Response&)>& callback) {
+        try {
+            std::thread([session, callback]() {
+                WILI_HTTP_TRACE("http: request start");
+                cpr::Response response = session->Get();
+                WILI_HTTP_TRACE("http: request done");
+                callback(response);
+                WILI_HTTP_TRACE("http: callback done");
+            }).detach();
+        } catch (const std::exception& failure) {
+        }
+    }
+
     static void _cpr_get(const std::string& url, const cpr::Parameters& parameters = {},
                           const std::function<void(const cpr::Response&)>& callback = nullptr,
                           const ErrorCallback& error                                = nullptr) {
@@ -137,7 +189,8 @@ public:
         session->SetUrl(cpr::Url{parseLink(url)});
         session->SetParameters(parameters);
 
-        session->GetCallback(
+        runAsync(
+            session,
             [callback, error](const cpr::Response& r) {
                 {
                     char message[96];

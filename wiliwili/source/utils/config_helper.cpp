@@ -27,6 +27,12 @@
 
 #if defined(PS5)
 extern "C" void wiliwili_boot_log(const char*);
+#if defined(PS5_NATIVE_APP)
+extern "C" int sceNetCtlInit(void);
+extern "C" int sceNetInit(void);
+extern "C" int sceNetPoolCreate(const char*, int, int);
+extern "C" int sceSslInit(size_t);
+#endif
 #define WILI_BOOT_LOG(message) wiliwili_boot_log(message)
 #else
 #define WILI_BOOT_LOG(message) (void)0
@@ -1049,6 +1055,21 @@ void ProgramConfig::init() {
     mbedtls_platform_set_calloc_free(sce_calloc, sce_free);
     curl_global_init_mem(CURL_GLOBAL_DEFAULT, sce_malloc, sce_free, sce_realloc, sce_strdup, sce_calloc);
 #else
+#if defined(PS5_NATIVE_APP)
+    {
+        // A title brings the network stack up itself before libcurl uses it
+        // (ps5-payload-sdk samples/http2_get).
+        (void)sceNetCtlInit();
+        int netError = sceNetInit();
+        int poolId   = sceNetPoolCreate("wiliwili", 32 * 1024, 0);
+        int sslId    = sceSslInit(256 * 1024);
+        char message[96];
+        std::snprintf(message, sizeof(message),
+                      "wiliwili: net init=%#x pool=%d ssl=%d", netError, poolId, sslId);
+        wiliwili_boot_log(message);
+        WILI_BOOT_LOG(message);
+    }
+#endif
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
     cpr::async::startup(THREAD_POOL_MIN_THREAD_NUM, THREAD_POOL_MAX_THREAD_NUM, std::chrono::milliseconds(5000));
@@ -1076,6 +1097,9 @@ void ProgramConfig::init() {
     ps4_mpv_dump_shaders            = 0;
     // 在加载第一帧之后隐藏启动画面
     brls::sync([]() { sceSystemServiceHideSplashScreen(); });
+#elif defined(PS5_NATIVE_APP)
+    /* A title sandbox has no meaningful working directory; querying it is not
+     * part of the supported contract. */
 #else
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) != nullptr) {
@@ -1142,9 +1166,12 @@ std::string ProgramConfig::getHomePath() {
 #if defined(__SWITCH__)
     return "/";
 #elif defined(PS5)
-    // Everything the application writes lives next to the installed ELF; the
-    // system partitions are read-only for a payload.
+#if defined(PS5_NATIVE_APP)
+    // Installed titles keep writable state in the download-data sandbox.
+    return "/download0/wiliwili";
+#else
     return "/data/homebrew/wiliwili";
+#endif
 #elif defined(_WIN32)
     return std::string(getenv("HOMEPATH"));
 #else
@@ -1158,7 +1185,11 @@ std::string ProgramConfig::getConfigDir() {
 #elif defined(PS4)
     return "/data/wiliwili";
 #elif defined(PS5)
+#if defined(PS5_NATIVE_APP)
+    return "/download0/wiliwili/config";
+#else
     return "/data/homebrew/wiliwili/config";
+#endif
 #elif defined(__PSV__)
     return "ux0:/data/wiliwili";
 #elif defined(IOS)

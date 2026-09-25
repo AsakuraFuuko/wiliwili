@@ -65,8 +65,18 @@ const char seed[64] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B
                        'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '\0', '\0'};
 
 std::string getRandom(int length, int rangeStart, int rangeEnd) {
+#if defined(PS5_NATIVE_APP)
+    /* libc++'s std::random_device opens /dev/urandom, which the title sandbox
+     * does not expose. Device identifiers only need a varied seed here, so it
+     * comes from the clock, the process id and a per-call counter instead. */
+    static unsigned counter = 0;
+    std::mt19937 gen(static_cast<std::mt19937::result_type>(time(nullptr)) ^
+                     (static_cast<std::mt19937::result_type>(getpid()) << 16) ^
+                     (++counter * 2654435761u));
+#else
     std::random_device rd;
     std::mt19937 gen(rd());
+#endif
     std::uniform_int_distribution<> dis(rangeStart, rangeEnd);
     std::string text;
     for (int n = 0; n < length; ++n) {

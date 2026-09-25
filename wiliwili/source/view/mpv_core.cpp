@@ -1,3 +1,6 @@
+#include <fstream>
+
+extern "C" void wiliwili_boot_log(const char *);
 //
 // Created by fang on 2022/8/12.
 //
@@ -173,10 +176,27 @@ static inline void check_error(int status) {
 }
 
 #if defined(BOREALIS_USE_OPENGL) && !defined(MPV_SW_RENDER)
+#if defined(PS5_NATIVE_APP) || defined(PS5)
+/* 诊断：mpv 通过这个回调取 GL 入口；本机 GL bridge（ps5-opengl）不一定导出全部
+ * 符号，缺失时回调返回 NULL，mpv 一调用就会跳到地址 0（SIGSEGV, rip≈0）。 */
+static void *wiliwili_logged_gl_proc(void *handle, const char *name) {
+    void *pointer = (void *)SDL_GL_GetProcAddress(name);
+    if (pointer == nullptr) {
+        std::string line = std::string("gl: MISSING ") + name;
+        wiliwili_boot_log(line.c_str());
+    }
+    return pointer;
+}
+#endif
+
 static void *get_proc_address(void *unused, const char *name) {
 #ifdef __SDL2__
     SDL_GL_GetCurrentContext();
+#if defined(PS5_NATIVE_APP) || defined(PS5)
+    return wiliwili_logged_gl_proc(unused, name);
+#else
     return (void *)SDL_GL_GetProcAddress(name);
+#endif
 #else
     glfwGetCurrentContext();
     return (void *)glfwGetProcAddress(name);
@@ -260,6 +280,64 @@ void initMpvProc(Module dll, fnGetProcAddress pGetProcAddress) {
     mpvRenderContextReportSwap = (mpvRenderContextReportSwapFunc)pGetProcAddress(dll, "mpv_render_context_report_swap");
     mpvClientApiVersion        = (mpvClientApiVersionFunc)pGetProcAddress(dll, "mpv_client_api_version");
 }
+void initMpvProc(Module dll, fnGetProcAddress pGetProcAddress) {
+    mpvSetOptionString     = (mpvSetOptionStringFunc)pGetProcAddress(dll, "mpv_set_option_string");
+    mpvObserveProperty     = (mpvObservePropertyFunc)pGetProcAddress(dll, "mpv_observe_property");
+    mpvCreate              = (mpvCreateFunc)pGetProcAddress(dll, "mpv_create");
+    mpvInitialize          = (mpvInitializeFunc)pGetProcAddress(dll, "mpv_initialize");
+    mpvTerminateDestroy    = (mpvTerminateDestroyFunc)pGetProcAddress(dll, "mpv_terminate_destroy");
+    mpvSetWakeupCallback   = (mpvSetWakeupCallbackFunc)pGetProcAddress(dll, "mpv_set_wakeup_callback");
+    mpvCommandString       = (mpvCommandStringFunc)pGetProcAddress(dll, "mpv_command_string");
+    mpvErrorString         = (mpvErrorStringFunc)pGetProcAddress(dll, "mpv_error_string");
+    mpvWaitEvent           = (mpvWaitEventFunc)pGetProcAddress(dll, "mpv_wait_event");
+    mpvGetProperty         = (mpvGetPropertyFunc)pGetProcAddress(dll, "mpv_get_property");
+    mpvCommandAsync        = (mpvCommandAsyncFunc)pGetProcAddress(dll, "mpv_command_async");
+    mpvGetPropertyString   = (mpvGetPropertyStringFunc)pGetProcAddress(dll, "mpv_get_property_string");
+    mpvFreeNodeContents    = (mpvFreeNodeContentsFunc)pGetProcAddress(dll, "mpv_free_node_contents");
+    mpvSetOption           = (mpvSetOptionFunc)pGetProcAddress(dll, "mpv_set_option");
+    mpvFree                = (mpvFreeFunc)pGetProcAddress(dll, "mpv_free");
+    mpvRenderContextCreate = (mpvRenderContextCreateFunc)pGetProcAddress(dll, "mpv_render_context_create");
+    mpvRenderContextUpdate = (mpvRenderContextUpdateFunc)pGetProcAddress(dll, "mpv_render_context_update");
+    mpvRenderContextFree   = (mpvRenderContextFreeFunc)pGetProcAddress(dll, "mpv_render_context_free");
+    mpvRenderContextRender = (mpvRenderContextRenderFunc)pGetProcAddress(dll, "mpv_render_context_render");
+    mpvRenderContextSetUpdateCallback =
+        (mpvRenderContextSetUpdateCallbackFunc)pGetProcAddress(dll, "mpv_render_context_set_update_callback");
+    mpvRenderContextReportSwap = (mpvRenderContextReportSwapFunc)pGetProcAddress(dll, "mpv_render_context_report_swap");
+    mpvClientApiVersion        = (mpvClientApiVersionFunc)pGetProcAddress(dll, "mpv_client_api_version");
+}
+
+#if defined(PS5_NATIVE_APP)
+/*
+ * 原生标题把 mpv 静态链接进 eboot，而链接脚本是 { local: *; }（PS5 模块转换器只
+ * 发布导入、不支持应用导出），所以 dlsym 永远解析不到 mpv_*：按动态库方式取函数
+ * 指针只能得到 NULL，调用时跳到地址 0（真机现象：VideoView 构造里 MPVCore 单例
+ * 初始化处 SIGSEGV，fault addr = 0）。这里直接取链接进来的符号。
+ */
+void initMpvProcLinked() {
+    mpvSetOptionString = &mpv_set_option_string;
+    mpvObserveProperty = &mpv_observe_property;
+    mpvCreate = &mpv_create;
+    mpvInitialize = &mpv_initialize;
+    mpvTerminateDestroy = &mpv_terminate_destroy;
+    mpvSetWakeupCallback = &mpv_set_wakeup_callback;
+    mpvCommandString = &mpv_command_string;
+    mpvErrorString = &mpv_error_string;
+    mpvWaitEvent = &mpv_wait_event;
+    mpvGetProperty = &mpv_get_property;
+    mpvCommandAsync = &mpv_command_async;
+    mpvGetPropertyString = &mpv_get_property_string;
+    mpvFreeNodeContents = &mpv_free_node_contents;
+    mpvSetOption = &mpv_set_option;
+    mpvFree = &mpv_free;
+    mpvRenderContextCreate = &mpv_render_context_create;
+    mpvRenderContextUpdate = &mpv_render_context_update;
+    mpvRenderContextFree = &mpv_render_context_free;
+    mpvRenderContextRender = &mpv_render_context_render;
+    mpvRenderContextSetUpdateCallback = &mpv_render_context_set_update_callback;
+    mpvRenderContextReportSwap = &mpv_render_context_report_swap;
+    mpvClientApiVersion = &mpv_client_api_version;
+}
+#endif
 #endif
 
 MPVCore::MPVCore() {
@@ -318,6 +396,27 @@ void MPVCore::init() {
     mpvSetOptionString(mpv, "reset-on-next-file", "speed,pause");
     mpvSetOptionString(mpv, "vo", "libmpv");
     mpvSetOptionString(mpv, "pulse-latency-hacks", "no");
+
+#if defined(PS5_NATIVE_APP) && !defined(WILIWILI_SOFTWARE_RENDER)
+    /* 原生 GL 路线：nanovg 把最终颜色按 BGRA 写出（video-out 的格式，见
+     * borealis/extern/nanovg/nanovg_gl.h 的 outColor = result.bgra），而 mpv 因为
+     * MPV_NO_FB 直接渲染进同一个 framebuffer 且写 RGBA —— 视频会红蓝互换。这里挂
+     * 一段只改 MAIN pass 的用户着色器把视频的颜色换回来（不额外增加渲染遍）。 */
+    {
+        std::string hook = MPVCore::colorSwapShaderPath();
+        if (!hook.empty()) {
+            std::ofstream out(hook, std::ios::trunc);
+            if (out) {
+                out << "//!DESC wiliwili: swap red/blue (video-out is BGRA, mpv writes RGBA)\n"
+                       "//!HOOK MAIN\n"
+                       "//!BIND HOOKED\n"
+                       "vec4 hook() { return HOOKED_tex(HOOKED_pos).bgra; }\n";
+                out.close();
+                mpvSetOptionString(mpv, "glsl-shaders", hook.c_str());
+            }
+        }
+    }
+#endif
 
     mpvSetOption(mpv, "brightness", MPV_FORMAT_DOUBLE, &MPVCore::VIDEO_BRIGHTNESS);
     mpvSetOption(mpv, "contrast", MPV_FORMAT_DOUBLE, &MPVCore::VIDEO_CONTRAST);
@@ -383,12 +482,36 @@ void MPVCore::init() {
     // log
     // mpvSetOptionString(mpv, "msg-level", "ffmpeg=trace");
     // mpvSetOptionString(mpv, "msg-level", "all=no");
+    /* PS5（payload 与原生标题）都不该打开它：本机 libmpv 没有终端输出后端，
+     * terminal=yes 会让 mpv 内部跳到 NULL 地址（真机表现：走到 VideoView 构造里
+     * 的 MPVCore::init 就 SIGSEGV，fault addr = 0）。日志走应用自己的通道。 */
+#if !defined(PS5) && !defined(PS5_NATIVE_APP)
     if (MPVCore::TERMINAL) {
         mpvSetOptionString(mpv, "terminal", "yes");
         if (brls::Logger::getLogLevel() >= brls::LogLevel::LOG_DEBUG) {
             mpvSetOptionString(mpv, "msg-level", "all=v");
         }
     }
+#endif
+
+#if defined(PS5_NATIVE_APP)
+    /* 内存诊断：应用槽的 flexible 内存上限约 450MB，而打开播放器前进程已占 ~414MB。
+     * 这里把 mpv 的缓存/队列压到最小，用来判定"播不了"是否由内存引起。 */
+    mpvSetOptionString(mpv, "demuxer-max-bytes", "16MiB");
+    mpvSetOptionString(mpv, "demuxer-max-back-bytes", "4MiB");
+    mpvSetOptionString(mpv, "demuxer-readahead-secs", "1");
+    mpvSetOptionString(mpv, "vd-lavc-threads", "2");
+    mpvSetOptionString(mpv, "demuxer-lavf-analyzeduration", "0.2");
+    mpvSetOptionString(mpv, "demuxer-lavf-probescore", "16");
+    mpvSetOptionString(mpv, "audio-buffer", "0.2");
+    brls::Logger::info("native: mpv memory options minimised");
+#endif
+
+#if defined(PS5) || defined(PS5_NATIVE_APP)
+    /* 双保险：让 mpv 根本不生成日志事件（本机 libmpv 一旦真的输出日志就跳到 NULL，
+     * 见上面的说明）。 */
+    mpvSetOptionString(mpv, "msg-level", "all=no");
+#endif
 
     if (mpvInitialize(mpv) < 0) {
         mpvTerminateDestroy(mpv);
@@ -1344,6 +1467,14 @@ std::unordered_map<std::string, mpv_node> MPVCore::getNodeMap(const std::string 
 
 double MPVCore::getPlaybackTime() const { return playback_time; }
 
+std::string MPVCore::colorSwapShaderPath() {
+#if defined(PS5_NATIVE_APP) && !defined(WILIWILI_SOFTWARE_RENDER)
+    return ProgramConfig::instance().getConfigDir() + "/rb-swap.hook";
+#else
+    return std::string();
+#endif
+}
+
 void MPVCore::disableDimming(bool disable) {
     brls::Logger::info("disableDimming: {}", disable);
     brls::Application::getPlatform()->disableScreenDimming(disable, "Playing video", APPVersion::getPackageName());
@@ -1364,8 +1495,11 @@ void MPVCore::setShader(const std::string &profile, const std::string &shaders,
     currentShader        = shaders;
     currentSetting       = settings;
 
-    // 设置着色器
-    if (!shaders.empty()) command_async("no-osd", "change-list", "glsl-shaders", "set", shaders);
+    // 设置着色器（内置的颜色交换必须保留在最前面，见 init() 的说明）
+    std::string builtin = MPVCore::colorSwapShaderPath();
+    if (!shaders.empty() || !builtin.empty())
+        command_async("no-osd", "change-list", "glsl-shaders", "set",
+                      builtin.empty() ? shaders : (shaders.empty() ? builtin : builtin + "," + shaders));
 
     // 设置mpv配置
     for (auto &setting : settings) {
@@ -1386,8 +1520,12 @@ void MPVCore::clearShader(bool showHint) {
     currentShaderProfile.clear();
     currentSetting.clear();
 
-    // 清空着色器
-    command_async("no-osd", "change-list", "glsl-shaders", "clr", "");
+    // 清空着色器（内置的颜色交换着色器保留）
+    std::string builtin = MPVCore::colorSwapShaderPath();
+    if (builtin.empty())
+        command_async("no-osd", "change-list", "glsl-shaders", "clr", "");
+    else
+        command_async("no-osd", "change-list", "glsl-shaders", "set", builtin);
 
     // 重置mpv配置
     if (reset) MPVCore::instance().restart();

@@ -13,7 +13,15 @@
 #include "api/bilibili/util/http.hpp"
 
 #ifdef USE_WEBP
+#include <mutex>
+#include <thread>
+#include <deque>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <webp/decode.h>
+
+extern "C" void wiliwili_boot_log(const char*);
 #endif
 
 #ifdef BOREALIS_USE_GXM
@@ -199,6 +207,26 @@ static inline void freeImageData(uint8_t* imageData, bool isWebp) {
         stbi_image_free(imageData);
 }
 
+struct ImageUpload {
+    ImageHelper* helper;
+    uint8_t* data;
+    int width;
+    int height;
+    bool isWebp;
+};
+
+extern "C" void wiliwili_drain_image_uploads(void) { ImageHelper::drainUploads(); }
+
+static std::deque<ImageUpload>& uploadQueue() {
+    static std::deque<ImageUpload> queue;
+    return queue;
+}
+
+static std::mutex& uploadQueueMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 void ImageHelper::requestImage() {
     brls::Logger::verbose("request Image 2: {} {}", this->imageUrl, this->isCancel);
 
@@ -260,42 +288,49 @@ void ImageHelper::requestImage() {
     }
 #endif
 
-    brls::sync([this, r, imageData, imageW, imageH, isWebp]() {
-        // 再检查一遍缓存
-        int tex = brls::TextureCache::instance().getCache(this->imageUrl);
-        if (tex > 0) {
-            brls::Logger::verbose("cache hit 2: {}", this->imageUrl);
-            this->imageView->innerSetImage(tex);
-        } else {
-            NVGcontext* vg = brls::Application::getNVGContext();
-            if (imageData) {
-#ifdef BOREALIS_USE_GXM
-                bool dxt5 = this->imageFlag & NVG_IMAGE_DXT5;
-                tex = nvgCreateImageRGBA(vg, imageW, imageH, (dxt5 ? NVG_IMAGE_DXT5 : NVG_IMAGE_DXT1) | NVG_IMAGE_LPDDR, imageData);
-#else
-                tex = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
-#endif
-            } else {
-                brls::Logger::error("Failed to load image: {}", this->imageUrl);
-            }
+    /* Texture creation needs the render thread, but every queued image blocks
+     * the render loop for the duration of its upload. A list of covers would
+     * therefore freeze the interface, so uploads are queued and drained one per
+     * frame by the render loop (see drainImageUploads). */
+    {
+        std::lock_guard<std::mutex> lock(uploadQueueMutex());
+        uploadQueue().push_back(ImageUpload{this, imageData, imageW, imageH, isWebp});
+    }
+}
 
-            if (tex > 0) {
-                brls::TextureCache::instance().addCache(this->imageUrl, tex);
-                if (!this->isCancel) {
-                    brls::Logger::verbose("load image: {}", this->imageUrl);
-                    this->imageView->innerSetImage(tex);
-                }
+void ImageHelper::drainUploads() {
+    ImageUpload job;
+    {
+        std::lock_guard<std::mutex> lock(uploadQueueMutex());
+        if (uploadQueue().empty()) return;
+        job = uploadQueue().front();
+        uploadQueue().pop_front();
+    }
+
+    ImageHelper* helper = job.helper;
+    int tex = brls::TextureCache::instance().getCache(helper->imageUrl);
+    if (tex > 0) {
+        brls::Logger::verbose("cache hit 2: {}", helper->imageUrl);
+        helper->imageView->innerSetImage(tex);
+    } else {
+        NVGcontext* vg = brls::Application::getNVGContext();
+        if (job.data) {
+            tex = nvgCreateImageRGBA(vg, job.width, job.height, 0, job.data);
+        } else {
+            brls::Logger::error("Failed to load image: {}", helper->imageUrl);
+        }
+        if (tex > 0) {
+            brls::TextureCache::instance().addCache(helper->imageUrl, tex);
+            if (!helper->isCancel) {
+                brls::Logger::verbose("load image: {}", helper->imageUrl);
+                helper->imageView->innerSetImage(tex);
             }
         }
-        if (imageData) {
-#ifdef BOREALIS_USE_GXM
-            free(imageData);
-#else
-            freeImageData(imageData, isWebp);
-#endif
-        }
-        this->clean();
-    });
+    }
+    if (job.data) {
+        freeImageData(job.data, job.isWebp);
+    }
+    helper->clean();
 }
 
 void ImageHelper::clean() {

@@ -22,6 +22,8 @@
 #include "fragment/player_danmaku_setting.hpp"
 #include "fragment/player_setting.hpp"
 #include "fragment/player_dlna_search.hpp"
+extern "C" void wiliwili_boot_log(const char *);
+#define WILI_BOOT_LOG(m) wiliwili_boot_log(m)
 #include "view/video_view.hpp"
 
 #include "utils/shortcut_helper.hpp"
