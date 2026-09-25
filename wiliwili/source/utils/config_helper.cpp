@@ -156,7 +156,19 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::DLNA_NAME, {"dlna_name", {}, {}, 0}},
     {SettingItem::PLAYER_ASPECT, {"player_aspect", {"-1", "-2", "-3", "4:3", "16:9"}, {}, 0}},
     {SettingItem::HTTP_PROXY, {"http_proxy", {}, {}, 0}},
-    {SettingItem::DANMAKU_STYLE_FONT, {"danmaku_style_font", {"stroke", "incline", "shadow", "pure"}, {}, 0}},
+    {SettingItem::DANMAKU_STYLE_FONT,
+     {"danmaku_style_font",
+      {"stroke", "incline", "shadow", "pure"},
+      {},
+#if defined(PS5)
+      /* PS5 上默认用 "incline"（1 像素偏移描边）：描边样式走 nanovg 的 dilate 着色器，
+       * 每帧多采样让 llvmpipe 多花约 30 ms（整幅 1080p 的预算）；偏移描边只是多画一遍
+       * 普通文字，真机实测 stroke 19-35 fps、shadow 22-36 fps、incline 与 pure 58-60 fps。 */
+      1
+#else
+      0
+#endif
+     }},
     {SettingItem::SHORTCUT_REFRESH, {"shortcut_refresh", {}, {}, 0}},
     {SettingItem::SHORTCUT_SEARCH, {"shortcut_search", {}, {}, 0}},
     {SettingItem::SHORTCUT_LAST, {"shortcut_last", {}, {}, 0}},
