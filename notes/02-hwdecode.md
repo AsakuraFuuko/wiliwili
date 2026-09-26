@@ -740,3 +740,30 @@ len ∈ {256,512,1024,2048}、param ∈ {1,2,0,3,4,0x0001,0x0201,0x1002}，全�
 
 **注意**：音频探针（`WILIWILI_TEST_AUDIO` / `WILIWILI_TEST_AUDIO2`）保留在树里但默认不触发；
 真机上跑它们会让标题退出，属于已知现象。
+
+
+### ★ 更正：音频可用（2026-09-26 真机出声，前一节的"证伪"作废）
+
+**正确配方**（照抄 `EVO-PLAYER-PS5` 的 `projects/evoplayer/core/src/services/SoundEffectEngine.cpp`，真机可用实现）：
+
+```c
+sceAudioOutInit();                                   /* rc=0 */
+int handle = sceAudioOutOpen(0xFF, 0, 0, 256, 48000, 1);
+/* userId=0xFF, type=0, index=0, grain=256 帧, 48000Hz, param=1 => S16 立体声 */
+if (handle < 1) 失败;                                /* 0x20000000 这类是**有效句柄** */
+while (...) {
+    fill int16_t block[256*2];                       /* 交织 L/R */
+    int rc = sceAudioOutOutput(handle, block);        /* 阻塞到该块播完（天然音频时钟） */
+    if (rc < 0) 失败;                                 /* 只认负数！正数（实测 256）是正常返回 */
+}
+sceAudioOutClose(handle);
+```
+
+真机日志：`init rc=0 → open handle=536870912 → chunks=180 first_rc=256 → close rc=0`，可闻 1.2 kHz 提示音 ✓。
+
+**先前两处误判（导致"音频不可用"的错误结论）**：
+1. 把 `0x20000000` 当成错误码（实际是有效句柄）⇒ 参数扫描在第一个"非负"处就停了，还丢掉了唯一正确的组合；
+2. 用 `!= 0` 判定 `Output` 成功与否（实际只有负数才是失败）⇒ 明明送成功了却主动退出。
+
+**仍然成立的部分**：SDL2 在该原生构建里没有音频后端（需自接系统接口）；`sceAudioOut2*` 不需要（经典 API 就够）；
+用户上下文与仲裁不是必需（`GetInitialUser`/`ArbitrationInitialize` 可以不做直接 open 成功）。

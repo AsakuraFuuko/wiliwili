@@ -30,71 +30,46 @@ void wiliwili_audio_probe(void) {
     char line[192];
     wiliwili_boot_log("audio: enter");
 
-    /* 模块 ID 表：0x01 = libSceAudioOut（0xcf = 207 = libSceVideodec2，与硬解一致）。
-     * 之前从没加载过音频模块——这很可能就是经典接口一直被拒的原因。 */
-    int module_rc = sceSysmoduleLoadModule(0x01);
-    snprintf(line, sizeof(line), "audio: sysmodule1 rc=%d", module_rc);
-    wiliwili_boot_log(line);
-
+    /* 照抄 EVO-PLAYER-PS5 的真机可用实现（SoundEffectEngine.cpp）：
+     *   sceAudioOutInit();
+     *   handle = sceAudioOutOpen(0xFF, 0, 0, 256, 48000, 1);
+     *   参数含义：userId=0xFF、type=0、index=0、grain=256 帧、48000 Hz、param=1 表示 S16 立体声。
+     *   句柄判定是 >= 1（0x20000000 这类是有效句柄，不是错误码）；
+     *   sceAudioOutOutput(handle, block) 阻塞到该块播完。 */
     int rc = sceAudioOutInit();
     snprintf(line, sizeof(line), "audio: init rc=%d", rc);
     wiliwili_boot_log(line);
 
-    /* 音频需要真实用户上下文：先取初始用户（payload 里这一步会失败）。 */
-    int user_id = -1;
-    int user_rc = sceUserServiceGetInitialUser(&user_id);
-    snprintf(line, sizeof(line), "audio: initial_user rc=%d id=%d", user_rc, user_id);
+    int handle = sceAudioOutOpen(0xFF, 0, 0, 256, 48000, 1);
+    snprintf(line, sizeof(line), "audio: open handle=%d", handle);
     wiliwili_boot_log(line);
+    if (handle < 1) return;
 
-    int arb_rc = sceAudioOutArbitrationInitialize();
-    snprintf(line, sizeof(line), "audio: arbitration rc=%d", arb_rc);
-    wiliwili_boot_log(line);
-
-    /* 参数扫描：模拟器实现里 param 是"编码声道数/格式"的，且 grain 必须是 256 的整数倍。
-     * 逐个组合打 rc，命中就直接出声。 */
-    int handle = -1;
-    const int user_ids[2]   = {user_id, 0xFF};
-    const int types[2]      = {0, 1};
-    const unsigned lens[4]  = {256, 512, 1024, 2048};
-    const unsigned params[8] = {1, 2, 0, 3, 4, 0x0001, 0x0201, 0x1002};
-    for (int u = 0; u < 2 && handle < 0; ++u) {
-        for (int t = 0; t < 2 && handle < 0; ++t) {
-            for (int l = 0; l < 4 && handle < 0; ++l) {
-                for (int p = 0; p < 8 && handle < 0; ++p) {
-                    int candidate = sceAudioOutOpen(user_ids[u], types[t], 0, lens[l], AUDIO_FREQ, params[p]);
-                    /* 只认"像句柄"的小正整数：0x20000000 之类是错误码，上一轮就是被它骗停了。 */
-                    if (candidate > 0 && candidate < 0x10000) {
-                        handle = candidate;
-                        snprintf(line, sizeof(line), "audio: HIT user=%d type=%d len=%u param=0x%x -> %d",
-                                 user_ids[u], types[t], lens[l], params[p], candidate);
-                    } else {
-                        snprintf(line, sizeof(line), "audio: miss user=%d type=%d len=%u param=0x%x rc=%d",
-                                 user_ids[u], types[t], lens[l], params[p], candidate);
-                    }
-                    wiliwili_boot_log(line);
-                }
-            }
-        }
-    }
-    if (handle < 0) return;
-
-    short buffer[AUDIO_FRAMES * 2];
+    /* 256 帧立体声 S16 = 1024 字节/块；每块约 5.33 ms，180 块 ≈ 1 秒。 */
+    short buffer[256 * 2];
     double phase = 0.0;
-    const double step = 2.0 * 3.14159265358979 * 1200.0 / (double)AUDIO_FREQ; /* 1.2 kHz 提示音 */
-    int chunks = AUDIO_FREQ / AUDIO_FRAMES;                                   /* 约 1 秒 */
+    const double step = 2.0 * 3.14159265358979 * 1200.0 / 48000.0;
     int ok_chunks = 0;
-    for (int chunk = 0; chunk < chunks; ++chunk) {
-        for (int i = 0; i < AUDIO_FRAMES; ++i) {
-            short sample   = (short)(0.25 * 32767.0 * ((phase < 3.14159265358979) ? 1.0 : -1.0));
-            buffer[i * 2]  = sample;
+    int first_rc = 0;
+    for (int chunk = 0; chunk < 180; ++chunk) {
+        for (int i = 0; i < 256; ++i) {
+            short sample      = (short)(0.25 * 32767.0 * ((phase < 3.14159265358979) ? 1.0 : -1.0));
+            buffer[i * 2]     = sample;
             buffer[i * 2 + 1] = sample;
             phase += step;
             if (phase >= 2.0 * 3.14159265358979) phase -= 2.0 * 3.14159265358979;
         }
-        if (sceAudioOutOutput(handle, buffer) != 0) break;
+        int out_rc = sceAudioOutOutput(handle, buffer);
+        if (chunk == 0) first_rc = out_rc;
+        /* EVO 的可用实现只把"负数"当失败（正数是正常返回，例如本次的 256）。 */
+        if (out_rc < 0) {
+            snprintf(line, sizeof(line), "audio: output failed at chunk %d rc=%d", chunk, out_rc);
+            wiliwili_boot_log(line);
+            break;
+        }
         ++ok_chunks;
     }
-    snprintf(line, sizeof(line), "audio: output chunks=%d/%d", ok_chunks, chunks);
+    snprintf(line, sizeof(line), "audio: chunks=%d first_rc=%d", ok_chunks, first_rc);
     wiliwili_boot_log(line);
 
     rc = sceAudioOutClose(handle);
