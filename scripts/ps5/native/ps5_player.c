@@ -528,7 +528,19 @@ static void video_step(void) {
 }
 
 /* 帧循环：每帧推**一块**音频（Output 阻塞 ≈ 5.3 ms，自然节拍），视频包读到就立刻送硬解。 */
-void wiliwili_ps5player_pause(int paused) { g_paused = paused; }
+void wiliwili_ps5player_pause(int paused) {
+    /* app 的加载状态机会周期性调 pause()，一冻结就"画面卡住"（真机实测）。
+     * 暂时忽略它：先保证能连续播放；用户暂停键的支持留待与 app 状态机打通后再说。
+     * 打点一次，便于确认调用来源。 */
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        char lb[120];
+        snprintf(lb, sizeof(lb), "player: pause(%d) ignored (app state machine)", paused);
+        wiliwili_boot_log(lb);
+    }
+    (void)paused;
+}
 
 /* 诊断用：true 时额外在 nvg UI 通道之后重画一遍，让探针模式下的画面能盖住 UI 被肉眼看到
  * （PS5 侧没有屏幕截图手段，只能靠电视确认）。真实播放走"nvg 之前"的正常路径。 */
