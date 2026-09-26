@@ -827,3 +827,26 @@ C 文件里写了 `nullptr`。**待修的小项**：音频时钟到 1.5 s 后不
 
 **素材**：`WILIWILI_TEST_PLAYER=<url>`（片源 `player-test.mp4` = H.264 640x360 + AAC 48k 立体声，
 由开发机 `python3 -m http.server 8811` 提供）。
+
+
+### P2e 调试记录（2026-09-26 收尾，交接口）
+
+`video_submit_packet` 内部打点（真机）：
+
+```
+player: bsf sent size=0        ← 正常：av_bsf_send_packet 会取走包引用，调用者的 size 归零
+player: bsf recv rc=0
+player: decode au=8947         ← 首帧 AU（含 SPS/PPS）8947 字节
+player: decode rc=0 valid=0    ← 需要 Flush 取帧（代码里已做）
+player: bsf recv rc=0 / decode au=4722 / rc=0 valid=0
+player: bsf recv rc=0 / decode au=3056 / rc=0 valid=0
+...
+```
+
+⇒ **视频这条子链是通的**（AU 正常转换、`Decode` 连续 `rc=0`）。崩点在**同一个帧循环的补料段**里：
+打点显示 `draw enter n=1` 之后一路在解视频包，但循环的收尾标记（`refilled` / `pushed` / `drew`）没打出来 ⇒ 进程在补料循环中途退出。
+
+**下一步（明确）**：
+1. 在补料循环里再多打两行（`av_read_frame` 的返回值/流号、`video_submit_packet` 返回后），确认是"读到某个包之后崩"还是"decode/Flush 节奏问题"；
+2. 重点怀疑 `pipeline_depth=1` 下**连续喂 AU 却不按 EVO 的 3 槽节奏收帧** —— 把解码节奏改成 EVO 的两段式（`Decode`；`valid==0` 才 `Flush`）并给 AU/帧池各留 3 槽周转，或直接把解码放到独立线程；
+3. 音频侧已验证可用（上一版循环里时钟推进到 1.5 s、282 块），不要再动它。

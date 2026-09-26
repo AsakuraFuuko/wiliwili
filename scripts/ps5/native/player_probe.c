@@ -304,11 +304,16 @@ static void video_submit_packet(AVPacket *pkt) {
     static int slot = 0;
     if (!g_bsf) return;
     AVPacket *out = av_packet_alloc();
-    if (av_bsf_send_packet(g_bsf, pkt) != 0) {
+    int send_rc   = av_bsf_send_packet(g_bsf, pkt);
+    if (send_rc != 0) {
+        plog1("player: bsf send rc=%d", send_rc);
         av_packet_free(&out);
         return;
     }
-    while (av_bsf_receive_packet(g_bsf, out) == 0) {
+    plog1("player: bsf sent size=%d", (long)pkt->size);
+    int recv_rc = av_bsf_receive_packet(g_bsf, out);
+    plog1("player: bsf recv rc=%d", recv_rc);
+    while (recv_rc == 0) {
         uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
         memcpy(au_slot, out->data, (size_t)out->size);
         InputData input;
@@ -326,7 +331,9 @@ static void video_submit_packet(AVPacket *pkt) {
         OutputInfo oi;
         memset(&oi, 0, sizeof(oi));
         oi.size = sizeof(oi);
+        plog1("player: decode au=%d", (long)out->size);
         int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
+        plog2("player: decode rc=%d valid=%d", rc, oi.valid);
         if (rc == 0 && oi.valid == 0) {
             memset(&oi, 0, sizeof(oi));
             oi.size = sizeof(oi);
@@ -349,6 +356,7 @@ static void video_submit_packet(AVPacket *pkt) {
         }
         slot = (slot + 1) % PIPELINE_SLOTS;
         av_packet_unref(out);
+        recv_rc = av_bsf_receive_packet(g_bsf, out);
     }
     av_packet_free(&out);
 }
