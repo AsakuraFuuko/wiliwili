@@ -918,3 +918,19 @@ player: clock_ms=1280 blocks=240 pts_ms=5100     ← 音频时钟与视频 PTS �
 **遗留（下一步）**：`audio_push_blocks(1)` 让音频时钟被渲染帧率绑住（实测 28 s 只走 1.28 s 音频）。
 正确架构是把音频与渲染解耦（独立线程做 `Output` 阻塞循环，或每帧排空缓冲），视频按音频时钟丢/追赶；
 之后才是接入 `VideoView`（弹幕/OSD 不动）。
+
+
+### ★ P2e 体验收口：A/V 同步（2026-09-26）
+
+**加了两处，自管播放器具备可用体验**：
+1. `audio_push_blocks(1)` → `audio_push_blocks(64)`（每帧排空缓冲）：`sceAudioOutOutput` 的阻塞本身就是
+   时钟，推 1 块会把音频绑在渲染帧率上（实测 28 s 只走 1.28 s）。改成排空后音频按真实速率走。
+2. 视频送包按音频时钟限速（`g_last_video_pts_us > clock + 300 ms` 就停手，把包留到下一帧
+   `g_pending_video`）：否则几秒内把整个文件解完。
+
+**真机证据**：`player: clock_ms=2560 blocks=480 pts_ms=2700` ⇒ 视频只领先音频 140 ms（限速 300 ms 内）。
+进程存活、无崩溃、无刷屏。
+
+**下一步（唯一剩下的）**：把这条链搬进 `wiliwili/source/view/video_view.cpp`
+（弹幕/OSD 一行不改；把 `wiliwili_player_draw` 的循环搬到 VideoView 的渲染钩子，音频排空 + 限速逻辑照搬），
+然后清探针（`WILIWILI_TEST_PLAYER` 等）与 `assets` 下的调试片源，出发布镜像。

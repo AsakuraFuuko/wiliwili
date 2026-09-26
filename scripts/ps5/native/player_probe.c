@@ -110,6 +110,7 @@ static int g_pcm_frames;
 static int g_audio_handle = -1;
 static unsigned long long g_audio_blocks;
 static int g_audio_eof;
+static int g_pending_video; /* g_pkt 里留着一个未到播放时间的视频包 */
 
 static void plog1(const char *fmt, long a) {
     char line[160];
@@ -389,10 +390,22 @@ void wiliwili_player_draw(struct NVGcontext *vg) {
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
 
     int guard = 0;
+    /* 上一帧留下的、还没到播放时间的视频包先送出去 */
+    if (g_pending_video) {
+        video_submit_packet(g_pkt);
+        av_packet_unref(g_pkt);
+        g_pending_video = 0;
+    }
     while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && guard++ < 256) {
         int read_rc = av_read_frame(g_fmt, g_pkt);
         if (read_rc < 0) {
             g_audio_eof = 1;
+            break;
+        }
+        if (g_pkt->stream_index == g_video_index && g_last_video_pts_us > 0 &&
+            g_last_video_pts_us > g_audio_clock_us() + 300000) {
+            /* 视频跑到音频前面 300 ms 以上就停手，把包留到下一帧（否则几秒内解完整个文件） */
+            g_pending_video = 1;
             break;
         }
         if (g_pkt->stream_index == g_audio_index && g_adec) {
@@ -401,10 +414,12 @@ void wiliwili_player_draw(struct NVGcontext *vg) {
         } else if (g_pkt->stream_index == g_video_index) {
             video_submit_packet(g_pkt); /* 不再丢弃 */
         }
-        av_packet_unref(g_pkt);
+        if (!g_pending_video) av_packet_unref(g_pkt);
     }
     if (draw_calls <= 3) plog1("player: refilled pcm_frames=%d", (long)g_pcm_frames);
-    audio_push_blocks(1);
+    /* 排空缓冲：sceAudioOutOutput 会阻塞到该块播完，节奏由它定（推 1 块会把音频
+     * 绑死在渲染帧率上——实测 28 s 才走 1.28 s 音频）。 */
+    audio_push_blocks(64);
     if (draw_calls <= 3) plog1("player: pushed blocks=%d", (long)g_audio_blocks);
 
     wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
