@@ -92,6 +92,8 @@ static int g_ready;
 /* ffmpeg */
 static AVFormatContext *g_fmt;
 static int g_video_index = -1, g_audio_index = -1;
+static AVFormatContext *g_afmt; /* 音频单独一条 URL 时（B 站 DASH）用它 */
+static int g_video_eof;
 static AVBSFContext *g_bsf;
 static AVCodecContext *g_adec;
 static struct SwrContext *g_swr;
@@ -239,7 +241,7 @@ static void audio_decode_one_frame(void) {
 static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_GRAIN * 1000000ULL / AUDIO_FREQ); }
 
 
-void wiliwili_ps5player_open(const char *url) {
+void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     char line[192];
     plog1("player: enter %d", url != NULL);
 
@@ -253,29 +255,14 @@ void wiliwili_ps5player_open(const char *url) {
     }
 
     avformat_network_init();
-    /* 诊断：ffmpeg 支持哪些协议、是否带 TLS（B 站是 https，这条决定能不能直接开）。 */
     {
-        const char *cfg = avcodec_configuration();
-        for (int part = 0; part < 4; ++part) {
-            char line[200];
-            snprintf(line, sizeof(line), "player: avconfig%d=%.170s", part, cfg + part * 170);
-            wiliwili_boot_log(line);
-            if (strlen(cfg) < (size_t)(part * 170 + 170)) break;
+        char lb[220];
+        snprintf(lb, sizeof(lb), "player: url=%.80s", url ? url : "(null)");
+        wiliwili_boot_log(lb);
+        if (audio_url && audio_url[0]) {
+            snprintf(lb, sizeof(lb), "player: audio_url=%.80s", audio_url);
+            wiliwili_boot_log(lb);
         }
-        const char *proto = NULL;
-        void *it = NULL;
-        line[0] = 0;
-        int n = 0;
-        while ((proto = avio_enum_protocols(&it, 0)) != NULL && n < 6) {
-            if (strstr(proto, "http") || strstr(proto, "tls") || strstr(proto, "file")) {
-                strncat(line, proto, sizeof(line) - strlen(line) - 2);
-                strncat(line, " ", sizeof(line) - strlen(line) - 2);
-            }
-            ++n;
-        }
-        char line2[320];
-        snprintf(line2, sizeof(line2), "player: protocols=%s", line);
-        wiliwili_boot_log(line2);
     }
     /* B 站是 https：给 ffmpeg 的 TLS 指 CA（随包安装，绝不关闭校验）。 */
     AVDictionary *opts = NULL;
@@ -294,6 +281,24 @@ void wiliwili_ps5player_open(const char *url) {
     }
     g_video_index = av_find_best_stream(g_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     g_audio_index = av_find_best_stream(g_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+
+    /* B 站 DASH：视频与音频是两条独立 URL（app 通过 audios 参数传进来）。
+     * 音频单独开一个上下文，视频仍走 g_fmt。二者都只有一条流时最省事。 */
+    if (audio_url != NULL && audio_url[0] != '\0' && strcmp(audio_url, url) != 0) {
+        AVDictionary *aopts = NULL;
+        av_dict_set(&aopts, "ca_file", "/app0/assets/ca-bundle.crt", 0);
+        av_dict_set(&aopts, "user_agent", "wiliwili/1.6.0 (PS5)", 0);
+        int arc = avformat_open_input(&g_afmt, audio_url, NULL, &aopts);
+        av_dict_free(&aopts);
+        plog1("player: audio open rc=%d", arc);
+        if (arc >= 0) {
+            avformat_find_stream_info(g_afmt, NULL);
+            g_audio_index = av_find_best_stream(g_afmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+            wiliwili_boot_log("player: separate audio url");
+        } else {
+            g_afmt = NULL;
+        }
+    }
     plog2("player: streams v=%d a=%d", g_video_index, g_audio_index);
 
     /* 解码器必须按**真实流尺寸**建：写死小尺寸会让解码器越界写帧缓冲（1080p 必崩）。 */
@@ -336,10 +341,13 @@ void wiliwili_ps5player_open(const char *url) {
 
     /* 音频解码 + 重采样到 S16 立体声 48k */
     if (g_audio_index >= 0) {
-        const AVCodec *adec = avcodec_find_decoder(g_fmt->streams[g_audio_index]->codecpar->codec_id);
+        /* 音频源的流必须从**音频上下文**取 codecpar：DASH 时 g_audio_index 是 g_afmt 里的下标，
+         * 拿去索引 g_fmt 会建出错误的解码器（表现：没有 PCM、时钟停在 0、视频被一起拖住）。 */
+        AVFormatContext *asrc = g_afmt ? g_afmt : g_fmt;
+        const AVCodec *adec  = avcodec_find_decoder(asrc->streams[g_audio_index]->codecpar->codec_id);
         if (adec) {
             g_adec = avcodec_alloc_context3(adec);
-            avcodec_parameters_to_context(g_adec, g_fmt->streams[g_audio_index]->codecpar);
+            avcodec_parameters_to_context(g_adec, asrc->streams[g_audio_index]->codecpar);
             wiliwili_boot_log("player: audio codec found");
             if (avcodec_open2(g_adec, adec, NULL) == 0) {
                 wiliwili_boot_log("player: audio decoder open");
@@ -349,6 +357,7 @@ void wiliwili_ps5player_open(const char *url) {
                     swr_init(g_swr);
                 }
                 plog2("player: audio codec id=%d sr=%d", (long)adec->id, g_adec->sample_rate);
+                wiliwili_boot_log("player: audio decoder ready");
             } else {
                 g_adec = NULL;
             }
@@ -431,6 +440,26 @@ static void video_submit_packet(AVPacket *pkt) {
     av_packet_free(&out);
 }
 
+/* DASH（音视频两条 URL）：每帧从视频源读**一个**视频包送硬解，落后音频超 300ms 就等。 */
+static void video_step(void) {
+    if (g_video_index < 0 || g_video_eof) return;
+    if (g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
+    int guard = 0;
+    while (guard++ < 64) {
+        if (av_read_frame(g_fmt, g_pkt) < 0) {
+            g_video_eof = 1;
+            return;
+        }
+        if (g_pkt->stream_index != g_video_index) {
+            av_packet_unref(g_pkt);
+            continue;
+        }
+        video_submit_packet(g_pkt);
+        av_packet_unref(g_pkt);
+        return;
+    }
+}
+
 /* 帧循环：每帧推**一块**音频（Output 阻塞 ≈ 5.3 ms，自然节拍），视频包读到就立刻送硬解。 */
 void wiliwili_ps5player_pause(int paused) { g_paused = paused; }
 
@@ -453,6 +482,32 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     static int draw_calls = 0;
     ++draw_calls;
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
+
+    if (g_afmt) {
+        /* 两条独立 URL：音频从 g_afmt 读，视频单独走 video_step（单源路径不动） */
+        int aguard = 0;
+        while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 256) {
+            if (av_read_frame(g_afmt, g_pkt) < 0) {
+                g_audio_eof = 1;
+                break;
+            }
+            if (g_pkt->stream_index == g_audio_index && g_adec) {
+                avcodec_send_packet(g_adec, g_pkt);
+                audio_decode_one_frame();
+            }
+            av_packet_unref(g_pkt);
+        }
+        video_step();
+        audio_push_blocks(64);
+        wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+        static int report_at2 = 0;
+        if (++report_at2 >= 120) {
+            report_at2 = 0;
+            plog3("player: clock_ms=%d blocks=%d pts_ms=%d", (long)(g_audio_clock_us() / 1000), (long)g_audio_blocks,
+                  (long)(g_last_video_pts_us / 1000));
+        }
+        return;
+    }
 
     int guard = 0;
     /* 上一帧留下的、还没到播放时间的视频包先送出去 */

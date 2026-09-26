@@ -839,7 +839,7 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
 /* 原生标题线：mpv 在 app slot 里起不来（MPVCore::init → mpv_initialize 一跳 NULL 崩），
  * 所以 PS5 上改走自管播放器：ffmpeg 解封装 + sceVideodec2 硬解 + NV12 上屏 + sceAudioOut。
  * 播放循环由 borealis 的帧钩子驱动（nvgEndFrame 之后调 wiliwili_ps5player_draw）。 */
-extern "C" void wiliwili_ps5player_open(const char *url);
+extern "C" void wiliwili_ps5player_open(const char *url, const char *audio_url);
 extern "C" void wiliwili_ps5player_close(void);
 extern "C" void wiliwili_ps5player_pause(int paused);
 #endif
@@ -848,8 +848,8 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::ve
 #ifdef PS5_NATIVE_APP
     (void)start;
     (void)end;
-    (void)audios; /* 进度/音轨参数暂不支持，start/end 留给后续做 seek */
-    wiliwili_ps5player_open(url.c_str());
+    /* B 站 DASH 是音视频两条 URL：audios[0] 是音轨，必须一起交给引擎。 */
+    wiliwili_ps5player_open(url.c_str(), audios.empty() ? nullptr : audios[0].c_str());
 #else
     mpvCore->setUrl(url, genExtraUrlParam(start, end, audios));
 #endif

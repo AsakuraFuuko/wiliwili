@@ -997,3 +997,26 @@ ffmpeg 配置里**有** `--enable-openssl`、也没有 `--disable-network`，但
 **静态链接时 tls/https 的 protocol 对象很可能没被拉进镜像**（局域网 `http://` 是好的，能证 http 协议在）。
 因此 B 站（全站 https）真实播放还需要一步：**用应用里已经工作良好的 HTTP 栈（cpr/curl，带 CA）
 取流，再通过 `avio_alloc_context` 的自定义读回调喂给 ffmpeg**（不要关 TLS 校验）。
+
+
+### ★ B 站 DASH：双 URL 输入打通（2026-09-26）
+
+**发现**：`player_base_activity.cpp` 对 B 站点播走的是 **DASH** —— 视频与音频是**两条独立 URL**，
+通过 `video->setUrl(v.base_url, start, end, audios)` 的 `audios` 参数传进来。而 PS5 分支此前**把 audios 丢了**，
+只开了视频那条 `.m4s`，自然没画面也没声音（FLV/durl 路径才是单 URL 音视频复用）。
+
+**实现**：`wiliwili_ps5player_open(video_url, audio_url)` —— 音频单独开一个 `AVFormatContext`（`g_afmt`），
+帧循环在 DASH 模式下用两个独立的读循环（音频从 `g_afmt`，视频 `video_step()` 单步读并按音频时钟限速），
+单源路径的已验证代码保持原样不动。**音频解码器的 codecpar 必须从音频上下文取**（拿 `g_audio_index`
+去索引视频上下文会建出错解码器 ⇒ 没有 PCM、时钟停 0、视频被一起拖住）。
+
+**真机验证（视频 mp4 + 独立音轨，即 DASH 形态）**：
+```
+player: separate audio url / audio open rc=0 / audio decoder ready
+player: clock_ms=2560→5120→6016  pts_ms=2900→5400→5966   ← 6 秒片完整播完，A/V 偏差 <60ms
+```
+（顺带：测试音轨必须 `-movflags +faststart`，否则 moov 在文件尾、http 顺序读会 EIO —— 这是测试资产问题，
+B 站的 `.m4s` 是 fMP4、moov 内联，不受影响。）
+
+**另外**：引擎现在会把 app 传进来的真实 URL 打进日志（`player: url=…` / `player: audio_url=…`），
+便于在真机上直接确认 B 站下发的形态。
