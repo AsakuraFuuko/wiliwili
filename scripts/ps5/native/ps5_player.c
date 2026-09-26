@@ -499,9 +499,17 @@ static void video_submit_packet(AVPacket *pkt) {
         int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
         int flush_rc = 0;
         if (rc == 0 && oi.valid == 0) {
+            /* Flush 用**独立**的帧缓冲：与 Decode 共用时硬件可能仍在写同一块，
+             * 实测表现为间歇性野指针崩溃（crash addr=0x86cad7）。 */
+            FrameBuffer fframe;
+            memset(&fframe, 0, sizeof(fframe));
+            fframe.size        = sizeof(fframe);
+            fframe.buffer      = (uint8_t *)g_frame_pool + (size_t)fslot * g_frame_size +
+                            (size_t)(g_frame_size / 2);
+            fframe.buffer_size = g_frame_size / 2;
             memset(&oi, 0, sizeof(oi));
             oi.size = sizeof(oi);
-            flush_rc = sceVideodec2Flush(g_decoder, &frame, &oi);
+            flush_rc = sceVideodec2Flush(g_decoder, &fframe, &oi);
         }
         if (dbg_au < 12) {
             ++dbg_au;
