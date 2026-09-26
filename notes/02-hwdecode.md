@@ -956,3 +956,20 @@ void wiliwili_ps5player_close(void);
 **仍缺的一步（需要登录态）**：`VideoView::setUrl` 的真实 URL 来自播放流程（`PlayerActivity` 取
 playurl，需 cookie）。原生标题是新安装、没有登录信息，所以真实链路的端到端验证要等"扫码登录"那一步；
 在此之前用 `WILIWILI_TEST_PLAYER=<url>` 驱动同一个 `open()` 即可覆盖引擎侧。
+
+
+### ★ 绘制层次修正（2026-09-26 收尾）
+
+视频是 raw GL 直画，**必须落在 nvg 的 UI 通道之前**（`nvgBeginFrame` 之前），否则会盖住
+OSD/弹幕/进度条（它们都走 nvg）。探针模式（`WILIWILI_TEST_PLAYER`）另加一条 overlay：
+在 UI 之后补画一遍，便于在人眼确认（PS5 侧没有屏幕截图手段）。
+
+**真机复验（顺序修正后）**：`ready` → `clock_ms=2560 → 5120 → 6016`、`pts_ms=2700 → 5100 → 5966`
+（6 秒片完整播完，A/V 偏差 <60 ms），进程存活；EOF 后循环自然停摆，不再崩溃。
+
+**至此原生线播放侧的完整链路**（真机全部验证）：
+`ffmpeg 解封装 → h264_mp4toannexb → sceVideodec2 硬解 → NV12 raw GL 上屏 → 音频解码 → swr → sceAudioOut`，
+加音频时钟驱动的 A/V 同步与暂停/停止 API，并已接入 `VideoView`。
+
+**剩下的是产品层**：真实播放链路需要登录态（playurl 要 cookie），之后是进度条拖动/seek、倍速、
+以及把 `notes/` 里的探针按仓库约定清理。

@@ -112,6 +112,7 @@ static unsigned long long g_audio_blocks;
 static int g_audio_eof;
 static int g_pending_video; /* g_pkt 里留着一个未到播放时间的视频包 */
 static int g_paused;
+static int g_overlay; /* 探针模式：在 UI 之后重复画一遍，便于肉眼确认 */
 
 static void plog1(const char *fmt, long a) {
     char line[160];
@@ -385,6 +386,12 @@ static void video_submit_packet(AVPacket *pkt) {
 
 /* 帧循环：每帧推**一块**音频（Output 阻塞 ≈ 5.3 ms，自然节拍），视频包读到就立刻送硬解。 */
 void wiliwili_ps5player_pause(int paused) { g_paused = paused; }
+
+/* 诊断用：true 时额外在 nvg UI 通道之后重画一遍，让探针模式下的画面能盖住 UI 被肉眼看到
+ * （PS5 侧没有屏幕截图手段，只能靠电视确认）。真实播放走"nvg 之前"的正常路径。 */
+int wiliwili_ps5player_overlay(void) { return g_overlay; }
+
+void wiliwili_ps5player_set_overlay(int on) { g_overlay = on; }
 
 /* 收尾：关音频、清状态（句柄判定按实测：>=1 才是有效句柄）。 */
 void wiliwili_ps5player_close(void) {
