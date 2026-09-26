@@ -872,3 +872,21 @@ player: bsf recv rc=0            ← 位流过滤器转换成功
 与文件版的 AU 头逐字节对比。
 
 **音频侧依旧可用**（时钟推进到 1.5 s/282 块是已观察到的），不需要改动。
+
+
+### 交接（2026-09-26 最后一轮）
+
+**已完成的全部硬指标**：硬解 1.46 ms/帧、NV12 上屏 60 fps（颜色人工确认）、`sceAudioOut` 出声、
+装配链路每一环单独验证通过；**唯一未收的真正 bug** = 播放循环里"第 4 个视频包经 bsf 后送硬解时退出"。
+
+**最后一步的精确做法**（我这一轮的 AU 头打印因日志 helper 参数错配没打出来，重试时注意用
+`snprintf` 直接格式化到 `char[]` 再 `wiliwili_boot_log`，别用自定义的 plogN）：
+1. 用 `snprintf(buf, sizeof buf, "player: au size=%d head=%02x%02x%02x%02x%02x%02x%02x%02x", ...)` 打印
+   bsf 输出的前 8 字节；
+2. 与文件版对照（`/tmp/vdec-stream.h264` 头 = `00 00 00 01 67 64 00 1e ...`，SPS 起始码 4 字节）；
+3. 若 bsf 输出的是 3 字节起始码（`00 00 01`）或缺少 SPS/PPS，就在喂给 `sceVideodec2Decode` 前做一次规整
+   （补成 4 字节起始码 / 首帧前置 SPS+PPS）。
+
+**其余可复用的资产**：`player_probe.c`（装配版，含 ffmpeg 解封装 + bsf + 硬解 + AudioOut + 时钟）、
+`videodec2_probe.c`（纯硬解 + NV12 上屏，已验证）、`audio_probe.c`（音频配方）、`regen-cdb.sh`、
+以及 `notes/00..05` 的全部真机数据与踩坑记录。

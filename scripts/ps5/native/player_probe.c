@@ -305,8 +305,9 @@ void wiliwili_player_probe(const char *url) {
 
 /* 把一个视频包送进硬解，出帧就拷进稳定缓冲（Y/UV）。 */
 static void video_submit_packet(AVPacket *pkt) {
-    static int slot  = 0; /* AU 环 */
-    static int fslot = 0; /* 帧环（与 AU 环独立，避免互相覆盖） */
+    static int slot      = 0; /* AU 环 */
+    static int fslot     = 0; /* 帧环（与 AU 环独立，避免互相覆盖） */
+    static int au_logged = 0;
     if (!g_bsf) return;
     AVPacket *out = av_packet_alloc();
     int send_rc   = av_bsf_send_packet(g_bsf, pkt);
@@ -328,6 +329,15 @@ static void video_submit_packet(AVPacket *pkt) {
         }
         uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
         memcpy(au_slot, out->data, (size_t)out->size);
+        if (au_logged < 6) {
+            ++au_logged;
+            const uint8_t *h = (const uint8_t *)out->data;
+            plog1("player: au size=%d", (long)out->size);
+            plog2("player: au head=%02x%02x%02x%02x %02x%02x%02x%02x",
+                  (long)h[0], (long)h[1]);
+            /* 后四个字节单独打，避免自定义 plog 参数不够 */
+            plog2("player: au h4=%02x%02x%02x%02x", (long)h[4], (long)h[5]);
+        }
         InputData input;
         memset(&input, 0, sizeof(input));
         input.size    = sizeof(input);
