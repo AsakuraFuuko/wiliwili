@@ -111,6 +111,7 @@ static int g_audio_handle = -1;
 static unsigned long long g_audio_blocks;
 static int g_audio_eof;
 static int g_pending_video; /* g_pkt 里留着一个未到播放时间的视频包 */
+static int g_paused;
 
 static void plog1(const char *fmt, long a) {
     char line[160];
@@ -237,7 +238,7 @@ static void audio_decode_one_frame(void) {
 static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_GRAIN * 1000000ULL / AUDIO_FREQ); }
 
 
-void wiliwili_player_probe(const char *url) {
+void wiliwili_ps5player_open(const char *url) {
     char line[192];
     plog1("player: enter %d", url != NULL);
 
@@ -383,8 +384,18 @@ static void video_submit_packet(AVPacket *pkt) {
 }
 
 /* 帧循环：每帧推**一块**音频（Output 阻塞 ≈ 5.3 ms，自然节拍），视频包读到就立刻送硬解。 */
-void wiliwili_player_draw(struct NVGcontext *vg) {
-    if (!g_ready) return;
+void wiliwili_ps5player_pause(int paused) { g_paused = paused; }
+
+/* 收尾：关音频、清状态（句柄判定按实测：>=1 才是有效句柄）。 */
+void wiliwili_ps5player_close(void) {
+    if (g_audio_handle >= 1) sceAudioOutClose(g_audio_handle);
+    g_audio_handle = -1;
+    g_ready        = 0;
+    g_paused       = 0;
+}
+
+void wiliwili_ps5player_draw(struct NVGcontext *vg) {
+    if (!g_ready || g_paused) return;
     static int draw_calls = 0;
     ++draw_calls;
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);

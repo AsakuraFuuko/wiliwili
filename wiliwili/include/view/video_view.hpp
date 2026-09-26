@@ -298,6 +298,9 @@ private:
     bool isTvControlMode = false;
     // 是否展示重播按钮
     bool showReplay = false;
+#ifdef PS5_NATIVE_APP
+    bool ps5Paused = false; /* PS5 自管播放器的暂停状态（mpv 在原生标题里不可用） */
+#endif
     std::string bangumiTitle;
     unsigned int bangumiSeasonId = 0;
     MPVEvent::Subscription eventSubscribeID;

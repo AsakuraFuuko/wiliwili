@@ -14,7 +14,7 @@
 extern "C" void wiliwili_videodec2_probe(void); /* 硬解探针，见 scripts/ps5/native/videodec2_probe.c */
 extern "C" void wiliwili_audio_probe(void); /* 音频探针，见 scripts/ps5/native/audio_probe.c */
 extern "C" void wiliwili_audio2_probe(void); /* PS5 原生音频探针，见 scripts/ps5/native/audio2_probe.c */
-extern "C" void wiliwili_player_probe(const char *url); /* 装配后的播放器探针，见 scripts/ps5/native/player_probe.c */
+extern "C" void wiliwili_ps5player_open(const char *url); /* 自管播放器，见 scripts/ps5/native/ps5_player.c */
 #ifdef PS5
 #include <ps5/klog.h>
 extern "C" int sceSystemServiceLoadExec(const char*, const char**);
@@ -265,7 +265,7 @@ int main(int argc, char* argv[]) {
                 const char *aud2 = getenv("WILIWILI_TEST_AUDIO2");
                 if (aud2 != nullptr && aud2[0] != '\0') wiliwili_audio2_probe();
                 const char *playerUrl = getenv("WILIWILI_TEST_PLAYER");
-                if (playerUrl != nullptr && playerUrl[0] != '\0') wiliwili_player_probe(playerUrl);
+                if (playerUrl != nullptr && playerUrl[0] != '\0') wiliwili_ps5player_open(playerUrl);
             }
 #endif
             /* 音频后端探针：自管播放器要自己出声音，先确认 SDL2 音频可用。 */

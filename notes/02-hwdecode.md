@@ -934,3 +934,25 @@ player: clock_ms=1280 blocks=240 pts_ms=5100     ← 音频时钟与视频 PTS �
 **下一步（唯一剩下的）**：把这条链搬进 `wiliwili/source/view/video_view.cpp`
 （弹幕/OSD 一行不改；把 `wiliwili_player_draw` 的循环搬到 VideoView 的渲染钩子，音频排空 + 限速逻辑照搬），
 然后清探针（`WILIWILI_TEST_PLAYER` 等）与 `assets` 下的调试片源，出发布镜像。
+
+
+### ★ P2e 收尾：搬进 VideoView（2026-09-26）
+
+**引擎改名成可复用 API**（`scripts/ps5/native/player_probe.c` → `ps5_player.c`）：
+```c
+void wiliwili_ps5player_open(const char *url);     /* 打开并起流 */
+void wiliwili_ps5player_draw(struct NVGcontext*);  /* 每帧推进一步（须在 nvgEndFrame 之后） */
+void wiliwili_ps5player_pause(int paused);
+void wiliwili_ps5player_close(void);
+```
+**接线点**（全部 `#ifdef PS5_NATIVE_APP`，其它平台仍走 mpv）：
+- `VideoView::setUrl(...)` → `wiliwili_ps5player_open(url)`；`stop()` → `close()`；
+  `pause()/resume()/togglePlay()` → `pause(0/1)`（新增 `ps5Paused` 成员）；`setSpeed()` 暂空实现。
+- 帧钩子：`library/borealis/.../application.cpp` 在 `nvgEndFrame` 之后调 `wiliwili_ps5player_draw`。
+- 探针入口：`wiliwili/source/main.cpp` 读 `WILIWILI_TEST_PLAYER=<url>` 后调同一个 `open`。
+
+**真机复验（改名+接线后）**：`player: ready` → `clock_ms=2560 blocks=480 pts_ms=2700`，进程存活。
+
+**仍缺的一步（需要登录态）**：`VideoView::setUrl` 的真实 URL 来自播放流程（`PlayerActivity` 取
+playurl，需 cookie）。原生标题是新安装、没有登录信息，所以真实链路的端到端验证要等"扫码登录"那一步；
+在此之前用 `WILIWILI_TEST_PLAYER=<url>` 驱动同一个 `open()` 即可覆盖引擎侧。

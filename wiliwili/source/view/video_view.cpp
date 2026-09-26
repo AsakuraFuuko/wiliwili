@@ -835,8 +835,24 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
     setUrl(url, start, end, audios);
 }
 
+#ifdef PS5_NATIVE_APP
+/* 原生标题线：mpv 在 app slot 里起不来（MPVCore::init → mpv_initialize 一跳 NULL 崩），
+ * 所以 PS5 上改走自管播放器：ffmpeg 解封装 + sceVideodec2 硬解 + NV12 上屏 + sceAudioOut。
+ * 播放循环由 borealis 的帧钩子驱动（nvgEndFrame 之后调 wiliwili_ps5player_draw）。 */
+extern "C" void wiliwili_ps5player_open(const char *url);
+extern "C" void wiliwili_ps5player_close(void);
+extern "C" void wiliwili_ps5player_pause(int paused);
+#endif
+
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
+#ifdef PS5_NATIVE_APP
+    (void)start;
+    (void)end;
+    (void)audios; /* 进度/音轨参数暂不支持，start/end 留给后续做 seek */
+    wiliwili_ps5player_open(url.c_str());
+#else
     mpvCore->setUrl(url, genExtraUrlParam(start, end, audios));
+#endif
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::string& audio) {
@@ -869,14 +885,37 @@ void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) 
     this->setUrl(url, start, end);
 }
 
-void VideoView::resume() { mpvCore->resume(); }
+void VideoView::resume() {
+#ifdef PS5_NATIVE_APP
+    wiliwili_ps5player_pause(0);
+#else
+    mpvCore->resume();
+#endif
+}
 
-void VideoView::pause() { mpvCore->pause(); }
+void VideoView::pause() {
+#ifdef PS5_NATIVE_APP
+    wiliwili_ps5player_pause(1);
+#else
+    mpvCore->pause();
+#endif
+}
 
-void VideoView::stop() { mpvCore->stop(); }
+void VideoView::stop() {
+#ifdef PS5_NATIVE_APP
+    wiliwili_ps5player_close();
+#else
+    mpvCore->stop();
+#endif
+}
 
 void VideoView::togglePlay() {
     if (customToggleAction != nullptr) return customToggleAction();
+#ifdef PS5_NATIVE_APP
+    ps5Paused = !ps5Paused;
+    wiliwili_ps5player_pause(ps5Paused);
+    return;
+#endif
     if (this->mpvCore->isPaused()) {
         if (showReplay) {
             this->mpvCore->seek(0);
@@ -891,7 +930,13 @@ void VideoView::togglePlay() {
 
 void VideoView::setCustomToggleAction(std::function<void()> action) { this->customToggleAction = action; }
 
-void VideoView::setSpeed(float speed) { mpvCore->setSpeed(speed); }
+void VideoView::setSpeed(float speed) {
+#ifdef PS5_NATIVE_APP
+    (void)speed; /* 自管播放器暂不支持倍速 */
+#else
+    mpvCore->setSpeed(speed);
+#endif
+}
 
 void VideoView::setLastPlayedPosition(int64_t p) { lastPlayedPosition = p; }
 

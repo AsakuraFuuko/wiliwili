@@ -198,14 +198,14 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     # application: the software rendering variant gates its startup probe on one
     # of them.
     feature_defines = tuple(d for d in NATIVE_DEFINES if d.startswith("-DWILIWILI_"))
-    extra_sources = ["native_shims.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c", "audio_probe.c", "audio2_probe.c", "player_probe.c"]
+    extra_sources = ["native_shims.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c", "audio_probe.c", "audio2_probe.c", "ps5_player.c"]
     # native_libc_trace.c reports every string and memory call reached with a
     # NULL argument, which is how the software renderer's crash was identified.
     # It wraps hot libc entry points, so it is a diagnostic aid and stays out of
     # the deliverable image unless PS5_NATIVE_LIBC_TRACE=1 asks for it.
     if os.environ.get("PS5_NATIVE_LIBC_TRACE") == "1":
         extra_sources.append("native_libc_trace.c")
-    # 探针要用 SDK 里的 ffmpeg 头（player_probe.c 走 ffmpeg 解封装）。
+    # 自管播放器要用 SDK 里的 ffmpeg 头（ps5_player.c 走 ffmpeg 解封装）。
     homebrew_include = sdk / "target" / "user" / "homebrew" / "include"
     probe_defines    = feature_defines + (f"-I{homebrew_include}",)
     for extra in extra_sources:
