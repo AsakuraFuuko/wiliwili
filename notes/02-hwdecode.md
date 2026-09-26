@@ -1266,3 +1266,31 @@ clock_ms=15781 pts_ms=15800
 clock_ms=29008 pts_ms=29533
 clock_ms=36682 pts_ms=37133     ← A/V 锁定在 ±500ms，~40 秒推进 37 秒 ≈ 实时
 ```
+
+### 最终状态（2026-09-27）
+
+**播放链路（真机验证）**：真实 B 站点播画面+声音正常，A/V 锁定在 ±500ms，
+`~40 秒推进 37 秒 ≈ 实时`；本地 DASH 测试流同样正常；无崩溃。
+验证方式 `WILIWILI_TEST_BV=BV1teau6XE5Z` + `WILIWILI_TEST_BV_DELAY=25`
+（无人值守可复现，不需要手点）。
+
+**排查中被证伪的两个假设（别再重复走）**
+1. **"B 站非标流缺参数集"——错**。逐字节 dump 首个 AU 后确认参数集齐全
+   （`nals=[6 7 8 6 5]`：SEI+SPS+PPS+SEI+IDR，SPS profile=100/level=3.0/640x360）。
+   期间做的"把 SPS/PPS 提前到 AU 最前"的重排**无效**，已删除。
+2. **"AU 被手写扫描切碎"——也不是本 case 的原因**。手写扫描确实是隐患
+   （已改用 bsf 包边界），但这次每帧失败的真正原因是 `max_dpb_frames=4`。
+
+**真正的根因（两次都是它）**
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 每帧 `dec=0x811D0302 valid=0`、只有声音 | `max_dpb_frames` 写死 4，而流的 SPS 声明 `max_num_ref_frames=7` | 改成 `-1`（`SCE_VIDEODEC2_AUTO_FRAMES`，解码器自定） |
+| 画面出来但只有 ~6 fps、`pts_ms` 远落后 `clock_ms` | worker 每轮推 64 块音频（阻塞 ≈341ms），每轮只解 1 帧视频 | 每轮推 2 块（≈10.7ms），循环 ~90Hz |
+
+**判定"解码器拒绝"的最短路径**（下次直接用，省掉本轮绕的弯路）
+1. `WILIWILI_TEST_BV` 复现 → 看 `player: auN size=.. dec=..` 是否 `dec=0`。
+2. `dec!=0` 时**先怀疑解码器配置**而不是码流：把 SPS 的
+   `profile_idc / level_idc / max_num_ref_frames / 分辨率`解析出来，与
+   `DecoderConfigInfo` 逐项对比（`max_dpb_frames` 用 -1 就不会错）。
+3. 需要"确定无疑"的字节时用 `read-download0.sh` 取回落盘文件（记得先 kill 标题，
+   镜像才写回）。
