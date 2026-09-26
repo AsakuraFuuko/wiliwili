@@ -216,7 +216,7 @@ static int decoder_init(int width, int height) {
         wiliwili_boot_log(lb);
     }
     g_au_pool    = alloc_direct(limit, 0x800000u * AU_SLOTS, 0x32);
-    g_frame_pool = alloc_direct(limit, g_frame_size * FRAME_SLOTS, 0x32);
+    g_frame_pool = alloc_direct(limit, g_frame_size * (FRAME_SLOTS + 1), 0x32); /* +1：Flush 独占槽 */
         if (!g_au_pool || !g_frame_pool) return -1;
 
     if (sceVideodec2CreateDecoder(&config, &mem, &g_decoder) != 0) return -1;
@@ -504,9 +504,10 @@ static void video_submit_packet(AVPacket *pkt) {
             FrameBuffer fframe;
             memset(&fframe, 0, sizeof(fframe));
             fframe.size        = sizeof(fframe);
-            fframe.buffer      = (uint8_t *)g_frame_pool + (size_t)fslot * g_frame_size +
-                            (size_t)(g_frame_size / 2);
-            fframe.buffer_size = g_frame_size / 2;
+            /* 必须是**整帧**大小（它是解码器的输出目标；给半个帧会让 Flush 失败 ⇒
+             * 一帧都拿不到 ⇒ 播放器只剩转圈——踩过一次）。独占池里最后一个槽位。 */
+            fframe.buffer      = (uint8_t *)g_frame_pool + (size_t)FRAME_SLOTS * g_frame_size;
+            fframe.buffer_size = g_frame_size;
             memset(&oi, 0, sizeof(oi));
             oi.size = sizeof(oi);
             flush_rc = sceVideodec2Flush(g_decoder, &fframe, &oi);
