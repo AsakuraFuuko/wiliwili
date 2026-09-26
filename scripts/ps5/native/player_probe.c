@@ -285,7 +285,7 @@ void wiliwili_player_probe(const char *url) {
                                         &g_adec->ch_layout, g_adec->sample_fmt, g_adec->sample_rate, 0, NULL) == 0) {
                     swr_init(g_swr);
                 }
-                plog2("player: audio codec=%s sr=%d", (long)adec->id, g_adec->sample_rate);
+                plog2("player: audio codec id=%d sr=%d", (long)adec->id, g_adec->sample_rate);
             } else {
                 g_adec = NULL;
             }

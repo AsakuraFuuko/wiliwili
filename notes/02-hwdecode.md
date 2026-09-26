@@ -790,3 +790,26 @@ player: audio codec found / audio decoder open                                  
 **下一步（明确且局部）**：把 `swr_alloc_set_opts2(...)` 换成 AVOption 手工配置（`swr_alloc()` +
 `av_opt_set_chlayout/av_opt_set_int` + `swr_init`），并保留打点；过了这一步接下来就是
 "按音频时钟解视频 + 上屏"的循环（那一套已在 `videodec2_probe.c` 里验证过）。
+
+
+### ★ P2e 装配成功（2026-09-26 真机）：自管播放器跑通
+
+```
+player: sysmodule rc=0 / decoder reset rc=0     ← 硬解就绪
+player: audio handle=536870912                  ← AudioOut 就绪
+player: streams v=0 a=1                         ← 解封装找到视频/音频流
+player: bsf lookup/filter=1/alloc ok/init rc=0  ← h264_mp4toannexb
+player: audio codec found/decoder open          ← AAC 解码器
+player: audio codec id=86018 sr=48000
+player: ready                                   ← 全链路就绪
+player: clock_ms=1504 audio_blocks=282 pts_ms=2366   ← 播放中：音频时钟 1.5s、视频 PTS 2.37s
+```
+
+即：**ffmpeg 解封装 → 硬解 → NV12 上屏 + ffmpeg 解码音频 → sceAudioOut** 这台"自管播放器"在真机上跑起来了
+（`WILIWILI_TEST_PLAYER=<url>` 触发）。
+
+**踩到的三个自身 bug（都已修）**：`%s` 配整数导致 snprintf 解引用野指针（崩）、`log2` 与 math.h 冲突、
+C 文件里写了 `nullptr`。**待修的小项**：音频时钟到 1.5 s 后不再推进（`av_read_frame` 的 EOF/循环结构），
+以及视频预解码窗口的节奏（40/60 ms 阈值）。
+
+**下一步**：修节奏 → 把这条链搬进 `VideoView`（弹幕/OSD 不动）→ 清探针 → 出发布镜像。
