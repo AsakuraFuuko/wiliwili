@@ -16,8 +16,6 @@
 
 #include <time.h>
 #include <pthread.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -102,7 +100,6 @@ static uint8_t g_uv_plane[1920 * 544];
 static int g_y_width, g_y_height;
 static int g_ready;
 /* 硬解环索引与自增序号：随 open 重置，且只能由唯一生产者推进。 */
-static int g_au_slot;
 /* AU 环索引：输入槽与帧槽都以它为模（EVO 的做法是各自取模，见 decode_au）。
  * 随 open/close 归零；只能由唯一生产者推进。 */
 static unsigned g_au_ring;
@@ -534,7 +531,6 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     g_pkt    = av_packet_alloc();
     g_aframe = av_frame_alloc();
     /* 环索引随每次 open 归零：跨片累加会让解码器仍持有的槽被覆盖（野指针崩溃）。 */
-    g_au_slot    = 0;
     g_au_seq     = 0;
     g_dbg_au     = 0;
     g_au_ring    = 0;
@@ -793,7 +789,9 @@ static void *player_worker(void *arg) {
     while (g_worker_run) {
         int reads = 0;
         long usec = 0;
-        player_audio_fill(&reads, &usec);
+        player_audio_fill(&reads, &usec); /* 输出参数此处不用：只关心副作用 */
+        (void)reads;
+        (void)usec;
         player_video_step_to_stage();
         if (!g_worker_run) break;
         /* 每轮只推 2 块音频（≈10.7ms）——**不能推一大批**：`sceAudioOutOutput` 会阻塞到
@@ -941,7 +939,6 @@ void wiliwili_ps5player_close(void) {
     g_audio_blocks = 0;
     g_y_width = 0;
     g_y_height = 0;
-    g_au_slot    = 0;
     g_au_seq     = 0;
     g_dbg_au     = 0;
     g_au_ring    = 0;
@@ -1057,38 +1054,23 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     }
 
     if (g_afmt) {
-        /* 两条独立 URL：音频从 g_afmt 读，视频单独走 video_step（单源路径不动） */
+        /* 两条独立 URL（DASH）：音频从 g_afmt 读，视频单独走 video_step。
+         * 这是**兜底路径**——正常情况下 worker 线程在跑，早在上面就返回了；
+         * 只有 WILIWILI_PLAYER_THREAD 被显式关闭时才走到这里。 */
         int aguard = 0;
-        int reads = 0;
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
         while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 1024) {
             if (av_read_frame(g_afmt, g_pkt) < 0) {
                 g_audio_eof = 1;
                 break;
             }
-            ++reads;
             if (g_pkt->stream_index == g_audio_index && g_adec) {
                 avcodec_send_packet(g_adec, g_pkt);
                 audio_decode_one_frame();
             }
             av_packet_unref(g_pkt);
         }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        int before_push = g_pcm_frames;
         video_step();
         audio_push_blocks(64);
-        {
-            static int dbg = 0;
-            if (dbg < 6) {
-                ++dbg;
-                char lb[220];
-                snprintf(lb, sizeof(lb), "player: fill reads=%d usec=%ld pcm=%d pushed=%d eof=%d", reads,
-                         (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L), before_push,
-                         before_push - g_pcm_frames, (int)g_audio_eof);
-                wiliwili_boot_log(lb);
-            }
-        }
         wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
         if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
         static int report_at2 = 0;
@@ -1148,11 +1130,9 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
         av_packet_unref(g_pkt);
     }
     video_step();
-    if (draw_calls <= 3) plog1("player: refilled pcm_frames=%d", (long)g_pcm_frames);
     /* 排空缓冲：sceAudioOutOutput 会阻塞到该块播完，节奏由它定（推 1 块会把音频
      * 绑死在渲染帧率上——实测 28 s 才走 1.28 s 音频）。 */
     audio_push_blocks(64);
-    if (draw_calls <= 3) plog1("player: pushed blocks=%d", (long)g_audio_blocks);
 
     wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
     if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
