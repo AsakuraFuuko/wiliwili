@@ -519,9 +519,26 @@ int wiliwili_ps5player_overlay(void) { return g_overlay; }
 /* 已成功起流？供 VideoView 判断是否需要改用备用视频地址。 */
 int wiliwili_ps5player_ready(void) { return g_ready; }
 
+/* ── 状态查询：供 MPVCore 把"自管播放器"的状态喂给 UI（mpv 事件循环在 PS5 上不跑） ── */
+int wiliwili_ps5player_paused(void) { return g_paused; }
+
+long wiliwili_ps5player_position_ms(void) { return (long)(g_audio_clock_us() / 1000); }
+
+long wiliwili_ps5player_duration_ms(void) {
+    if (g_fmt == NULL || g_fmt->duration == AV_NOPTS_VALUE) return 0;
+    return (long)(g_fmt->duration / (AV_TIME_BASE / 1000));
+}
+
 /* VideoView::draw 每帧上报自己的矩形（nvg 坐标：左上角原点）。视频按 16:9 letterbox 放进这个区域，
  * 区域之外（OSD、评论、标题）不受影响。 */
 void wiliwili_ps5player_set_rect(float x, float y, float w, float h) {
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        char lb[200];
+        snprintf(lb, sizeof(lb), "player: rect=%.0f,%.0f %.0fx%.0f", x, y, w, h);
+        wiliwili_boot_log(lb);
+    }
     g_rect_x = x;
     g_rect_y = y;
     g_rect_w = w;
@@ -557,7 +574,15 @@ static void pl_get_viewport(int vp[4]) {
 }
 
 void wiliwili_ps5player_draw(struct NVGcontext *vg) {
-    if (!g_ready || g_paused) return;
+    static int why_logged = 0;
+    if (!g_ready) {
+        if (!why_logged) {
+            why_logged = 1;
+            wiliwili_boot_log("player: draw skip (not ready)");
+        }
+        return;
+    }
+    /* 暂停时**仍然画**（显示最后一帧），只是不推进——之前暂停会让整个画面消失。 */
     /* 画面按区域画：16:9 适配进 g_rect_*（GL 视口原点在左下，y 要翻转）。
      * 之前画全屏且在 nvgBeginFrame 之前，会被 VideoView 的不透明背景盖住 ⇒ 全白。 */
     int old_vp[4];
@@ -584,6 +609,10 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     ++draw_calls;
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
 
+    if (g_paused) {
+        wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+        return;
+    }
     if (g_afmt) {
         /* 两条独立 URL：音频从 g_afmt 读，视频单独走 video_step（单源路径不动） */
         int aguard = 0;
@@ -607,6 +636,11 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
             plog3("player: clock_ms=%d blocks=%d pts_ms=%d", (long)(g_audio_clock_us() / 1000), (long)g_audio_blocks,
                   (long)(g_last_video_pts_us / 1000));
         }
+        return;
+    }
+
+    if (g_paused) {
+        wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
         return;
     }
 

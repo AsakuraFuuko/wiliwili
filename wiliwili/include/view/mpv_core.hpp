@@ -155,6 +155,11 @@ public:
     int64_t getVolume() const;
 
     bool isValid();
+#ifdef PS5_NATIVE_APP
+    /* 把自管播放器的状态同步到 mpv 的状态成员：PS5 上没有 mpv 事件循环，
+     * 不这样喂 UI 就永远停在"未播放"（表现：播放器一直转圈、进度条不动）。 */
+    void syncNativePlayerState();
+#endif
 
     // todo: remove these sync function
     std::string getString(const std::string &key);

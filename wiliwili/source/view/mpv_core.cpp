@@ -276,9 +276,39 @@ mpv_event *stub_wait_event(mpv_handle *, double) {
     e.event_id = MPV_EVENT_NONE;
     return &e;
 }
-int stub_get_property(mpv_handle *, const char *, mpv_format, void *) { return -1; }
+int stub_get_property(mpv_handle *, const char *name, mpv_format fmt, void *data) {
+    if (!name || !data) return -1;
+#ifdef PS5_NATIVE_APP
+    auto set_num = [&](double v) {
+        if (fmt == MPV_FORMAT_DOUBLE) *(double *)data = v;
+        else if (fmt == MPV_FORMAT_INT64) *(int64_t *)data = (int64_t)v;
+        else if (fmt == MPV_FORMAT_FLAG) *(int *)data = (int)(v != 0);
+        else return -1;
+        return 0;
+    };
+    if (!strcmp(name, "duration")) return set_num(wiliwili_ps5player_duration_ms() / 1000.0);
+    if (!strcmp(name, "time-pos")) return set_num(wiliwili_ps5player_position_ms() / 1000.0);
+    if (!strcmp(name, "percent-pos")) return set_num(0);
+    if (!strcmp(name, "pause")) return set_num(wiliwili_ps5player_paused());
+    if (!strcmp(name, "eof-reached")) return set_num(0);
+    if (!strcmp(name, "core-idle")) return set_num(0);
+    if (!strcmp(name, "idle-active")) return set_num(0);
+    if (!strcmp(name, "paused-for-cache")) return set_num(0);
+    if (!strcmp(name, "speed")) return set_num(1.0);
+    if (!strcmp(name, "volume")) return set_num(100.0);
+    if (!strcmp(name, "width")) return set_num(1920);
+    if (!strcmp(name, "height")) return set_num(1080);
+    if (!strcmp(name, "playlist-count")) return set_num(1);
+    if (!strcmp(name, "playlist-pos")) return set_num(0);
+#endif
+    return -1;
+}
 int stub_command_async(mpv_handle *, uint64_t, const char **) { return -1; }
-char *stub_get_property_string(mpv_handle *, const char *) { return nullptr; }
+char *stub_get_property_string(mpv_handle *, const char *) {
+    /* 绝不能返回 NULL：调用方会直接 std::string(ptr)，那是空指针构造（实测崩过）。 */
+    static char empty[1] = {0};
+    return empty;
+}
 void stub_free_node_contents(mpv_node *) {}
 int stub_set_option(mpv_handle *, const char *, mpv_format, void *) { return -1; }
 void stub_free(void *) {}
@@ -975,6 +1005,23 @@ void MPVCore::setFrameSize(brls::Rect r) {
     mpvRenderContextReportSwap(mpv_context);
 #endif
 }
+
+#ifdef PS5_NATIVE_APP
+extern "C" int wiliwili_ps5player_ready(void);
+extern "C" int wiliwili_ps5player_paused(void);
+extern "C" long wiliwili_ps5player_position_ms(void);
+extern "C" long wiliwili_ps5player_duration_ms(void);
+
+void MPVCore::syncNativePlayerState() {
+    bool ready          = wiliwili_ps5player_ready() != 0;
+    bool paused         = wiliwili_ps5player_paused() != 0;
+    this->video_stopped = !ready;
+    this->video_playing = ready && !paused;
+    this->video_paused  = paused;
+    this->playback_time = (double)wiliwili_ps5player_position_ms() / 1000.0;
+    this->duration      = (double)wiliwili_ps5player_duration_ms() / 1000.0;
+}
+#endif
 
 bool MPVCore::isValid() {
 #ifdef PS5_NATIVE_APP

@@ -636,6 +636,9 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     /* 每帧把播放器矩形告诉自管播放器：它在 UI 之后按这个区域（16:9 letterbox）画视频。 */
     wiliwili_ps5player_set_rect(x, y, width, height);
 #endif
+#ifdef PS5_NATIVE_APP
+    mpvCore->syncNativePlayerState(); /* 每帧把自管播放器的状态喂给 UI（OSD/转圈/进度条依赖） */
+#endif
     if (!mpvCore->isValid()) return;
     float alpha        = this->getAlpha();
     brls::Time current = brls::getCPUTimeUsec();
