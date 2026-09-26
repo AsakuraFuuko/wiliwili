@@ -54,8 +54,11 @@ int32_t sceVideodec2Flush(void *decoder, void *frame, void *output);
 #define RESOURCE_COMPUTE 1u
 /* 环大小取已验证探针的值（pipeline_depth=1 时 3 槽足够；探针用 3 连解 30 帧无问题）。
  * EVO 的 8/12 是针对它自己 DecodeInputQueueDepth=4 的配置，别照抄。 */
-#define AU_SLOTS 3
-#define FRAME_SLOTS 3
+/* 1080p 下解码器吞吐慢，3 槽不够：第 4 个 AU 会覆盖解码器仍持有的第 1 槽
+ * （实测 1920x896 流在第 3~4 帧野指针崩溃；640x368 的小流却不会）。
+ * 按 EVO 的经验值放到 8/12（它的 DecodeInputQueueDepth=4、帧环留 3 个富余）。 */
+#define AU_SLOTS 8
+#define FRAME_SLOTS 12
 #define AUDIO_GRAIN 256 /* 每块 256 帧（EVO 的可用实现用的就是它） */
 #define AUDIO_FREQ 48000
 
@@ -589,6 +592,26 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     pl_get_viewport(old_vp);
     int vp[4]     = {0, 0, 0, 0};
     int have_rect = (g_rect_w > 1.0f && g_rect_h > 1.0f);
+    {
+        static int logged_fit = 0;
+        if (have_rect && !logged_fit) {
+            logged_fit = 1;
+            int src_ar_w = (g_y_width > 0) ? g_y_width : 1920;
+            int src_ar_h = (g_y_height > 0) ? g_y_height : 1080;
+            float ar     = (float)src_ar_w / (float)src_ar_h;
+            float w      = g_rect_w;
+            float h      = w / ar;
+            if (h > g_rect_h) {
+                h = g_rect_h;
+                w = h * ar;
+            }
+            char lb[200];
+            snprintf(lb, sizeof(lb), "player: fit rect=%.0f,%.0f %.0fx%.0f -> %.0fx%.0f vp_y=%.0f", g_rect_x,
+                     g_rect_y, g_rect_w, g_rect_h, w, h, (float)old_vp[3] - (g_rect_y + (g_rect_h - h) * 0.5f) - h);
+            wiliwili_boot_log(lb);
+        }
+    }
+    have_rect = 0; /* 见上：先全屏直画 */
     if (have_rect) {
         int win_h = old_vp[3]; /* 当前视口高度（整窗），用于 y 翻转 */
         float src_ar = (g_y_width > 0 && g_y_height > 0) ? (float)g_y_width / (float)g_y_height : 16.0f / 9.0f;
