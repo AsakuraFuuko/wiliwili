@@ -1128,3 +1128,118 @@ player: clock_ms=2560→5120→6016  pts_ms=2900→5400→5966   ← 整片播�
 
 **若仍有偶发崩溃**（`addr=0x86cad7`）：把暂存改成三缓冲/环形，彻底消除"解码槽位复用与显示读取"的竞争；
 目前靠"环 8/12 + Flush 独立整帧缓冲"缓解。
+
+---
+
+### ★★ 播放器"一帧都解不出来"的根因链（2026-09-26 深夜，真机逐层定位）
+
+**现象**：真实 B 站点播 + 本地 DASH 测试流都是"有声音、时钟 1:1 推进、画面全白"。
+日志每帧：`player: auN size=… dec=-2128805117 valid=0 oi=0 0x0`（`0x811D0303`）。
+
+**根因链（按发现顺序，前两条是"假因"，最后一条才是真因）**
+
+1. **双生产者竞争（真 bug，但不是白屏主因）**：上一版把"独立播放线程"的 worker 分支写在
+   `draw()` 里 `if (g_afmt) {…}` 之后，而 `g_afmt != NULL` 正是 worker 被创建的条件 ⇒
+   渲染线程与 worker **同时**读 `g_fmt`/`g_afmt`、抢同一个 `g_pkt`、同时推音频。
+   修法：worker 分支提到最前，且成为唯一生产者；worker 直接解码进 `g_stage_*`
+   （锁内），渲染线程只 `player_take_frame()`，不再共用 `g_y_plane`。
+2. **DPB/环尺寸（假因，勿再"优化"）**：曾把 `max_dpb_frames` 4→16、环 3→8/12 想"增强 1080p"，
+   真机立刻 `dec=0x811D0302/0303`。**已验证探针就是 DPB=4 + 3 槽单环、AU 槽与帧槽共用
+   同一索引**；改成 8/12 反而坏。已改回 `MAX_DPB_FRAMES=4` / `AU_SLOTS=4` / 单环共享索引。
+3. **真因：AU（访问单元）边界**。`h264_mp4toannexb` 的输出**不是**访问单元，它把每个
+   NAL（SEI / SPS / PPS / 片）**各自成包**。旧代码把**每个 bsf 输出包直接当 AU** 喂给
+   `sceVideodec2Decode` ⇒ 解码器永远收不到"含 SPS+PPS 的关键帧 AU" ⇒ 每帧 `0x811D0303`。
+   **决定性对照实验**：把同一份 Annex-B 流（`pt-v.annexb.h264`，625464 B）给
+   - `videodec2_probe`（`WILIWILI_TEST_VDEC=1`）：**180/180 帧全部解出**（电视出画面）；
+   - 播放器：**每帧 valid=0**。
+   ⇒ 排除流、ABI、解码器配置，锁定"AU 聚合"。
+
+**修法（在主机侧做到与探针逐字节等价，再上真机）**：把 bsf 输出**原样拼接**进 8 MB 的
+`g_au_buf`，再对拼接结果按探针 `split_stream` 的规则切 AU —— **遇到第二个 VCL 片
+（type 1/5）就在它之前切**。**不要按"包边界"推理 AU**：一个包可能含多个 NAL，一个 AU
+也可能横跨多个包，任何按包推演都会引入一字节级偏移，而解码器对此不容错。
+
+**验证方法（推荐沿用）**：主机侧用纯 Python 复刻切分算法，与探针算法在**同一份流**上
+逐字节比对（`probe == player` 且 AU 数 = 帧数）。本轮结果：180 AU、全字节相同、
+AU0 = `00 00 00 01 06 05 ff ff…`（8948 B）。这一步不依赖真机，能直接证伪/证实聚合逻辑。
+
+**另一个必须知道的坑（浪费了两轮真机）**：ShadowMountPlus 对已注册镜像打印
+`[SPEED] Skipping file copy (Assets already exist)`，**不会同步新的 `assets/`**。
+改 `assets/wiliwili-options.txt` 而不换 TITLE_ID 时，真机跑的还是旧 assets
+（表现为"我明明配了本地流，日志里却出现 `vdec:` 探针输出"）。
+⇒ **用测试选项做验证时务必换一个全新 TITLE_ID**（本轮用 `PPSA99014`）。
+
+### ★★ 播放器重构（2026-09-26 深夜）：改用 FFmpeg 原语 + 两个被我引入又修掉的回归
+
+**背景**：用户报"只有声音、没有画面"。用 `WILIWILI_TEST_BV=<bvid>` + `WILIWILI_TEST_BV_DELAY`
+做成**全自动复现**（不用手点），逐层定位。
+
+**按 EVO-PLAYER-PS5 的做法重构了提交路径**（`evo_vdec_native.c` 是同类参考实现）：
+- **不再手写 Annex-B 扫描切 AU**。解复用器给出的每个样本就是一个 AU，
+  `h264_mp4toannexb` 保持样本边界 ⇒ 「每个 bsf 输出包 = 一个 AU」直接喂解码器。
+  手写扫描会在片数据里把 `00 00 01` 误判成 NAL 边界，把 AU 切碎。
+- 参数集：靠**重建 bsf**（不是 `av_bsf_flush`）重新武装 `h264_mp4toannexb` 的一次性
+  SPS/PPS 注入——EVO 的 #57 就是这么解的，注释里写得很清楚。
+- 输入槽与帧槽**独立取模**。
+
+**教训 1（我引入的回归）：`bsf_rebuild()` 里顺手 `free` 了自己的输入参数**
+```c
+if (g_bsf) av_bsf_free(&g_bsf);
+if (g_bsf_par) avcodec_parameters_free(&g_bsf_par);   /* ← 这是输入，不能释放 */
+g_bsf = NULL;
+if (g_bsf_par == NULL) return -1;                     /* ← 必然成立 ⇒ 永远返回 -1 */
+```
+症状：`player: bsf rebuild rc=-1` ⇒ 视频路径被整体禁用（`y=0x0`）。**修法**：只释放旧过滤器。
+
+**教训 2（我引入的回归，代价最大）：照抄 EVO 的 decoder 配置打坏了能用的解码器。**
+把 `pipeline_depth` 1→4、帧池 4→8、DPB 4→16 之后，**每一帧**都变成
+`sceVideodec2Decode` 返回 `0x811D0302`/`0303`（valid=0）。
+证据（同一次运行的 AU 结构完全正常，参数集齐全）：
+```
+player: au1 nals=[6 7 8 6 5 ]   ← SEI+SPS+PPS+SEI+IDR，参数集一个不缺
+player: au1 ... dec=-2128805118 valid=0
+player: au2 nals=[1 ]           ← P 帧，同样 valid=0
+```
+⇒ **错误码与"AU 内容"无关，只与解码器配置有关**。
+**`pipeline_depth=1` + DPB=4 + 环 4 槽是真机唯一的已验证可用组合**；EVO 的
+4/8/16 是给它自己的流与使用方式调的，**不能照抄**。改这几个数之前必须在真机上先证明更好。
+
+**方法论（本轮最有价值的两条）**
+1. **日志会丢**：`wiliwili_boot_log` 走 UDP + 每行一次 `fsync`，密集输出时**相邻两行也会丢**
+   （曾因此误判"take/drew 从未执行"）。需要"确定无疑"的读数时写文件，或把多项状态
+   **合并进同一行**。
+2. **`WILIWILI_TEST_BV` 让真实流可自动复现**——比手点可靠，且能跑在无人值守的循环里。
+   配套脚本 `scripts/ps5/native/test-cycle.sh`：停旧标题 → 删旧镜像 → 写 options →
+   打包上传 → 重试 launch → 抓日志，一条命令跑完一个循环。
+
+**另一个反复踩的运维坑**：ShadowMountPlus 按 TITLE_ID 缓存 assets
+（`[SPEED] Skipping file copy (Assets already exist)`），
+**同一个 ID 重传镜像不会更新 `assets/`** ⇒ 改了 `wiliwili-options.txt` 必须换新 ID
+（且旧 ID 的进程要先退出，它占着 VideoOut 与音频句柄）。
+
+### ★★★ 根因终结：`max_dpb_frames` 必须是 -1（AUTO），否则参考帧多的流整段解不出（2026-09-26 深夜）
+
+**现象**：真实 B 站点播"只有声音、画面全白"（payload 线与原生线都一样）。
+日志逐帧 `player: auN ... dec=-2128805119 valid=0 oi=0 0x0`，而音频 `clock_ms` 1:1 正常。
+
+**证据链（全部真机）**
+1. **排除码流结构**：把失败流的首个 AU 前 512 字节 dump 到文件后逐字节解析（`pdump_hex`）：
+   `[SEI("BILIAVC.2.0.2:1 - H.264/AVC codec")][SPS][PPS][SEI][IDR]`
+   —— SPS/PPS/IDR 齐全，profile=100、level=3.0、分辨率 640x360，与解码器配置一致。
+   （期间我试过"把 SPS/PPS 提前到 AU 最前"的参数集重排：**无效**，已删除。）
+2. **主机侧解析 SPS 得到关键值**：`max_num_ref_frames = 7`。
+3. 我们的 `DecoderConfigInfo.max_dpb_frames` 当时写死 **4** ⇒ 解码器无法为本流分配
+   7 个参考帧 ⇒ **每一帧** `sceVideodec2Decode` 返回 `0x811D0302`、`valid=0`。
+4. 改成 `SCE_VIDEODEC2_AUTO_FRAMES(-1)`（EVO 的原话：*decoder self-sizes*）后，
+   同一个视频立刻 `dec=0 valid=1`，画面出来、`y=640x368`、无崩溃。
+
+**教训（这是本项目第二次栽在同一处）**：项目早期笔记写过"DPB 别写 4，EVO 用 -1"，
+后来被"按探针经验改成 4"覆盖掉了——**探针的测试流参考帧少，所以 4 也能过**，
+于是掩盖了问题。**这类"某个样本能过就当成结论"的推断要避免**：能力字段要么来自
+码流本身，要么用"自动/最大"值（-1），不要用某个成功样本反推出来的常量。
+
+**其余已确证仍需注意的点**
+- `pipeline_depth` 保持 1；把它提到 4（照抄 EVO）同样会让每帧 `0x811D0302`。
+- 环尺寸：输入 AU 环 4 槽、帧池 4 槽。
+- 差分诊断的取数通道：**"标题停止后 download0.dat 才写回"**，所以诊断文件要等
+  kill 完标题再读（`scripts/ps5/native/read-download0.sh`）。

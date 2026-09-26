@@ -16,6 +16,8 @@
 
 #include <time.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -53,13 +55,20 @@ int32_t sceVideodec2Flush(void *decoder, void *frame, void *output);
 #define SCE_SYSMODULE_VIDEODEC2 0xCF
 #define CODEC_AVC 1u
 #define RESOURCE_COMPUTE 1u
-/* 环大小取已验证探针的值（pipeline_depth=1 时 3 槽足够；探针用 3 连解 30 帧无问题）。
- * EVO 的 8/12 是针对它自己 DecodeInputQueueDepth=4 的配置，别照抄。 */
-/* 1080p 下解码器吞吐慢，3 槽不够：第 4 个 AU 会覆盖解码器仍持有的第 1 槽
- * （实测 1920x896 流在第 3~4 帧野指针崩溃；640x368 的小流却不会）。
- * 按 EVO 的经验值放到 8/12（它的 DecodeInputQueueDepth=4、帧环留 3 个富余）。 */
-#define AU_SLOTS 8
-#define FRAME_SLOTS 12
+/* 环尺寸与 DPB 必须回到**真机已验证可用**的那组值：
+ * 探针（30 帧连解 rc 全 0）与 21:32 那次真实 B 站视频成功播放，用的都是
+ * `pipeline_depth=1` + DPB=4 + 单一环索引。
+ * 教训（两次踩同一个坑）：照抄 EVO 的 `pipeline_depth=4` / 帧池 8 / DPB 16 都会让
+ * `sceVideodec2Decode` 对**每一帧**返回 0x811D0302/0303（valid=0）——那不是"容量不够"，
+ * 而是与驱动的内部假设冲突。改这些数之前先在真机上证明它比现在更好。 */
+#define AU_SLOTS 4          /* 输入 AU 环 */
+#define FRAME_SLOTS 4       /* 帧池（与输入环一致） */
+/* `max_dpb_frames` 必须是 SCE_VIDEODEC2_AUTO_FRAMES(-1)，让**解码器按码流自定尺寸**。
+ * 写死 4 会让"参考帧多于 4"的流整段解不出来：实测某 B 站 360P 流的 SPS 声明
+ * `max_num_ref_frames=7`，解码器每帧返回 0x811D0302、valid=0——现象只有声音、画面全白。
+ * （早期笔记里"EVO 用 -1"是对的，后来把它改成 4 是回归。） */
+#define MAX_DPB_FRAMES (-1)
+#define PIPELINE_DEPTH 1
 #define AUDIO_GRAIN 256 /* 每块 256 帧（EVO 的可用实现用的就是它） */
 #define AUDIO_FREQ 48000
 
@@ -92,6 +101,23 @@ static uint8_t g_y_plane[1920 * 1088];
 static uint8_t g_uv_plane[1920 * 544];
 static int g_y_width, g_y_height;
 static int g_ready;
+/* 硬解环索引与自增序号：随 open 重置，且只能由唯一生产者推进。 */
+static int g_au_slot;
+/* AU 环索引：输入槽与帧槽都以它为模（EVO 的做法是各自取模，见 decode_au）。
+ * 随 open/close 归零；只能由唯一生产者推进。 */
+static unsigned g_au_ring;
+static uint64_t g_au_seq;
+static int g_dbg_au;
+/* 帧搬运：工作线程写、渲染线程读。锁保护，只搬运"最新一帧"。
+ * 详见文件后部"播放线程"小节对单生产者约束的说明。 */
+static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_frame_new;                 /* 搬运缓冲里有尚未上传的帧 */
+static uint8_t g_stage_y[1920 * 1088];  /* Y 面 */
+static uint8_t g_stage_uv[1920 * 544];  /* NV12 的 UV 面只有 Y 的一半 */
+/* 工作线程私有的解码目标：解码在这里做（不持锁），解完才在锁内拷进 g_stage_*。 */
+static uint8_t g_work_y[1920 * 1088];
+static uint8_t g_work_uv[1920 * 544];
+static int g_stage_w, g_stage_h;
 
 /* ffmpeg */
 static AVFormatContext *g_fmt;
@@ -119,7 +145,6 @@ static int g_pcm_frames;
 static int g_audio_handle = -1;
 static unsigned long long g_audio_blocks;
 static int g_audio_eof;
-static int g_pending_video; /* g_pkt 里留着一个未到播放时间的视频包 */
 static int g_paused;
 static char g_url[1024]; /* 当前打开的 URL（用于幂等判断） */
 static int g_overlay; /* 探针模式：在 UI 之后重复画一遍，便于肉眼确认 */
@@ -186,8 +211,8 @@ static int decoder_init(int width, int height) {
      * 已验证的探针里写的是 640x368（= 360 对齐到 368）。 */
     config.max_width            = (width + 15) & ~15;
     config.max_height           = (height + 15) & ~15;
-    config.max_dpb_frames       = 16; /* 1080p 流参考帧可能多于 4（EVO 用 -1）；太小会导致 Decode 不出帧 */
-    config.pipeline_depth       = 1; /* 保持 1：AU 环只有 3 槽，提高会互相覆盖 */
+    config.max_dpb_frames       = MAX_DPB_FRAMES; /* -1 = 让解码器按码流自定（见上方说明） */
+    config.pipeline_depth       = PIPELINE_DEPTH; /* 1 = 已验证值，勿提高（见上方说明） */
     config.compute_queue        = (uint64_t)compute_queue;
     config.cpu_affinity         = 0x3F;
     config.cpu_priority         = 700;
@@ -217,7 +242,7 @@ static int decoder_init(int width, int height) {
         wiliwili_boot_log(lb);
     }
     g_au_pool    = alloc_direct(limit, 0x800000u * AU_SLOTS, 0x32);
-    g_frame_pool = alloc_direct(limit, g_frame_size * (FRAME_SLOTS + 1), 0x32); /* +1：Flush 独占槽 */
+    g_frame_pool = alloc_direct(limit, g_frame_size * FRAME_SLOTS, 0x32);
         if (!g_au_pool || !g_frame_pool) return -1;
 
     if (sceVideodec2CreateDecoder(&config, &mem, &g_decoder) != 0) return -1;
@@ -257,10 +282,52 @@ static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_
 
 
 void wiliwili_ps5player_close(void); /* 定义在下面：换片时先收尾 */
-/* 播放线程（定义在文件后部） */
+/* 播放线程（定义在文件后部）。变量只在这里声明一次：worker 是否在跑、线程句柄。 */
 static void *player_worker(void *arg);
 static volatile int g_worker_run;
+static volatile int g_worker_started;
 static pthread_t g_worker_tid;
+
+/* ── 位流过滤器（Annex-B 转换 + 参数集注入） ──────────────────────────────
+ * `h264_mp4toannexb` 把 mp4 的 avcC 参数集（SPS/PPS）注入到**它的第一个输出包**
+ * （即首个 IDR）上——这是**一次性**的。`av_bsf_flush()` 会丢掉缓冲状态但**不会**
+ * 重新武装这次注入，因此换片/seek 之后的首个 IDR 会带着空的参数集到解码器，
+ * 解码器对每一帧返回 0x811D0302/0303（valid=0）⇒ "有声音、画面全白"。
+ * 正解（EVO-PLAYER-PS5 的 #57 同款处理）：**重建过滤器**，新过滤器会重新注入。
+ * ──────────────────────────────────────────────────────────────────────── */
+static AVCodecParameters *g_bsf_par; /* par_in 的副本，供重建时用 */
+
+static int bsf_rebuild(void) {
+    /* 只释放旧过滤器；`g_bsf_par` 是**输入**，必须保留（曾经顺手在这里把它 free 掉，
+     * 结果每次重建都因参数为空返回 -1，视频路径被整体禁用）。 */
+    if (g_bsf) av_bsf_free(&g_bsf);
+    g_bsf = NULL;
+    if (g_bsf_par == NULL) {
+        wiliwili_boot_log("player: bsf rebuild: params missing");
+        return -1;
+    }
+    const AVBitStreamFilter *bf = av_bsf_get_by_name("h264_mp4toannexb");
+    if (bf == NULL) {
+        wiliwili_boot_log("player: bsf rebuild: filter not registered");
+        return -1;
+    }
+    if (av_bsf_alloc(bf, &g_bsf) < 0) {
+        g_bsf = NULL;
+        wiliwili_boot_log("player: bsf rebuild: alloc failed");
+        return -1;
+    }
+    if (avcodec_parameters_copy(g_bsf->par_in, g_bsf_par) < 0) {
+        av_bsf_free(&g_bsf);
+        wiliwili_boot_log("player: bsf rebuild: params copy failed");
+        return -1;
+    }
+    if (av_bsf_init(g_bsf) < 0) {
+        av_bsf_free(&g_bsf);
+        wiliwili_boot_log("player: bsf rebuild: init failed");
+        return -1;
+    }
+    return 0;
+}
 
 void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     char line[192];
@@ -322,6 +389,15 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     if (avformat_find_stream_info(g_fmt, NULL) < 0) {
         wiliwili_boot_log("player: find stream info failed");
         return;
+    }
+    /* 报出探测到的流数与时长：`moov` 在文件尾且走 HTTP 顺序读时，ffmpeg 拿不到完整
+     * 索引（nb_streams/duration 全 0 或异常），表现是"open rc=0 但一个包都读不出来"。
+     * 这一行能让该现象一眼可见，不必再靠逐层打点。 */
+    {
+        char lb[200];
+        snprintf(lb, sizeof(lb), "player: fmt streams=%d duration=%lld start_time=%lld", (int)g_fmt->nb_streams,
+                 (long long)g_fmt->duration, (long long)g_fmt->start_time);
+        wiliwili_boot_log(lb);
     }
     extern int wiliwili_video_flip, wiliwili_video_swap, wiliwili_video_709;
     {
@@ -405,21 +481,23 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
         }
     }
 
-    /* H.264：mp4 是 AVCC，硬解要 Annex-B，用 bitstream filter 转换（并附上 SPS/PPS） */
+/* H.264：mp4 是 AVCC，硬解要 Annex-B，用 bitstream filter 转换（并附上 SPS/PPS） */
     if (g_video_index >= 0) {
         wiliwili_boot_log("player: bsf lookup");
-        const AVBitStreamFilter *filter = av_bsf_get_by_name("h264_mp4toannexb");
-        plog1("player: filter=%d", filter != NULL);
-        if (filter == NULL || av_bsf_alloc(filter, &g_bsf) != 0) {
-            wiliwili_boot_log("player: bsf alloc failed");
+        if (g_bsf_par) avcodec_parameters_free(&g_bsf_par);
+        g_bsf_par = avcodec_parameters_alloc();
+        if (g_bsf_par == NULL ||
+            avcodec_parameters_copy(g_bsf_par, g_fmt->streams[g_video_index]->codecpar) < 0) {
+            wiliwili_boot_log("player: bsf params copy failed");
             return;
         }
-        wiliwili_boot_log("player: bsf alloc ok");
-        avcodec_parameters_copy(g_bsf->par_in, g_fmt->streams[g_video_index]->codecpar);
-        wiliwili_boot_log("player: bsf params copied");
-        int bsf_rc = av_bsf_init(g_bsf);
-        plog1("player: bsf init rc=%d", bsf_rc);
-        if (bsf_rc != 0) return;
+        plog1("player: bsf rebuild rc=%d", bsf_rebuild());
+        if (g_bsf_par && g_bsf_par->extradata) {
+        }
+        if (g_bsf == NULL) {
+            wiliwili_boot_log("player: bsf unavailable, video path disabled");
+            return;
+        }
     }
 
     /* 音频解码 + 重采样到 S16 立体声 48k */
@@ -455,6 +533,12 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
 
     g_pkt    = av_packet_alloc();
     g_aframe = av_frame_alloc();
+    /* 环索引随每次 open 归零：跨片累加会让解码器仍持有的槽被覆盖（野指针崩溃）。 */
+    g_au_slot    = 0;
+    g_au_seq     = 0;
+    g_dbg_au     = 0;
+    g_au_ring    = 0;
+    g_frame_new  = 0;
     g_ready  = 1;
 
     /* DASH（双 URL）时把读取/解码/音频推送搬到独立线程：渲染线程只有 6~8fps，
@@ -471,111 +555,158 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     wiliwili_boot_log("player: ready");
 }
 
-/* 把一个视频包送进硬解，出帧就拷进稳定缓冲（Y/UV）。 */
-static void video_submit_packet(AVPacket *pkt) {
-    static int slot      = 0; /* AU 环 */
-    static int fslot     = 0; /* 帧环（与 AU 环独立，避免互相覆盖） */
-    static uint64_t au_seq = 0;
-    static int dbg_au = 0;
+/* ── Annex-B AU 聚合 ───────────────────────────────────────────────────────
+ * `h264_mp4toannexb` 的输出**不是**访问单元：它把每个 NAL 单独成包（SEI、SPS、PPS、
+ * 片各自一包）。直接把这些包逐个喂给解码器，解码器永远收不到"含参数集的关键帧 AU"，
+ * 每帧返回 0x811D0303（valid=0）——一帧都出不来。已验证的探针是按 **AU 边界**切分
+ * （下一个 VCL 片之前一切归上一个 AU），这里照做：
+ *   把 bsf 的每个输出包追加进 8 MB 的 AU 缓冲；检测到"新的 VCL 片起始"且缓冲里
+ *   已经有过一个 VCL 片时，就先把攒好的 AU 送去解码。
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* ── 访问单元（AU）提交 ─────────────────────────────────────────────────────
+ * 关键设计（照 EVO-PLAYER-PS5 的既有实现，见 evo_vdec_native.c）：
+ * **不要自己扫描 Annex-B 起始码来切 AU**。解复用器给出的每个样本就是一个 AU，
+ * `h264_mp4toannexb` 的输出**保持该样本边界** ⇒ 「每个 bsf 输出包 = 一个 AU」。
+ * 手写扫描会在片数据里误把 `00 00 01` 当 NAL 边界，把 AU 切碎，解码器对每一帧
+ * 返回 0x811D0302/0303（valid=0），现象是"有声音、画面全白"。
+ *
+ * 参数集（SPS/PPS）：`h264_mp4toannexb` 的注入是**一次性**的（首个 IDR 才有）。
+ * 需要重新注入时——例如换片/seek 之后——**重建 bsf**（不是 `av_bsf_flush`），
+ * 新建的过滤器会在它的第一个输出包上重新注入参数集。
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static void decode_au(const uint8_t *au, size_t len, uint8_t *dst_y, uint8_t *dst_uv, int *out_w, int *out_h,
+                      int64_t pts_us) {
+    if (!g_decoder || len == 0 || len > 0x800000) return;
+    unsigned islot = g_au_ring % AU_SLOTS;
+    unsigned fslot = g_au_ring % FRAME_SLOTS;
+    ++g_au_ring;
+    uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)islot * 0x800000u;
+    if (au != au_slot) memcpy(au_slot, au, len);
+    InputData input;
+    memset(&input, 0, sizeof(input));
+    input.size    = sizeof(input);
+    input.au      = au_slot;
+    input.au_size = (uint64_t)len;
+    /* pts 用自增序号：已验证的探针就是 0,1,2…。A/V 同步靠音频时钟的 g_last_video_pts_us。 */
+    input.pts     = (uint64_t)(g_au_seq++);
+    input.dts     = UINT64_MAX;
+    FrameBuffer frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.size        = sizeof(frame);
+    frame.buffer      = (uint8_t *)g_frame_pool + (size_t)fslot * g_frame_size;
+    frame.buffer_size = g_frame_size;
+    OutputInfo oi;
+    memset(&oi, 0, sizeof(oi));
+    oi.size = sizeof(oi);
+    int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
+    if (rc == 0 && oi.valid == 0) {
+        /* 还没攒够帧：Flush 把已解出的帧吐出来（复用同一个 `frame`，同已验证探针）。 */
+        memset(&oi, 0, sizeof(oi));
+        oi.size = sizeof(oi);
+        (void)sceVideodec2Flush(g_decoder, &frame, &oi);
+    }
+    /* 前几个 AU 的提交结果：解码器一旦拒绝（rc != 0 或 valid = 0）在这里就能看到。 */
+    if (g_dbg_au < 4) {
+        ++g_dbg_au;
+        plog3("player: au%d size=%d dec=%d", (long)g_dbg_au, (long)len, (long)rc);
+    }
+    /* A/V 节流用真实 PTS。 */
+    if (pts_us >= 0) g_last_video_pts_us = pts_us;
+    /* 几何量必须自检后再用：解码器失败/未填充时会留下未初始化的 width/pitch，
+     * 照着它逐行 memcpy 就是野读野写（实测崩在映像内部，addr=0x86caed）。 */
+    if (oi.valid && oi.buffer && oi.width > 0 && oi.height > 0 && oi.pitch >= (uint32_t)oi.width &&
+        oi.width <= 1920 && oi.height <= 1088 && oi.pitch <= 4096) {
+        int w = (int)oi.width, h = (int)oi.height;
+        const uint8_t *src = (const uint8_t *)oi.buffer;
+        if (oi.buffer_size >= (uint64_t)oi.pitch * (h + h / 2)) {
+            if (out_w) *out_w = w;
+            if (out_h) *out_h = h;
+            for (int y = 0; y < h; ++y)
+                memcpy(dst_y + (size_t)y * w, src + (size_t)y * oi.pitch, (size_t)w);
+            const uint8_t *uv = src + (size_t)oi.pitch * h;
+            for (int y = 0; y < h / 2; ++y)
+                memcpy(dst_uv + (size_t)y * w, uv + (size_t)y * oi.pitch, (size_t)w);
+        }
+    } else if (oi.valid && oi.error) {
+        static int bad = 0;
+        if (bad++ < 4) plog2("player: decode error=%d rc=%d", (long)oi.error, (long)rc);
+    }
+}
+
+/* 把一包（= 一个 AU）经 bsf 之后送进解码器。 */
+static void video_submit_packet(AVPacket *pkt, uint8_t *dst_y, uint8_t *dst_uv, int *out_w, int *out_h) {
     if (!g_bsf) return;
     AVPacket *out = av_packet_alloc();
-    int send_rc   = av_bsf_send_packet(g_bsf, pkt);
-    if (send_rc != 0) {
-        plog1("player: bsf send rc=%d", send_rc);
+    if (av_bsf_send_packet(g_bsf, pkt) != 0) {
         av_packet_free(&out);
         return;
     }
-    int recv_rc = av_bsf_receive_packet(g_bsf, out);
-    while (recv_rc == 0) {
-        if (out->data == NULL || out->size <= 0 || out->size > 0x800000) {
-            /* bsf 可能给出空包/异常长度：直接跳过，别把 memcpy 送到野指针上。 */
-            plog1("player: skip bsf packet size=%d", (long)out->size);
-            av_packet_unref(out);
-            recv_rc = av_bsf_receive_packet(g_bsf, out);
-            continue;
+    while (av_bsf_receive_packet(g_bsf, out) == 0) {
+        if (out->data != NULL && out->size > 0 && out->size <= 0x800000) {
+            int64_t pts_us = -1;
+            if (out->pts != AV_NOPTS_VALUE && g_fmt && g_video_index >= 0)
+                pts_us = av_rescale_q(out->pts, g_fmt->streams[g_video_index]->time_base, AV_TIME_BASE_Q);
+            decode_au(out->data, (size_t)out->size, dst_y, dst_uv, out_w, out_h, pts_us);
         }
-        uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
-        memcpy(au_slot, out->data, (size_t)out->size);
-        InputData input;
-        memset(&input, 0, sizeof(input));
-        input.size    = sizeof(input);
-        input.au      = au_slot;
-        input.au_size = (uint64_t)out->size;
-        /* pts 用自增序号：已验证的探针就是 0,1,2…（bsf 给的 mp4 pts 在流时间基下不是这种语义，
-         * 解码器对它的校验/重排假设会不同）。A/V 同步靠音频时钟那边的 g_last_video_pts_us。 */
-        input.pts     = (uint64_t)(au_seq++);
-        input.dts     = UINT64_MAX;
-        FrameBuffer frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.size        = sizeof(frame);
-        frame.buffer      = (uint8_t *)g_frame_pool + (size_t)fslot * g_frame_size;
-        frame.buffer_size = g_frame_size;
-        OutputInfo oi;
-        memset(&oi, 0, sizeof(oi));
-        oi.size = sizeof(oi);
-        int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
-        int flush_rc = 0;
-        if (rc == 0 && oi.valid == 0) {
-            /* Flush 用**独立**的帧缓冲：与 Decode 共用时硬件可能仍在写同一块，
-             * 实测表现为间歇性野指针崩溃（crash addr=0x86cad7）。 */
-            FrameBuffer fframe;
-            memset(&fframe, 0, sizeof(fframe));
-            fframe.size        = sizeof(fframe);
-            /* 必须是**整帧**大小（它是解码器的输出目标；给半个帧会让 Flush 失败 ⇒
-             * 一帧都拿不到 ⇒ 播放器只剩转圈——踩过一次）。独占池里最后一个槽位。 */
-            fframe.buffer      = (uint8_t *)g_frame_pool + (size_t)FRAME_SLOTS * g_frame_size;
-            fframe.buffer_size = g_frame_size;
-            memset(&oi, 0, sizeof(oi));
-            oi.size = sizeof(oi);
-            flush_rc = sceVideodec2Flush(g_decoder, &fframe, &oi);
-        }
-        if (dbg_au < 12) {
-            ++dbg_au;
-            const uint8_t *h = (const uint8_t *)out->data;
-            char lb[220];
-            snprintf(lb, sizeof(lb),
-                     "player: au%d size=%d head=%02x%02x%02x%02x%02x dec=%d valid=%d flush=%d oi=%d %dx%d",
-                     dbg_au, (int)out->size, h[0], h[1], h[2], h[3], h[4], rc, oi.valid, flush_rc, (int)oi.buffer_size,
-                     (int)oi.width, (int)oi.height);
-            wiliwili_boot_log(lb);
-        }
-        if (oi.valid && oi.buffer) {
-            int w = (int)oi.width, h = (int)oi.height;
-            if (w > 1920) w = 1920;
-            if (h > 1088) h = 1088;
-            g_y_width  = w;
-            g_y_height = h;
-            const uint8_t *src = (const uint8_t *)oi.buffer;
-            for (int y = 0; y < h; ++y)
-                memcpy(g_y_plane + (size_t)y * w, src + (size_t)y * oi.pitch, (size_t)w);
-            const uint8_t *uv = src + (size_t)oi.pitch * h;
-            for (int y = 0; y < h / 2; ++y)
-                memcpy(g_uv_plane + (size_t)y * w, uv + (size_t)y * oi.pitch, (size_t)w);
-            if (out->pts != AV_NOPTS_VALUE)
-                g_last_video_pts_us = av_rescale_q(out->pts, g_fmt->streams[g_video_index]->time_base, AV_TIME_BASE_Q);
-        }
-        slot  = (slot + 1) % AU_SLOTS;
-        fslot = (fslot + 1) % FRAME_SLOTS;
         av_packet_unref(out);
-        recv_rc = av_bsf_receive_packet(g_bsf, out);
     }
     av_packet_free(&out);
 }
 
+/* 流结束：把 bsf 里缓冲的尾部刷出来（发送 NULL 包 = drain）。 */
+static void video_submit_flush(uint8_t *dst_y, uint8_t *dst_uv, int *out_w, int *out_h) {
+    if (!g_bsf) return;
+    AVPacket *out = av_packet_alloc();
+    if (av_bsf_send_packet(g_bsf, NULL) == 0) {
+        while (av_bsf_receive_packet(g_bsf, out) == 0) {
+            if (out->data != NULL && out->size > 0 && out->size <= 0x800000)
+                decode_au(out->data, (size_t)out->size, dst_y, dst_uv, out_w, out_h, -1);
+            av_packet_unref(out);
+        }
+    }
+    av_packet_free(&out);
+    /* 解码器内部还有重排缓冲，Flush 出来。 */
+    if (g_decoder && g_frame_pool) {
+        FrameBuffer fb;
+        OutputInfo oi;
+        for (int i = 0; i < 8; ++i) {
+            memset(&fb, 0, sizeof(fb));
+            fb.size        = sizeof(fb);
+            fb.buffer      = (uint8_t *)g_frame_pool + (size_t)(g_au_ring % FRAME_SLOTS) * g_frame_size;
+            fb.buffer_size = g_frame_size;
+            memset(&oi, 0, sizeof(oi));
+            oi.size = sizeof(oi);
+            if (sceVideodec2Flush(g_decoder, &fb, &oi) != 0) break;
+            if (!(oi.valid && !oi.error && oi.picture_count)) break;
+            ++g_au_ring;
+            if (dst_y && oi.buffer && oi.width <= 1920 && oi.height <= 1088) {
+                int w = (int)oi.width, h = (int)oi.height;
+                const uint8_t *src = (const uint8_t *)oi.buffer;
+                if (oi.pitch >= (uint32_t)w && w > 0 && h > 0 && oi.buffer_size >= (uint64_t)oi.pitch * (h + h / 2)) {
+                    for (int y = 0; y < h; ++y)
+                        memcpy(dst_y + (size_t)y * w, src + (size_t)y * oi.pitch, (size_t)w);
+                    const uint8_t *uv = src + (size_t)oi.pitch * h;
+                    for (int y = 0; y < h / 2; ++y)
+                        memcpy(dst_uv + (size_t)y * w, uv + (size_t)y * oi.pitch, (size_t)w);
+                    if (out_w) *out_w = w;
+                    if (out_h) *out_h = h;
+                }
+            }
+        }
+    }
+}
 
 /* ── 播放线程 ─────────────────────────────────────────────────────────────
  * 渲染线程只有 6~8 fps（播放页），而网络读取与阻塞式音频推送都必须在 ~190 次/秒的
  * 节奏上跑；把它们留在渲染线程里，播放速度就被帧率绑死（实测慢约 8 倍）。
  * 这里把「读取 + 解码 + 音频推送」搬到独立线程，渲染线程只做「取最新帧 → 上传纹理」。
- * 用 WILIWILI_PLAYER_THREAD=0 可退回旧的单线程路径以便对照。 */
-static volatile int g_worker_run;
-static volatile int g_worker_started;
-static pthread_t g_worker_tid;
-static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_frame_new;               /* 搬运缓冲里有尚未上传的帧 */
-static uint8_t g_stage_y[1920 * 1088];  /* 工作线程写、渲染线程读（用锁保护） */
-static uint8_t g_stage_uv[1920 * 1088];
-static int g_stage_w, g_stage_h;
+ * 用 WILIWILI_PLAYER_THREAD=0 可退回旧的单线程路径以便对照。
+ *
+ * 关键约束（踩过）：**生产者只能有一个**。worker 在跑时，draw() 必须直接走
+ * 「取帧 + 绘制」分支，绝不能同时再执行单线程补料循环——两条线程共用一个
+ * `g_pkt`/`g_afmt`/`g_adec`/`g_pcm` 会立刻互相踩坏（表现为杂音、节奏乱、野指针崩溃）。 */
 
 
 /* 从音频源补 PCM（工作线程里跑；只用于 DASH 双 URL 的情况）。 */
@@ -605,33 +736,54 @@ static int player_audio_fill(int *out_reads, long *out_usec) {
     return reads;
 }
 
-/* 从视频源取一个包解码，并把结果搬到"待上传"暂存（工作线程调用）。 */
+/* 从视频源取包解码，直到真的产出一帧，然后搬进"待上传"暂存（工作线程调用）。
+ * bsf 输出是"每个 NAL 一包"（SEI/SPS/PPS/片各自一包），必须多读几包才能凑齐一个 AU，
+ * 所以这里循环到 decode_au 产出帧为止。 */
 static void player_video_step_to_stage(void) {
     if (g_video_index < 0 || g_video_eof) return;
     if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
     int guard = 0;
-    while (guard++ < 64) {
+    while (guard++ < 256) {
         if (av_read_frame(g_fmt, g_pkt) < 0) {
+            /* 流末尾攒着的那个 AU 必须送出去，否则最后一帧永远不解（同样不持锁解码）。 */
+            int w = 0, h = 0;
             g_video_eof = 1;
+            video_submit_flush(g_work_y, g_work_uv, &w, &h);
+            if (w > 0 && h > 0) {
+                size_t ysz  = (size_t)w * (size_t)h;
+                size_t uvsz = ysz / 2;
+                pthread_mutex_lock(&g_frame_lock);
+                memcpy(g_stage_y, g_work_y, ysz);
+                memcpy(g_stage_uv, g_work_uv, uvsz);
+                g_stage_w   = w;
+                g_stage_h   = h;
+                g_frame_new = 1;
+                pthread_mutex_unlock(&g_frame_lock);
+            }
             return;
         }
         if (g_pkt->stream_index != g_video_index) {
             av_packet_unref(g_pkt);
             continue;
         }
-        video_submit_packet(g_pkt);
+        /* 解码**不持锁**：临界区只做"发布"这一次拷贝。曾经把整段解码（+两个整帧
+         * memcpy）放在锁内，而渲染侧用 trylock ⇒ 渲染线程每帧都可能撞上持锁窗口，
+         * 彻底取不到帧（真机表现为 audec 正常、画面一直是首帧）。 */
+        int w = 0, h = 0;
+        video_submit_packet(g_pkt, g_work_y, g_work_uv, &w, &h);
         av_packet_unref(g_pkt);
-        if (g_y_width > 0) {
-            size_t ysz = (size_t)g_y_width * (size_t)g_y_height;
+        if (w > 0 && h > 0) {
+            size_t ysz  = (size_t)w * (size_t)h;
+            size_t uvsz = ysz / 2;
             pthread_mutex_lock(&g_frame_lock);
-            memcpy(g_stage_y, g_y_plane, ysz);
-            memcpy(g_stage_uv, g_uv_plane, ysz);
-            g_stage_w   = g_y_width;
-            g_stage_h   = g_y_height;
+            memcpy(g_stage_y, g_work_y, ysz);
+            memcpy(g_stage_uv, g_work_uv, uvsz);
+            g_stage_w   = w;
+            g_stage_h   = h;
             g_frame_new = 1;
             pthread_mutex_unlock(&g_frame_lock);
+            return; /* 产出一帧，交回工作循环去推音频 */
         }
-        return;
     }
 }
 
@@ -653,40 +805,52 @@ static void *player_worker(void *arg) {
 /* 渲染线程调用：把搬运缓冲里的最新帧取到上传用的平面上 */
 static int player_take_frame(void) {
     int got = 0;
-    if (pthread_mutex_trylock(&g_frame_lock) == 0) {
+    /* 用阻塞锁：临界区只有两次 memcpy（发布拷贝在 worker 侧），而 trylock 会让渲染
+     * 线程在偶发持锁时静默丢帧。 */
+    pthread_mutex_lock(&g_frame_lock);
+    {
         if (g_frame_new && g_stage_w > 0) {
-            size_t ysz = (size_t)g_stage_w * (size_t)g_stage_h;
+            size_t ysz  = (size_t)g_stage_w * (size_t)g_stage_h;
+            size_t uvsz = ysz / 2;
             memcpy(g_y_plane, g_stage_y, ysz);
-            memcpy(g_uv_plane, g_stage_uv, ysz);
+            memcpy(g_uv_plane, g_stage_uv, uvsz);
             g_y_width  = g_stage_w;
             g_y_height = g_stage_h;
             g_frame_new = 0;
             got = 1;
         }
-        pthread_mutex_unlock(&g_frame_lock);
     }
+    pthread_mutex_unlock(&g_frame_lock);
     return got;
 }
 
-/* DASH（音视频两条 URL）：每帧从视频源读**一个**视频包送硬解，落后音频超 300ms 就等。 */
+/* 单源（mp4 音频+视频同一条流）/无 worker 时的推进：读包直到真的产出一个 AU。
+ * 注意 bsf 的输出是"每个 NAL 一包"，一次 av_read_frame 通常只推进一个 NAL，
+ * 所以必须循环到 decode_au 被触发（否则每帧只喂了个 SEI，永远不解码）。 */
 static void video_step(void) {
     if (g_video_index < 0 || g_video_eof) return;
     /* 音频源断流时**不要跟着卡死**：B 站会下发 mcdn 这类 P2P CDN，实测"能开、放几秒、然后断"
      * （真机表现为每次固定停在 clock_ms=2560）。此时改为每帧送一包的自走节奏。 */
     if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
     int guard = 0;
-    while (guard++ < 64) {
+    while (guard++ < 256) {
         if (av_read_frame(g_fmt, g_pkt) < 0) {
             g_video_eof = 1;
+            video_submit_flush(g_y_plane, g_uv_plane, &g_y_width, &g_y_height);
             return;
         }
         if (g_pkt->stream_index != g_video_index) {
             av_packet_unref(g_pkt);
             continue;
         }
-        video_submit_packet(g_pkt);
+        int w = 0, h = 0;
+        video_submit_packet(g_pkt, g_y_plane, g_uv_plane, &w, &h);
         av_packet_unref(g_pkt);
-        return;
+        if (w > 0 && h > 0) {
+            g_y_width  = w;
+            g_y_height = h;
+            return; /* 已经产出完整一帧，交给下一次调用 */
+        }
     }
 }
 
@@ -752,6 +916,7 @@ void wiliwili_ps5player_close(void) {
     if (g_afmt) avformat_close_input(&g_afmt);
     if (g_fmt) avformat_close_input(&g_fmt);
     if (g_bsf) av_bsf_free(&g_bsf);
+    if (g_bsf_par) avcodec_parameters_free(&g_bsf_par);
     if (g_adec) avcodec_free_context(&g_adec);
     if (g_swr) swr_free(&g_swr);
     if (g_pkt) av_packet_free(&g_pkt);
@@ -759,6 +924,7 @@ void wiliwili_ps5player_close(void) {
     g_afmt = NULL;
     g_fmt  = NULL;
     g_bsf  = NULL;
+    g_bsf_par = NULL;
     g_adec = NULL;
     g_swr  = NULL;
     g_pkt  = NULL;
@@ -767,11 +933,17 @@ void wiliwili_ps5player_close(void) {
     g_paused = 0;
     g_audio_eof  = 0;
     g_video_eof  = 0;
-    g_pending_video = 0;
     g_pcm_frames = 0;
     g_audio_blocks = 0;
     g_y_width = 0;
     g_y_height = 0;
+    g_au_slot    = 0;
+    g_au_seq     = 0;
+    g_dbg_au     = 0;
+    g_au_ring    = 0;
+    g_frame_new  = 0;
+    g_stage_w    = 0;
+    g_stage_h    = 0;
     g_video_index = -1;
     g_audio_index = -1;
     g_url[0] = 0;
@@ -830,7 +1002,9 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
             wiliwili_boot_log(lb);
         }
     }
-    have_rect = 0; /* 见上：先全屏直画 */
+    /* 按 VideoView 上报的矩形做 16:9 letterbox：视频只占播放器区域，
+     * 区域之外的 OSD/评论/标题不受影响。曾经为了排查"全白"临时改成全屏直画，
+     * 那样会盖住 OSD——帧发布链路修好后必须回到按矩形绘制。 */
     if (have_rect) {
         int win_h = old_vp[3]; /* 当前视口高度（整窗），用于 y 翻转 */
         float src_ar = (g_y_width > 0 && g_y_height > 0) ? (float)g_y_width / (float)g_y_height : 16.0f / 9.0f;
@@ -855,6 +1029,29 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
         wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
         return;
     }
+
+    /* 生产者只有一个：worker 在跑时，渲染线程**只**取帧上传。
+     * 这个分支必须排在任何"自己读包"的路径之前——它曾排在其后，而 DASH（B 站常态）
+     * 走的是前面的 g_afmt 分支，于是渲染线程与 worker 同时读同一条流、抢同一个
+     * g_pkt，播放全程都在互相破坏（杂音、节奏乱、addr=0x86caed 崩溃）。 */
+    if (g_worker_run) {
+        player_take_frame();
+        if (g_y_width > 0) wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+        if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
+        static int report_w = 0;
+        if (++report_w >= 30) {
+            report_w = 0;
+            /* 全部状态放在**同一行**：UDP 日志连续两行会丢后一行（实测），
+             * 分两行打印会得到"clock 到了、REND 没到"的假象。 */
+            char lb[220];
+            snprintf(lb, sizeof(lb), "player: clock_ms=%d blocks=%d pts_ms=%d y=%dx%d new=%d stage=%d",
+                     (int)(g_audio_clock_us() / 1000), (int)g_audio_blocks, (int)(g_last_video_pts_us / 1000),
+                     g_y_width, g_y_height, g_frame_new, g_stage_w);
+            wiliwili_boot_log(lb);
+        }
+        return;
+    }
+
     if (g_afmt) {
         /* 两条独立 URL：音频从 g_afmt 读，视频单独走 video_step（单源路径不动） */
         int aguard = 0;
@@ -889,6 +1086,7 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
             }
         }
         wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+        if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
         static int report_at2 = 0;
         if (++report_at2 >= 120) {
             report_at2 = 0;
@@ -921,45 +1119,31 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     }
 
     if (g_worker_started) {
-        /* 工作线程在跑：这里只取最新帧上传（不做任何网络 IO / 阻塞音频调用） */
+        /* 不可能到这里：worker 分支在上面（g_worker_run），这里保留兜底只为防御
+         * “启动中/收尾中”的瞬态——worker 已置位但 run 已清零时仍只取帧、不读包。 */
         player_take_frame();
         if (g_y_width > 0) wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
-        static int report_w = 0;
-        if (++report_w >= 120) {
-            report_w = 0;
-            plog3("player: clock_ms=%d blocks=%d pts_ms=%d", (long)(g_audio_clock_us() / 1000),
-                  (long)g_audio_blocks, (long)(g_last_video_pts_us / 1000));
-        }
         return;
     }
 
     int guard = 0;
-    /* 上一帧留下的、还没到播放时间的视频包先送出去 */
-    if (g_pending_video) {
-        video_submit_packet(g_pkt);
-        av_packet_unref(g_pkt);
-        g_pending_video = 0;
-    }
-    while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && guard++ < 1024) {
+    /* 单线程兜底路径（只有音频/视频都在同一条流、且 worker 未启用时才会走到）。
+     * 注意不能再"扣住一个没到时间的视频包"：bsf 的输出是单个 NAL，扣半个 AU 会让
+     * 聚合缓冲停在半途。节流交给 g_last_video_pts_us 判断（跳过整个 AU）。
+     * 视频推进走 video_step（它自己会循环读到凑齐一个 AU）。 */
+    while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && guard++ < 4096) {
         int read_rc = av_read_frame(g_fmt, g_pkt);
         if (read_rc < 0) {
             g_audio_eof = 1;
             break;
         }
-        if (g_pkt->stream_index == g_video_index && !g_audio_eof && g_last_video_pts_us > 0 &&
-            g_last_video_pts_us > g_audio_clock_us() + 300000) {
-            /* 视频跑到音频前面 300 ms 以上就停手，把包留到下一帧（否则几秒内解完整个文件） */
-            g_pending_video = 1;
-            break;
-        }
         if (g_pkt->stream_index == g_audio_index && g_adec) {
             avcodec_send_packet(g_adec, g_pkt);
             audio_decode_one_frame();
-        } else if (g_pkt->stream_index == g_video_index) {
-            video_submit_packet(g_pkt); /* 不再丢弃 */
         }
-        if (!g_pending_video) av_packet_unref(g_pkt);
+        av_packet_unref(g_pkt);
     }
+    video_step();
     if (draw_calls <= 3) plog1("player: refilled pcm_frames=%d", (long)g_pcm_frames);
     /* 排空缓冲：sceAudioOutOutput 会阻塞到该块播完，节奏由它定（推 1 块会把音频
      * 绑死在渲染帧率上——实测 28 s 才走 1.28 s 音频）。 */
