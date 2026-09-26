@@ -117,6 +117,7 @@ static unsigned long long g_audio_blocks;
 static int g_audio_eof;
 static int g_pending_video; /* g_pkt 里留着一个未到播放时间的视频包 */
 static int g_paused;
+static char g_url[1024]; /* 当前打开的 URL（用于幂等判断） */
 static int g_overlay; /* 探针模式：在 UI 之后重复画一遍，便于肉眼确认 */
 static float g_rect_x, g_rect_y, g_rect_w, g_rect_h; /* 播放器区域（nvg 左上角原点） */
 
@@ -251,9 +252,24 @@ static void audio_decode_one_frame(void) {
 static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_GRAIN * 1000000ULL / AUDIO_FREQ); }
 
 
+void wiliwili_ps5player_close(void); /* 定义在下面：换片时先收尾 */
+
 void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     char line[192];
     plog1("player: enter %d", url != NULL);
+
+    /* app 会为一个视频多次调用 setUrl/setBackupUrl。不设防的话每次都会重建解码器、
+     * 重开音频句柄、重分配缓存 ⇒ 播放被打乱（真机：画面卡住）甚至崩溃（addr=0x10）。
+     * 同一个 URL 直接忽略；换片则先真正收尾。 */
+    if (g_ready && url != NULL && strcmp(g_url, url) == 0) {
+        wiliwili_boot_log("player: same url, ignored");
+        return;
+    }
+    if (g_ready) {
+        wiliwili_boot_log("player: switching source, closing previous");
+        wiliwili_ps5player_close();
+    }
+    if (url != NULL) snprintf(g_url, sizeof(g_url), "%s", url);
 
     /* 音频：照抄可用配方（0xFF, 0, 0, 256, 48000, 1）；句柄 < 1 才算失败；Output 只认负数失败 */
     sceAudioOutInit();
@@ -371,9 +387,13 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
                      wiliwili_video_709);
             wiliwili_boot_log(lb);
         }
-        if (decoder_init(vw, vh) != 0) {
-            wiliwili_boot_log("player: decoder init failed");
-            return;
+        if (g_decoder == NULL) {
+            if (decoder_init(vw, vh) != 0) {
+                wiliwili_boot_log("player: decoder init failed");
+                return;
+            }
+        } else {
+            plog1("player: decoder reuse reset rc=%d", sceVideodec2Reset(g_decoder));
         }
     }
 
@@ -581,8 +601,32 @@ void wiliwili_ps5player_set_overlay(int on) { g_overlay = on; }
 void wiliwili_ps5player_close(void) {
     if (g_audio_handle >= 1) sceAudioOutClose(g_audio_handle);
     g_audio_handle = -1;
-    g_ready        = 0;
-    g_paused       = 0;
+    if (g_afmt) avformat_close_input(&g_afmt);
+    if (g_fmt) avformat_close_input(&g_fmt);
+    if (g_bsf) av_bsf_free(&g_bsf);
+    if (g_adec) avcodec_free_context(&g_adec);
+    if (g_swr) swr_free(&g_swr);
+    if (g_pkt) av_packet_free(&g_pkt);
+    if (g_aframe) av_frame_free(&g_aframe);
+    g_afmt = NULL;
+    g_fmt  = NULL;
+    g_bsf  = NULL;
+    g_adec = NULL;
+    g_swr  = NULL;
+    g_pkt  = NULL;
+    g_aframe = NULL;
+    g_ready  = 0;
+    g_paused = 0;
+    g_audio_eof  = 0;
+    g_video_eof  = 0;
+    g_pending_video = 0;
+    g_pcm_frames = 0;
+    g_audio_blocks = 0;
+    g_y_width = 0;
+    g_y_height = 0;
+    g_video_index = -1;
+    g_audio_index = -1;
+    g_url[0] = 0;
 }
 
 /* GL 视口：和本文件其它 GL 调用一样通过 SDL_GL_GetProcAddress 取（引擎是 C，不带 GL 头）。 */
