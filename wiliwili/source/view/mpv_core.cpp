@@ -255,6 +255,67 @@ void MPVCore::on_wakeup(void *self) {
 
 #if defined(MPV_BUNDLE_DLL)
 template <typename Module, typename fnGetProcAddress>
+/* ── PS5 原生标题：libmpv 不可用时的安全桩 ────────────────────────────────
+ * 原生标题沙箱禁止 dlopen，libmpv 拿不到句柄 ⇒ 这些函数指针保持 NULL，
+ * 任何 mpvCore->xxx() 都是"跳到 NULL"；而 MPVCore::init() 在 mpvCreate() 返回
+ * NULL 后还会 brls::fatal()，直接把进程终结（用户"点播放"崩在这里）。
+ * 修法：先在启动时装上全部安全桩（读返回 0/空、命令忽略、渲染返回失败），
+ * 之后若某条路真的加载成功，会被真实符号覆盖；PS5 上则由 init() 直接返回。
+ * 播放本身走自管播放器，见 scripts/ps5/native/ps5_player.c。 */
+namespace {
+int stub_set_option_string(mpv_handle *, const char *, const char *) { return -1; }
+int stub_observe_property(mpv_handle *, uint64_t, const char *, mpv_format) { return -1; }
+mpv_handle *stub_create() { return nullptr; }
+int stub_initialize(mpv_handle *) { return -1; }
+void stub_terminate_destroy(mpv_handle *) {}
+void stub_set_wakeup_callback(mpv_handle *, void (*)(void *), void *) {}
+int stub_command_string(mpv_handle *, const char *) { return -1; }
+const char *stub_error_string(int) { return "mpv unavailable"; }
+mpv_event *stub_wait_event(mpv_handle *, double) {
+    static mpv_event e{};
+    e.event_id = MPV_EVENT_NONE;
+    return &e;
+}
+int stub_get_property(mpv_handle *, const char *, mpv_format, void *) { return -1; }
+int stub_command_async(mpv_handle *, uint64_t, const char **) { return -1; }
+char *stub_get_property_string(mpv_handle *, const char *) { return nullptr; }
+void stub_free_node_contents(mpv_node *) {}
+int stub_set_option(mpv_handle *, const char *, mpv_format, void *) { return -1; }
+void stub_free(void *) {}
+int stub_rc_create(mpv_render_context **, mpv_handle *, mpv_render_param *) { return -1; }
+void stub_rc_set_update_callback(mpv_render_context *, mpv_render_update_fn, void *) {}
+int stub_rc_render(mpv_render_context *, mpv_render_param *) { return -1; }
+void stub_rc_report_swap(mpv_render_context *) {}
+uint64_t stub_rc_update(mpv_render_context *) { return 0; }
+void stub_rc_free(mpv_render_context *) {}
+unsigned long stub_client_api_version() { return 0; }
+
+void installMpvStubs() {
+    mpvSetOptionString            = &stub_set_option_string;
+    mpvObserveProperty            = &stub_observe_property;
+    mpvCreate                     = &stub_create;
+    mpvInitialize                 = &stub_initialize;
+    mpvTerminateDestroy           = &stub_terminate_destroy;
+    mpvSetWakeupCallback          = &stub_set_wakeup_callback;
+    mpvCommandString              = &stub_command_string;
+    mpvErrorString                = &stub_error_string;
+    mpvWaitEvent                  = &stub_wait_event;
+    mpvGetProperty                = &stub_get_property;
+    mpvCommandAsync               = &stub_command_async;
+    mpvGetPropertyString          = &stub_get_property_string;
+    mpvFreeNodeContents           = &stub_free_node_contents;
+    mpvSetOption                  = &stub_set_option;
+    mpvFree                       = &stub_free;
+    mpvRenderContextCreate        = &stub_rc_create;
+    mpvRenderContextSetUpdateCallback = &stub_rc_set_update_callback;
+    mpvRenderContextRender        = &stub_rc_render;
+    mpvRenderContextReportSwap    = &stub_rc_report_swap;
+    mpvRenderContextUpdate        = &stub_rc_update;
+    mpvRenderContextFree          = &stub_rc_free;
+    mpvClientApiVersion           = &stub_client_api_version;
+}
+} // namespace
+
 void initMpvProc(Module dll, fnGetProcAddress pGetProcAddress) {
     mpvSetOptionString     = (mpvSetOptionStringFunc)pGetProcAddress(dll, "mpv_set_option_string");
     mpvObserveProperty     = (mpvObservePropertyFunc)pGetProcAddress(dll, "mpv_observe_property");
@@ -340,6 +401,11 @@ void initMpvProcLinked() {
 #endif
 #endif
 
+#if !defined(MPV_BUNDLE_DLL)
+/* 直接链接 libmpv 时符号齐全（libmpv 对 NULL 句柄本身返回错误而不崩），桩留空实现。 */
+void installMpvStubs() {}
+#endif
+
 MPVCore::MPVCore() {
 #if defined(MPV_BUNDLE_DLL)
     HMODULE hMpv = ::LoadLibraryW(L"libmpv-2.dll");
@@ -375,11 +441,20 @@ MPVCore::MPVCore() {
 }
 
 void MPVCore::init() {
+#ifdef PS5_NATIVE_APP
+    /* 沙箱禁 dlopen ⇒ libmpv 不可用；装桩后直接返回（详见 installMpvStubs 的注释）。
+     * PS5 上播放走自管播放器（scripts/ps5/native/ps5_player.c），UI 层对 mpv 的读写
+     * 由桩兜底，全部安全。 */
+    installMpvStubs();
+    brls::Logger::info("MPVCore: PS5 native line, mpv disabled (using built-in player)");
+    return;
+#else
     setlocale(LC_NUMERIC, "C");
     this->mpv = mpvCreate();
     if (!mpv) {
         brls::fatal("Error Create mpv Handle");
     }
+#endif /* !PS5_NATIVE_APP */
     std::string confDir = ProgramConfig::instance().getConfigDir();
     // misc
     mpvSetOptionString(mpv, "config", "yes");

@@ -973,3 +973,27 @@ OSD/弹幕/进度条（它们都走 nvg）。探针模式（`WILIWILI_TEST_PLAYE
 
 **剩下的是产品层**：真实播放链路需要登录态（playurl 要 cookie），之后是进度条拖动/seek、倍速、
 以及把 `notes/` 里的探针按仓库约定清理。
+
+
+### ★ 用户"点播放崩了"的根因与修复（2026-09-26）
+
+**根因**：`MPVCore::MPVCore()`（构造函数，`mpv_core.cpp:429`）会调 `init()`，而 `init()` 里
+`this->mpv = mpvCreate();` 在原生标题沙箱里必然拿到 NULL（禁止 dlopen，libmpv 不可用），
+紧接着 `brls::fatal("Error Create mpv Handle")` **直接终结进程** ⇒ 一进播放页就崩。
+（`mpv_core.cpp:562` 里还留着上一轮写下的同一条崩溃注释，方向一致。）
+
+**修复**：
+1. `MPVCore::init()` 在 `#ifdef PS5_NATIVE_APP` 下**装安全桩后直接返回**；
+2. 新增 `installMpvStubs()`：把 21 个 mpv 函数指针全部替换为安全实现（读返回 0/空、命令忽略、
+   渲染返回失败），这样 UI 层（`VideoView` 的 OSD/进度条/音量，36 处 `mpvCore->`）在任何路径下都不会跳 NULL；
+   若某条路真的加载成功，会被真实符号覆盖；`MPV_BUNDLE_DLL` 未定义时留空实现（直接链接的 libmpv 本身对 NULL 句柄安全）。
+3. **真机验证**：`WILIWILI_TEST_MPV=1` 探针（只碰 `MPVCore::instance()`，即崩溃入口）⇒ 日志 `mpv: init survived`，进程存活。
+
+**顺带修掉两个真内容才会暴露的 bug**：解码器不再写死 640×368，改为按**真实流尺寸**建
+（顺序调成：先 `avformat_open_input`+`find_stream_info`，再 `decoder_init(w,h)`）；非 H.264 明确拒绝并报出 codec id。
+
+**仍未解决：外部 https 打不开**（`avformat_open_input` 返回 -5 = EIO）。
+ffmpeg 配置里**有** `--enable-openssl`、也没有 `--disable-network`，但 `avio_enum_protocols` 枚举为空 ⇒
+**静态链接时 tls/https 的 protocol 对象很可能没被拉进镜像**（局域网 `http://` 是好的，能证 http 协议在）。
+因此 B 站（全站 https）真实播放还需要一步：**用应用里已经工作良好的 HTTP 栈（cpr/curl，带 CA）
+取流，再通过 `avio_alloc_context` 的自定义读回调喂给 ffmpeg**（不要关 TLS 校验）。

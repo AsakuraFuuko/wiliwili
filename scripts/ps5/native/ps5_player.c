@@ -243,11 +243,6 @@ void wiliwili_ps5player_open(const char *url) {
     char line[192];
     plog1("player: enter %d", url != NULL);
 
-    if (decoder_init(640, 368) != 0) {
-        wiliwili_boot_log("player: decoder init failed");
-        return;
-    }
-
     /* 音频：照抄可用配方（0xFF, 0, 0, 256, 48000, 1）；句柄 < 1 才算失败；Output 只认负数失败 */
     sceAudioOutInit();
     g_audio_handle = sceAudioOutOpen(0xFF, 0, 0, AUDIO_GRAIN, AUDIO_FREQ, 1);
@@ -258,7 +253,38 @@ void wiliwili_ps5player_open(const char *url) {
     }
 
     avformat_network_init();
-    if (avformat_open_input(&g_fmt, url, NULL, NULL) < 0) {
+    /* 诊断：ffmpeg 支持哪些协议、是否带 TLS（B 站是 https，这条决定能不能直接开）。 */
+    {
+        const char *cfg = avcodec_configuration();
+        for (int part = 0; part < 4; ++part) {
+            char line[200];
+            snprintf(line, sizeof(line), "player: avconfig%d=%.170s", part, cfg + part * 170);
+            wiliwili_boot_log(line);
+            if (strlen(cfg) < (size_t)(part * 170 + 170)) break;
+        }
+        const char *proto = NULL;
+        void *it = NULL;
+        line[0] = 0;
+        int n = 0;
+        while ((proto = avio_enum_protocols(&it, 0)) != NULL && n < 6) {
+            if (strstr(proto, "http") || strstr(proto, "tls") || strstr(proto, "file")) {
+                strncat(line, proto, sizeof(line) - strlen(line) - 2);
+                strncat(line, " ", sizeof(line) - strlen(line) - 2);
+            }
+            ++n;
+        }
+        char line2[320];
+        snprintf(line2, sizeof(line2), "player: protocols=%s", line);
+        wiliwili_boot_log(line2);
+    }
+    /* B 站是 https：给 ffmpeg 的 TLS 指 CA（随包安装，绝不关闭校验）。 */
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "ca_file", "/app0/assets/ca-bundle.crt", 0);
+    av_dict_set(&opts, "user_agent", "wiliwili/1.6.0 (PS5)", 0);
+    int open_rc = avformat_open_input(&g_fmt, url, NULL, &opts);
+    av_dict_free(&opts);
+    plog1("player: open rc=%d", open_rc);
+    if (open_rc < 0) {
         wiliwili_boot_log("player: open input failed");
         return;
     }
@@ -269,6 +295,27 @@ void wiliwili_ps5player_open(const char *url) {
     g_video_index = av_find_best_stream(g_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     g_audio_index = av_find_best_stream(g_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     plog2("player: streams v=%d a=%d", g_video_index, g_audio_index);
+
+    /* 解码器必须按**真实流尺寸**建：写死小尺寸会让解码器越界写帧缓冲（1080p 必崩）。 */
+    {
+        int vw = 640, vh = 368;
+        if (g_video_index >= 0) {
+            AVCodecParameters *vp = g_fmt->streams[g_video_index]->codecpar;
+            if (vp->width > 0) vw = vp->width;
+            if (vp->height > 0) vh = vp->height;
+            if (vp->codec_id != AV_CODEC_ID_H264) {
+                /* 非 H.264（B 站 4K 是 HEVC）：先明确报出来，别装作能播。 */
+                plog1("player: unsupported codec id=%d", (long)vp->codec_id);
+                wiliwili_boot_log("player: only H.264 supported for now");
+                return;
+            }
+        }
+        plog2("player: video size w=%d h=%d", vw, vh);
+        if (decoder_init(vw, vh) != 0) {
+            wiliwili_boot_log("player: decoder init failed");
+            return;
+        }
+    }
 
     /* H.264：mp4 是 AVCC，硬解要 Annex-B，用 bitstream filter 转换（并附上 SPS/PPS） */
     if (g_video_index >= 0) {

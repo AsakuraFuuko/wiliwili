@@ -265,6 +265,13 @@ int main(int argc, char* argv[]) {
                 if (aud != nullptr && aud[0] != '\0') wiliwili_audio_probe();
                 const char *aud2 = getenv("WILIWILI_TEST_AUDIO2");
                 if (aud2 != nullptr && aud2[0] != '\0') wiliwili_audio2_probe();
+                /* 诊断：直接触发 MPVCore::init()。这正是"点播放"崩掉的那一步
+                 * （mpv 在 app slot 里不可用），用来确认桩化之后不再崩。 */
+                if (getenv("WILIWILI_TEST_MPV") != nullptr) {
+                    MPVCore::instance(); /* 构造函数内部就会 init()，这正是崩溃入口 */
+                    extern void wiliwili_boot_log(const char *);
+                    wiliwili_boot_log("mpv: init survived");
+                }
                 const char *playerUrl = getenv("WILIWILI_TEST_PLAYER");
                 if (playerUrl != nullptr && playerUrl[0] != '\0') {
                     wiliwili_ps5player_open(playerUrl);
