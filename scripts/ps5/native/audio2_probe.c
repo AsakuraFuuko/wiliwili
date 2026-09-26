@@ -22,7 +22,8 @@ int32_t sceKernelMapDirectMemory(void **addr, size_t length, int32_t prot, int32
 int64_t sceKernelGetDirectMemorySize(void);
 
 int sceSysmoduleLoadModule(unsigned short id);
-int sceAudioOut2ArbitrationInitialize(void);
+/* 带参数的仲裁：无参版本会崩，说明它有入参（属性表 + 计数，与 SetAttributes 同形）。 */
+int sceAudioOut2ArbitrationInitialize(const void *attributes, unsigned int numAttributes);
 int sceAudioOut2ContextResetParam(void *params);
 int sceAudioOut2ContextQueryMemory(const void *params, size_t *memorySize);
 int sceAudioOut2ContextCreate(const void *params, void *buffer, size_t bufferSize, uint64_t *context);
@@ -78,6 +79,12 @@ void wiliwili_audio2_probe(void) {
         char line[128];
         int module_rc = sceSysmoduleLoadModule(0x01); /* libSceAudioOut */
         snprintf(line, sizeof(line), "a2: sysmodule1 rc=%d", module_rc);
+        wiliwili_boot_log(line);
+    }
+    {
+        char line[128];
+        int arb_rc = sceAudioOut2ArbitrationInitialize(NULL, 0);
+        snprintf(line, sizeof(line), "a2: arbitration(NULL,0) rc=%d", arb_rc);
         wiliwili_boot_log(line);
     }
     wiliwili_boot_log("a2: manual params");

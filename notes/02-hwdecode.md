@@ -721,3 +721,22 @@ len ∈ {256,512,1024,2048}、param ∈ {1,2,0,3,4,0x0001,0x0201,0x1002}，全�
 
 **顺带澄清**：用户反馈"刚才好像有声音了"——我们的探针没有真正出声（`Output` 全部失败、`audio2` 在写数据前即崩），
 听到的应是**标题退出/崩溃时的系统提示音**。
+
+
+### P2d 终结（2026-09-26）：本机两种音频路径都不可用（已证伪，勿重复）
+
+| 尝试 | 结果 |
+|---|---|
+| SDL2 音频 | ❌ `SDL_InitSubSystem(SDL_INIT_AUDIO) = -1`、driver=(none)（native SDL 无音频后端） |
+| 经典 `sceAudioOut*` + `sceSysmoduleLoadModule(1)`（0x01 = libSceAudioOut，模块表来源 etaHEN/AnyPS5） | ❌ **128/128 组合 miss**（`0x80310711`；非法 param 值给 `0x80310707`，说明参数确被解析） |
+| `sceAudioOut2*`（独立 `libSceAudioOut2.so` 桩 + `-lSceAudioOut2`；结构体按 PS5PCEM 的 HLE 布局修正；先加载模块） | ❌ **任何入口都让标题直接退出**：`ArbitrationInitialize(NULL,0)`、`ResetParam(&params)`、`ContextQueryMemory(&params,&size)` 各崩一次 |
+| 前置确认 | ✅ 用户上下文可用（`GetInitialUser` = 真实用户）；经典仲裁 `sceAudioOutArbitrationInitialize` rc=0；导入链路正确（中间镜像里 `sceAudioOut2ContextQueryMemory` 为未定义符号 U，与能跑通的 videodec 同形） |
+
+⇒ **结论**：本机（12.00）的 fake-signed 标题**无法打开音频**——经典路径被拒、AudioOut2 路径致命。
+不是权限查找问题（上下文与仲裁都成功），也不是链接/导入问题（符号解析正确）。
+后续若仍要声音，只剩三条更重的路：①找该固件对应的**真实 ABI 头**（非模拟器表格）；
+②用 **payload 上下文**做音频（payload 里 SDL 音频是能用的，但 payload 不能硬解）；
+③把音频放回 payload 侧进程（跨进程协作，复杂度高）。
+
+**注意**：音频探针（`WILIWILI_TEST_AUDIO` / `WILIWILI_TEST_AUDIO2`）保留在树里但默认不触发；
+真机上跑它们会让标题退出，属于已知现象。
