@@ -52,7 +52,11 @@ int32_t sceVideodec2Flush(void *decoder, void *frame, void *output);
 #define SCE_SYSMODULE_VIDEODEC2 0xCF
 #define CODEC_AVC 1u
 #define RESOURCE_COMPUTE 1u
-#define PIPELINE_SLOTS 3
+/* 环大小按 EVO 的经验值：AU 环必须 ≥4（DecodeInputQueueDepth = 4），帧环要更多
+ * （"8 keeps three spare slots beyond the deepest consumer"）。用 3 会在第 4 个 AU
+ * 覆盖解码器仍持有的槽 → 真机表现为解到第 4~5 个包就退出。 */
+#define AU_SLOTS 8
+#define FRAME_SLOTS 12
 #define AUDIO_GRAIN 256 /* 每块 256 帧（EVO 的可用实现用的就是它） */
 #define AUDIO_FREQ 48000
 
@@ -185,8 +189,8 @@ static int decoder_init(int width, int height) {
     mem.cpu_gpu_size      = cpu_gpu_size;
 
     g_frame_size = align16k(mem.max_frame_size);
-    g_au_pool    = alloc_direct(limit, 0x800000u * PIPELINE_SLOTS, 0x32);
-    g_frame_pool = alloc_direct(limit, g_frame_size * PIPELINE_SLOTS, 0x32);
+    g_au_pool    = alloc_direct(limit, 0x800000u * AU_SLOTS, 0x32);
+    g_frame_pool = alloc_direct(limit, g_frame_size * FRAME_SLOTS, 0x32);
     if (!g_au_pool || !g_frame_pool) return -1;
 
     if (sceVideodec2CreateDecoder(&config, &mem, &g_decoder) != 0) return -1;
@@ -301,7 +305,8 @@ void wiliwili_player_probe(const char *url) {
 
 /* 把一个视频包送进硬解，出帧就拷进稳定缓冲（Y/UV）。 */
 static void video_submit_packet(AVPacket *pkt) {
-    static int slot = 0;
+    static int slot  = 0; /* AU 环 */
+    static int fslot = 0; /* 帧环（与 AU 环独立，避免互相覆盖） */
     if (!g_bsf) return;
     AVPacket *out = av_packet_alloc();
     int send_rc   = av_bsf_send_packet(g_bsf, pkt);
@@ -314,6 +319,13 @@ static void video_submit_packet(AVPacket *pkt) {
     int recv_rc = av_bsf_receive_packet(g_bsf, out);
     plog1("player: bsf recv rc=%d", recv_rc);
     while (recv_rc == 0) {
+        if (out->data == NULL || out->size <= 0 || out->size > 0x800000) {
+            /* bsf 可能给出空包/异常长度：直接跳过，别把 memcpy 送到野指针上。 */
+            plog1("player: skip bsf packet size=%d", (long)out->size);
+            av_packet_unref(out);
+            recv_rc = av_bsf_receive_packet(g_bsf, out);
+            continue;
+        }
         uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
         memcpy(au_slot, out->data, (size_t)out->size);
         InputData input;
@@ -326,7 +338,7 @@ static void video_submit_packet(AVPacket *pkt) {
         FrameBuffer frame;
         memset(&frame, 0, sizeof(frame));
         frame.size        = sizeof(frame);
-        frame.buffer      = (uint8_t *)g_frame_pool + (size_t)slot * g_frame_size;
+        frame.buffer      = (uint8_t *)g_frame_pool + (size_t)fslot * g_frame_size;
         frame.buffer_size = g_frame_size;
         OutputInfo oi;
         memset(&oi, 0, sizeof(oi));
@@ -354,7 +366,8 @@ static void video_submit_packet(AVPacket *pkt) {
             if (out->pts != AV_NOPTS_VALUE)
                 g_last_video_pts_us = av_rescale_q(out->pts, g_fmt->streams[g_video_index]->time_base, AV_TIME_BASE_Q);
         }
-        slot = (slot + 1) % PIPELINE_SLOTS;
+        slot  = (slot + 1) % AU_SLOTS;
+        fslot = (fslot + 1) % FRAME_SLOTS;
         av_packet_unref(out);
         recv_rc = av_bsf_receive_packet(g_bsf, out);
     }
@@ -369,15 +382,22 @@ void wiliwili_player_draw(struct NVGcontext *vg) {
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
 
     int guard = 0;
+    static int iter_log = 0;
     while (g_pcm_frames < AUDIO_GRAIN * 4 && !g_audio_eof && guard++ < 64) {
-        if (av_read_frame(g_fmt, g_pkt) < 0) {
+        int read_rc = av_read_frame(g_fmt, g_pkt);
+        if (iter_log < 200) plog2("player: iter=%d read_rc=%d", (long)guard, read_rc);
+        ++iter_log;
+        if (read_rc < 0) {
             g_audio_eof = 1;
             break;
         }
         if (g_pkt->stream_index == g_audio_index && g_adec) {
             avcodec_send_packet(g_adec, g_pkt);
+            if (iter_log < 200) plog1("player: audio pkt size=%d", (long)g_pkt->size);
             audio_decode_one_frame();
+            if (iter_log < 200) plog1("player: audio decoded frames=%d", (long)g_pcm_frames);
         } else if (g_pkt->stream_index == g_video_index) {
+            if (iter_log < 200) plog1("player: video pkt size=%d", (long)g_pkt->size);
             video_submit_packet(g_pkt); /* 不再丢弃 */
         }
         av_packet_unref(g_pkt);

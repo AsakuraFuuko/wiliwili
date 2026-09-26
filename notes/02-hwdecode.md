@@ -850,3 +850,25 @@ player: bsf recv rc=0 / decode au=3056 / rc=0 valid=0
 1. 在补料循环里再多打两行（`av_read_frame` 的返回值/流号、`video_submit_packet` 返回后），确认是"读到某个包之后崩"还是"decode/Flush 节奏问题"；
 2. 重点怀疑 `pipeline_depth=1` 下**连续喂 AU 却不按 EVO 的 3 槽节奏收帧** —— 把解码节奏改成 EVO 的两段式（`Decode`；`valid==0` 才 `Flush`）并给 AU/帧池各留 3 槽周转，或直接把解码放到独立线程；
 3. 音频侧已验证可用（上一版循环里时钟推进到 1.5 s、282 块），不要再动它。
+
+
+### P2e 最终卡点（2026-09-26，交接口径）
+
+环大小已按 EVO 的经验值修正（AU 环 8、帧环 12，且 AU/帧槽位分离），并加了 bsf 包护栏（`data==NULL`/异常长度跳过）。
+真机仍死在同一处，且**打点已收敛到极小范围**：
+
+```
+iter=7 read_rc=0
+player: video pkt size=2425      ← 第 4 个视频包
+player: bsf sent size=0
+player: bsf recv rc=0            ← 位流过滤器转换成功
+（随后进程退出；"decode au=" 那行未出现——注意 UDP 日志在崩溃瞬间会丢最后几条，
+  所以真实死点应在紧随其后的 sceVideodec2Decode 调用里）
+```
+
+**关键对照**：同一个解码器在**按文件喂 AU** 时完全正常（`videodec2_probe.c`：30 帧流全部 `rc=0`、1.46 ms/帧），
+所以剩下的差异只有**AU 的来源**——`h264_mp4toannexb` 输出的 Annex-B 与 ffmpeg 直接把裸流切出来的 AU 有差别
+（起始码宽度、是否带 AUD、SPS/PPS 位置）。下一步就该在这里比：把 bsf 输出的 AU 存盘（或日志打印前 16 字节），
+与文件版的 AU 头逐字节对比。
+
+**音频侧依旧可用**（时钟推进到 1.5 s/282 块是已观察到的），不需要改动。
