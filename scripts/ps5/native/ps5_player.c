@@ -796,7 +796,11 @@ static void *player_worker(void *arg) {
         player_audio_fill(&reads, &usec);
         player_video_step_to_stage();
         if (!g_worker_run) break;
-        audio_push_blocks(64); /* 阻塞式：整块播完才返回，天然就是音频时钟 */
+        /* 每轮只推 2 块音频（≈10.7ms）——**不能推一大批**：`sceAudioOutOutput` 会阻塞到
+         * 该块播完，一轮推 32/64 块就是 170~340ms，而 worker 每轮只解 1 帧视频，
+         * 视频因此被压到 ~6 fps（实测 `pts_ms` 24 秒只前进 5 秒）。
+         * 小步推送让循环以 ~90Hz 转动，音频仍由设备排空天然限速。 */
+        audio_push_blocks(2);
     }
     g_worker_started = 0;
     return NULL;

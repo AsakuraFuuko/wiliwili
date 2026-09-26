@@ -1243,3 +1243,26 @@ player: au2 nals=[1 ]           ← P 帧，同样 valid=0
 - 环尺寸：输入 AU 环 4 槽、帧池 4 槽。
 - 差分诊断的取数通道：**"标题停止后 download0.dat 才写回"**，所以诊断文件要等
   kill 完标题再读（`scripts/ps5/native/read-download0.sh`）。
+
+### ★ 修完 DPB 之后的第二个问题：视频被压到 ~6 fps（已修，2026-09-27）
+
+`max_dpb_frames=-1` 之后画面出来了，但 `pts_ms` 推进远慢于 `clock_ms`
+（24 秒里只走了 5 秒视频）。原因在 worker 的循环结构：
+
+```c
+player_audio_fill();            // 把 PCM 补到 32 块（170ms）
+player_video_step_to_stage();   // 只解 1 帧视频
+audio_push_blocks(64);          // ← 一次推 64 块 ≈ 341ms，阻塞
+```
+
+`sceAudioOutOutput` 阻塞到整块播完，所以一轮 = 341ms，而每轮只解 1 帧
+⇒ 视频上限 ≈ 6 fps。**改成每轮只推 2 块**（≈10.7ms）后循环以 ~90Hz 转动，
+视频解码量足够，音频仍由设备排空天然限速。
+
+真机结果（同一个 B 站视频，`clock_ms` / `pts_ms` 单位 ms）：
+```
+clock_ms=4613  pts_ms=4433
+clock_ms=15781 pts_ms=15800
+clock_ms=29008 pts_ms=29533
+clock_ms=36682 pts_ms=37133     ← A/V 锁定在 ±500ms，~40 秒推进 37 秒 ≈ 实时
+```
