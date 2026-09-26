@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include <time.h>
+#include <pthread.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -256,6 +257,10 @@ static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_
 
 
 void wiliwili_ps5player_close(void); /* 定义在下面：换片时先收尾 */
+/* 播放线程（定义在文件后部） */
+static void *player_worker(void *arg);
+static volatile int g_worker_run;
+static pthread_t g_worker_tid;
 
 void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     char line[192];
@@ -451,6 +456,18 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     g_pkt    = av_packet_alloc();
     g_aframe = av_frame_alloc();
     g_ready  = 1;
+
+    /* DASH（双 URL）时把读取/解码/音频推送搬到独立线程：渲染线程只有 6~8fps，
+     * 留在渲染线程里播放速度会被帧率绑死（实测慢约 8 倍）。 */
+    if (g_afmt != NULL && getenv("WILIWILI_PLAYER_THREAD") == NULL) {
+        g_worker_run = 1;
+        if (pthread_create(&g_worker_tid, NULL, player_worker, NULL) != 0) {
+            g_worker_run = 0;
+            wiliwili_boot_log("player: worker thread create failed");
+        } else {
+            wiliwili_boot_log("player: worker thread started");
+        }
+    }
     wiliwili_boot_log("player: ready");
 }
 
@@ -545,6 +562,112 @@ static void video_submit_packet(AVPacket *pkt) {
     av_packet_free(&out);
 }
 
+
+/* ── 播放线程 ─────────────────────────────────────────────────────────────
+ * 渲染线程只有 6~8 fps（播放页），而网络读取与阻塞式音频推送都必须在 ~190 次/秒的
+ * 节奏上跑；把它们留在渲染线程里，播放速度就被帧率绑死（实测慢约 8 倍）。
+ * 这里把「读取 + 解码 + 音频推送」搬到独立线程，渲染线程只做「取最新帧 → 上传纹理」。
+ * 用 WILIWILI_PLAYER_THREAD=0 可退回旧的单线程路径以便对照。 */
+static volatile int g_worker_run;
+static volatile int g_worker_started;
+static pthread_t g_worker_tid;
+static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_frame_new;               /* 搬运缓冲里有尚未上传的帧 */
+static uint8_t g_stage_y[1920 * 1088];  /* 工作线程写、渲染线程读（用锁保护） */
+static uint8_t g_stage_uv[1920 * 1088];
+static int g_stage_w, g_stage_h;
+
+
+/* 从音频源补 PCM（工作线程里跑；只用于 DASH 双 URL 的情况）。 */
+static int player_audio_fill(int *out_reads, long *out_usec) {
+    int reads = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (g_afmt) {
+        int aguard = 0;
+        while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 2048) {
+            if (av_read_frame(g_afmt, g_pkt) < 0) {
+                g_audio_eof = 1;
+                break;
+            }
+            ++reads;
+            if (g_pkt->stream_index == g_audio_index && g_adec) {
+                avcodec_send_packet(g_adec, g_pkt);
+                audio_decode_one_frame();
+            }
+            av_packet_unref(g_pkt);
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (out_reads) *out_reads = reads;
+    if (out_usec)
+        *out_usec = (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+    return reads;
+}
+
+/* 从视频源取一个包解码，并把结果搬到"待上传"暂存（工作线程调用）。 */
+static void player_video_step_to_stage(void) {
+    if (g_video_index < 0 || g_video_eof) return;
+    if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
+    int guard = 0;
+    while (guard++ < 64) {
+        if (av_read_frame(g_fmt, g_pkt) < 0) {
+            g_video_eof = 1;
+            return;
+        }
+        if (g_pkt->stream_index != g_video_index) {
+            av_packet_unref(g_pkt);
+            continue;
+        }
+        video_submit_packet(g_pkt);
+        av_packet_unref(g_pkt);
+        if (g_y_width > 0) {
+            size_t ysz = (size_t)g_y_width * (size_t)g_y_height;
+            pthread_mutex_lock(&g_frame_lock);
+            memcpy(g_stage_y, g_y_plane, ysz);
+            memcpy(g_stage_uv, g_uv_plane, ysz);
+            g_stage_w   = g_y_width;
+            g_stage_h   = g_y_height;
+            g_frame_new = 1;
+            pthread_mutex_unlock(&g_frame_lock);
+        }
+        return;
+    }
+}
+
+static void *player_worker(void *arg) {
+    (void)arg;
+    g_worker_started = 1;
+    while (g_worker_run) {
+        int reads = 0;
+        long usec = 0;
+        player_audio_fill(&reads, &usec);
+        player_video_step_to_stage();
+        if (!g_worker_run) break;
+        audio_push_blocks(64); /* 阻塞式：整块播完才返回，天然就是音频时钟 */
+    }
+    g_worker_started = 0;
+    return NULL;
+}
+
+/* 渲染线程调用：把搬运缓冲里的最新帧取到上传用的平面上 */
+static int player_take_frame(void) {
+    int got = 0;
+    if (pthread_mutex_trylock(&g_frame_lock) == 0) {
+        if (g_frame_new && g_stage_w > 0) {
+            size_t ysz = (size_t)g_stage_w * (size_t)g_stage_h;
+            memcpy(g_y_plane, g_stage_y, ysz);
+            memcpy(g_uv_plane, g_stage_uv, ysz);
+            g_y_width  = g_stage_w;
+            g_y_height = g_stage_h;
+            g_frame_new = 0;
+            got = 1;
+        }
+        pthread_mutex_unlock(&g_frame_lock);
+    }
+    return got;
+}
+
 /* DASH（音视频两条 URL）：每帧从视频源读**一个**视频包送硬解，落后音频超 300ms 就等。 */
 static void video_step(void) {
     if (g_video_index < 0 || g_video_eof) return;
@@ -619,6 +742,11 @@ void wiliwili_ps5player_set_overlay(int on) { g_overlay = on; }
 
 /* 收尾：关音频、清状态（句柄判定按实测：>=1 才是有效句柄）。 */
 void wiliwili_ps5player_close(void) {
+    if (g_worker_run) {
+        g_worker_run = 0;
+        pthread_join(g_worker_tid, NULL);
+        wiliwili_boot_log("player: worker thread joined");
+    }
     if (g_audio_handle >= 1) sceAudioOutClose(g_audio_handle);
     g_audio_handle = -1;
     if (g_afmt) avformat_close_input(&g_afmt);
@@ -790,6 +918,19 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
                      g_y_height, g_rect_w, g_rect_h);
             wiliwili_boot_log(lb);
         }
+    }
+
+    if (g_worker_started) {
+        /* 工作线程在跑：这里只取最新帧上传（不做任何网络 IO / 阻塞音频调用） */
+        player_take_frame();
+        if (g_y_width > 0) wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+        static int report_w = 0;
+        if (++report_w >= 120) {
+            report_w = 0;
+            plog3("player: clock_ms=%d blocks=%d pts_ms=%d", (long)(g_audio_clock_us() / 1000),
+                  (long)g_audio_blocks, (long)(g_last_video_pts_us / 1000));
+        }
+        return;
     }
 
     int guard = 0;
