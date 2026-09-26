@@ -1041,3 +1041,28 @@ player: clock_ms=2560→5120→6016  pts_ms=2900→5400→5966   ← 整片播�
 
 **排查方法论补充**：这类"能进播放页、无报错、纯白屏"的问题，先在引擎里把 **app 传来的真实 URL 打进
 日志**，再对照 app 给 mpv 设的参数（`referrer`/`user-agent`/`network-timeout`）逐条补齐。
+
+
+### ★ 真机联调记录：B 站点播到"能出声、画面待定"（2026-09-26 晚）
+
+在**真实 B 站登录态**下逐轮排查（全部有真机日志佐证），依次修掉：
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 点播放崩 | `MPVCore` 构造 → `init()` → `mpvCreate()` 得 NULL → `brls::fatal` | PS5 下 `init()` 装安全桩后直接返回；`installMpvStubs()` 覆盖 21 个函数指针 |
+| 2 | 点开就退 | **我自己的锅**：测试变量 `WILIWILI_TEST_AUDIO2` 与既有 `audio2_probe` 重名（该探针会主动退出标题），且我把带它的测试选项文件一起装了进去 | 改名 `WILIWILI_TEST_AUDIO_ALT`；**发布镜像里绝不带 options 文件** |
+| 3 | 全白（视频区） | app 传的是 **DASH 双 URL**（视频 + 独立音轨），PS5 分支把 `audios` 丢了 | `open(video, audio_list)`；音频单独 `AVFormatContext`；音轨候选逐个尝试 |
+| 4 | 全白（音频也丢） | B 站 CDN 强制 **Referer**（app 给 mpv 设的 `referrer=https://www.bilibili.com`） | 引擎两条 open 都带 Referer + 浏览器 UA（**不关 TLS 校验**） |
+| 5 | 有声音无画面 | `VideoView::draw` 开头 `if (!mpvCore->isValid()) return;`，mpv 被桩化后恒 false ⇒ 整段绘制/OSD 跳过 | PS5 下 `isValid()` 返回 true |
+| 6 | 有声音无画面（其二） | app 在"加载中"会调 `pause()`，旧实现"暂停=直接 return"（连最后一帧都不画） | 暂停只停推进、仍绘制最后一帧 |
+| 7 | 转圈不消失、进度条不动 | 状态成员（`video_playing/paused/playback_time`）靠 mpv 事件循环更新，PS5 上没有该循环 | `MPVCore::syncNativePlayerState()` 每帧从自管播放器同步；属性桩按名字返回 `duration`/`time-pos`/`pause`；字符串桩返回空串而非 NULL（曾致空指针构造崩） |
+| 8 | 1920x896 流第 3~4 帧野指针崩（`addr=0x86cad7`） | 3 槽 AU/帧环在 1080p 吞吐下不够，第 4 个 AU 覆盖解码器仍持有的第 1 槽（小尺寸探针不会触发） | AU/帧环 3/3 → 8/12 |
+
+**当前状态（提交 `989ae09`）**：真机上已验证"有声音、音视频时钟同步推进（`clock_ms` / `pts_ms` 一致到 10s+）"，
+画面绘制先退回**全屏直画**（探针期肉眼验证过的形态），裁剪计算打点为
+`player: fit rect=10,10 800x450 -> 800x450 vp_y=620`（数值正确，待画面稳定后恢复）。
+
+**若仍不稳**：下一步把**解码放独立线程**（生产者/消费者 + 条件变量），彻底消除环槽时序竞争——这也是 EVO/mpv 的结构。
+
+**发布纪律**（踩过的坑）：`dist/` 会被构建清空 ⇒ options 文件必须**构建后**再写；**发布镜像不带任何探针开关**；
+测试变量命名前先 `grep` 仓库，避免与既有探针撞名。
