@@ -730,19 +730,36 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     if (g_afmt) {
         /* 两条独立 URL：音频从 g_afmt 读，视频单独走 video_step（单源路径不动） */
         int aguard = 0;
+        int reads = 0;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 1024) {
             if (av_read_frame(g_afmt, g_pkt) < 0) {
                 g_audio_eof = 1;
                 break;
             }
+            ++reads;
             if (g_pkt->stream_index == g_audio_index && g_adec) {
                 avcodec_send_packet(g_adec, g_pkt);
                 audio_decode_one_frame();
             }
             av_packet_unref(g_pkt);
         }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int before_push = g_pcm_frames;
         video_step();
         audio_push_blocks(64);
+        {
+            static int dbg = 0;
+            if (dbg < 6) {
+                ++dbg;
+                char lb[220];
+                snprintf(lb, sizeof(lb), "player: fill reads=%d usec=%ld pcm=%d pushed=%d eof=%d", reads,
+                         (long)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L), before_push,
+                         before_push - g_pcm_frames, (int)g_audio_eof);
+                wiliwili_boot_log(lb);
+            }
+        }
         wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
         static int report_at2 = 0;
         if (++report_at2 >= 120) {
