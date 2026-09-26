@@ -153,7 +153,7 @@ static unsigned long long g_draws;
 static int g_ready;
 /* 上屏修正开关：真机实测 PS5 硬解帧出来后方向与颜色对不上。默认 180 度旋转、HD 走 BT.709。 */
 int wiliwili_video_flip = 2; /* 真机实测：底子是垂直翻转（180 度会再引入水平错误） */
-int wiliwili_video_swap = 0;
+int wiliwili_video_swap = 1; /* 真机颜色不对：先试 U/V 交换（可用 WILIWILI_VIDEO_SWAP=0 关掉比对） */
 int wiliwili_video_709  = 1;
 
 static void log2(const char *fmt, long a, long b) {

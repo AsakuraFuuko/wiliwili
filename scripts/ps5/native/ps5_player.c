@@ -530,7 +530,9 @@ static void video_submit_packet(AVPacket *pkt) {
 /* DASH（音视频两条 URL）：每帧从视频源读**一个**视频包送硬解，落后音频超 300ms 就等。 */
 static void video_step(void) {
     if (g_video_index < 0 || g_video_eof) return;
-    if (g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
+    /* 音频源断流时**不要跟着卡死**：B 站会下发 mcdn 这类 P2P CDN，实测"能开、放几秒、然后断"
+     * （真机表现为每次固定停在 clock_ms=2560）。此时改为每帧送一包的自走节奏。 */
+    if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
     int guard = 0;
     while (guard++ < 64) {
         if (av_read_frame(g_fmt, g_pkt) < 0) {
@@ -768,7 +770,7 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
             g_audio_eof = 1;
             break;
         }
-        if (g_pkt->stream_index == g_video_index && g_last_video_pts_us > 0 &&
+        if (g_pkt->stream_index == g_video_index && !g_audio_eof && g_last_video_pts_us > 0 &&
             g_last_video_pts_us > g_audio_clock_us() + 300000) {
             /* 视频跑到音频前面 300 ms 以上就停手，把包留到下一帧（否则几秒内解完整个文件） */
             g_pending_video = 1;
