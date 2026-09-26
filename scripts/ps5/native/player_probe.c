@@ -27,6 +27,7 @@ struct NVGcontext;
 
 extern void wiliwili_boot_log(const char *message);
 extern void *SDL_GL_GetProcAddress(const char *proc);
+extern void wiliwili_draw_nv12(struct NVGcontext *vg, const uint8_t *y, const uint8_t *uv, int width, int height);
 
 /* ---- 系统导入 ---- */
 int32_t sceSysmoduleLoadModule(unsigned short id);
@@ -298,88 +299,92 @@ void wiliwili_player_probe(const char *url) {
     wiliwili_boot_log("player: ready");
 }
 
-/* 帧循环：先保证音频不断供（Output 阻塞即节拍），再按音频时钟解视频，最后上屏。 */
-void wiliwili_player_draw(struct NVGcontext *vg) {
-    (void)vg;
-    if (!g_ready) return;
-
-    /* 音频：保持领先 4 块左右（约 21 ms） */
-    int audio_rounds = 0;
-    while (!g_audio_eof && audio_rounds++ < 8) {
-        if (g_pcm_frames < AUDIO_GRAIN * 4) {
-            /* 需要更多 PCM：从容器取包解码 */
-            if (av_read_frame(g_fmt, g_pkt) < 0) {
-                g_audio_eof = 1;
-                break;
-            }
-            if (g_pkt->stream_index == g_audio_index && g_adec) {
-                avcodec_send_packet(g_adec, g_pkt);
-                av_packet_unref(g_pkt);
-                audio_decode_one_frame();
-            } else {
-                /* 视频包先放一边：用一个小暂存策略——解码到最新帧 */
-                if (g_pkt->stream_index == g_video_index && g_bsf) {
-                    if (g_last_video_pts_us <= g_audio_clock_us() + 60000) {
-                        AVPacket *out = av_packet_alloc();
-                        if (av_bsf_send_packet(g_bsf, g_pkt) == 0 && av_bsf_receive_packet(g_bsf, out) == 0) {
-                            int slot = (int)(g_audio_blocks % PIPELINE_SLOTS);
-                            uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
-                            memcpy(au_slot, out->data, (size_t)out->size);
-                            InputData input;
-                            memset(&input, 0, sizeof(input));
-                            input.size    = sizeof(input);
-                            input.au      = au_slot;
-                            input.au_size = (uint64_t)out->size;
-                            input.pts     = (uint64_t)(out->pts == AV_NOPTS_VALUE ? 0 : out->pts);
-                            input.dts     = UINT64_MAX;
-                            FrameBuffer frame;
-                            memset(&frame, 0, sizeof(frame));
-                            frame.size        = sizeof(frame);
-                            frame.buffer      = (uint8_t *)g_frame_pool + (size_t)slot * g_frame_size;
-                            frame.buffer_size = g_frame_size;
-                            OutputInfo oi;
-                            memset(&oi, 0, sizeof(oi));
-                            oi.size = sizeof(oi);
-                            if (sceVideodec2Decode(g_decoder, &input, &frame, &oi) == 0 && oi.valid == 0) {
-                                memset(&oi, 0, sizeof(oi));
-                                oi.size = sizeof(oi);
-                                sceVideodec2Flush(g_decoder, &frame, &oi);
-                            }
-                            if (oi.valid && oi.buffer) {
-                                int w = (int)oi.width, h = (int)oi.height;
-                                if (w > 1920) w = 1920;
-                                if (h > 1088) h = 1088;
-                                g_y_width  = w;
-                                g_y_height = h;
-                                const uint8_t *src = (const uint8_t *)oi.buffer;
-                                for (int y = 0; y < h; ++y)
-                                    memcpy(g_y_plane + (size_t)y * w, src + (size_t)y * oi.pitch, (size_t)w);
-                                const uint8_t *uv = src + (size_t)oi.pitch * h;
-                                for (int y = 0; y < h / 2; ++y)
-                                    memcpy(g_uv_plane + (size_t)y * w, uv + (size_t)y * oi.pitch, (size_t)w);
-                                if (out->pts != AV_NOPTS_VALUE)
-                                    g_last_video_pts_us =
-                                        av_rescale_q(out->pts, g_fmt->streams[g_video_index]->time_base, AV_TIME_BASE_Q);
-                            }
-                        }
-                        av_packet_free(&out);
-                    }
-                }
-                av_packet_unref(g_pkt);
-            }
-        }
-        audio_push_blocks(1);
-        if (g_audio_eof) break;
+/* 把一个视频包送进硬解，出帧就拷进稳定缓冲（Y/UV）。 */
+static void video_submit_packet(AVPacket *pkt) {
+    static int slot = 0;
+    if (!g_bsf) return;
+    AVPacket *out = av_packet_alloc();
+    if (av_bsf_send_packet(g_bsf, pkt) != 0) {
+        av_packet_free(&out);
+        return;
     }
+    while (av_bsf_receive_packet(g_bsf, out) == 0) {
+        uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
+        memcpy(au_slot, out->data, (size_t)out->size);
+        InputData input;
+        memset(&input, 0, sizeof(input));
+        input.size    = sizeof(input);
+        input.au      = au_slot;
+        input.au_size = (uint64_t)out->size;
+        input.pts     = (uint64_t)(out->pts == AV_NOPTS_VALUE ? 0 : out->pts);
+        input.dts     = UINT64_MAX;
+        FrameBuffer frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.size        = sizeof(frame);
+        frame.buffer      = (uint8_t *)g_frame_pool + (size_t)slot * g_frame_size;
+        frame.buffer_size = g_frame_size;
+        OutputInfo oi;
+        memset(&oi, 0, sizeof(oi));
+        oi.size = sizeof(oi);
+        int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
+        if (rc == 0 && oi.valid == 0) {
+            memset(&oi, 0, sizeof(oi));
+            oi.size = sizeof(oi);
+            sceVideodec2Flush(g_decoder, &frame, &oi);
+        }
+        if (oi.valid && oi.buffer) {
+            int w = (int)oi.width, h = (int)oi.height;
+            if (w > 1920) w = 1920;
+            if (h > 1088) h = 1088;
+            g_y_width  = w;
+            g_y_height = h;
+            const uint8_t *src = (const uint8_t *)oi.buffer;
+            for (int y = 0; y < h; ++y)
+                memcpy(g_y_plane + (size_t)y * w, src + (size_t)y * oi.pitch, (size_t)w);
+            const uint8_t *uv = src + (size_t)oi.pitch * h;
+            for (int y = 0; y < h / 2; ++y)
+                memcpy(g_uv_plane + (size_t)y * w, uv + (size_t)y * oi.pitch, (size_t)w);
+            if (out->pts != AV_NOPTS_VALUE)
+                g_last_video_pts_us = av_rescale_q(out->pts, g_fmt->streams[g_video_index]->time_base, AV_TIME_BASE_Q);
+        }
+        slot = (slot + 1) % PIPELINE_SLOTS;
+        av_packet_unref(out);
+    }
+    av_packet_free(&out);
+}
 
-    /* 上屏（NV12 双平面 + YUV 着色器；与 videodec2_probe.c 同一套） */
-    extern void wiliwili_draw_nv12(struct NVGcontext *vg, const uint8_t *y, const uint8_t *uv, int w, int h);
+/* 帧循环：每帧推**一块**音频（Output 阻塞 ≈ 5.3 ms，自然节拍），视频包读到就立刻送硬解。 */
+void wiliwili_player_draw(struct NVGcontext *vg) {
+    if (!g_ready) return;
+    static int draw_calls = 0;
+    ++draw_calls;
+    if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
+
+    int guard = 0;
+    while (g_pcm_frames < AUDIO_GRAIN * 4 && !g_audio_eof && guard++ < 64) {
+        if (av_read_frame(g_fmt, g_pkt) < 0) {
+            g_audio_eof = 1;
+            break;
+        }
+        if (g_pkt->stream_index == g_audio_index && g_adec) {
+            avcodec_send_packet(g_adec, g_pkt);
+            audio_decode_one_frame();
+        } else if (g_pkt->stream_index == g_video_index) {
+            video_submit_packet(g_pkt); /* 不再丢弃 */
+        }
+        av_packet_unref(g_pkt);
+    }
+    if (draw_calls <= 3) plog1("player: refilled pcm_frames=%d", (long)g_pcm_frames);
+    audio_push_blocks(1);
+    if (draw_calls <= 3) plog1("player: pushed blocks=%d", (long)g_audio_blocks);
+
     wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+    if (draw_calls <= 3) plog1("player: drew %d", (long)g_y_width);
 
     static int report_at = 0;
     if (++report_at >= 120) {
         report_at = 0;
-        plog3("player: clock_ms=%d audio_blocks=%d pts_ms=%d", (long)(g_audio_clock_us() / 1000),
-             (long)g_audio_blocks, (long)(g_last_video_pts_us / 1000));
+        plog3("player: clock_ms=%d blocks=%d pts_ms=%d", (long)(g_audio_clock_us() / 1000), (long)g_audio_blocks,
+              (long)(g_last_video_pts_us / 1000));
     }
 }
