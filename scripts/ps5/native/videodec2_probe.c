@@ -371,7 +371,10 @@ void wiliwili_draw_nv12(struct NVGcontext *vg, const uint8_t *y_plane, const uin
 
 void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     (void)vg;
-    if (!g_ready || g_y_width <= 0) return;
+    /* 注意：**不要**在这里判 g_ready —— 它是本探针自己的状态，只有 WILIWILI_TEST_VDEC 会置位。
+     * 播放器（scripts/ps5/native/ps5_player.c）复用本函数做 NV12 上屏，一旦依赖它就永远
+     * 在第一行 return：真机表现为"解码全部 valid=1、也有声音，但屏幕全白"。只用尺寸判断。 */
+    if (g_y_width <= 0) return;
 
     typedef unsigned int GLenum_t;
     typedef void (*PFN_TexImage2D)(GLenum_t, int, int, int, int, int, GLenum_t, GLenum_t, const void *);

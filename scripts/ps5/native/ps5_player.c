@@ -662,9 +662,26 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
         return;
     }
 
-    if (g_paused) {
+    if (g_paused && g_y_width > 0) {
+        /* 已有画面才允许"暂停冻结"。**第一帧之前不能返回**：app 在加载中就会调 pause()，
+         * 若此时返回，就永远不会解码 ⇒ 永远空白 + 一直转圈（真机实测现象）。 */
+        static int pause_logged = 0;
+        if (!pause_logged) {
+            pause_logged = 1;
+            wiliwili_boot_log("player: paused with frame, freezing");
+        }
         wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
         return;
+    }
+    {
+        static int first_logged = 0;
+        if (!first_logged) {
+            first_logged = 1;
+            char lb[200];
+            snprintf(lb, sizeof(lb), "player: loop start paused=%d y=%dx%d rect=%.0fx%.0f", g_paused, g_y_width,
+                     g_y_height, g_rect_w, g_rect_h);
+            wiliwili_boot_log(lb);
+        }
     }
 
     int guard = 0;
@@ -702,7 +719,15 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
 
     wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
     if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
-    if (draw_calls <= 3) plog1("player: drew %d", (long)g_y_width);
+    {
+        static int drew_logged = 0;
+        if (!drew_logged && g_y_width > 0) {
+            drew_logged = 1;
+            char lb[160];
+            snprintf(lb, sizeof(lb), "player: drew %dx%d (uploaded)", g_y_width, g_y_height);
+            wiliwili_boot_log(lb);
+        }
+    }
 
     static int report_at = 0;
     if (++report_at >= 120) {
