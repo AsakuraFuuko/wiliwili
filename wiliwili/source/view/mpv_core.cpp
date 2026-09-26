@@ -976,7 +976,15 @@ void MPVCore::setFrameSize(brls::Rect r) {
 #endif
 }
 
-bool MPVCore::isValid() { return mpv_context != nullptr; }
+bool MPVCore::isValid() {
+#ifdef PS5_NATIVE_APP
+    /* mpv 不可用（沙箱问题），但播放由自管播放器负责：这里必须返回 true，
+     * 否则 VideoView::draw 一进门就 return，OSD/弹幕/进度条全都不画。 */
+    return true;
+#else
+    return mpv_context != nullptr;
+#endif
+}
 
 void MPVCore::draw(brls::Rect area, float alpha) {
     if (mpv_context == nullptr) return;

@@ -115,6 +115,7 @@ static int g_audio_eof;
 static int g_pending_video; /* g_pkt 里留着一个未到播放时间的视频包 */
 static int g_paused;
 static int g_overlay; /* 探针模式：在 UI 之后重复画一遍，便于肉眼确认 */
+static float g_rect_x, g_rect_y, g_rect_w, g_rect_h; /* 播放器区域（nvg 左上角原点） */
 
 static void plog1(const char *fmt, long a) {
     char line[160];
@@ -177,8 +178,8 @@ static int decoder_init(int width, int height) {
      * 已验证的探针里写的是 640x368（= 360 对齐到 368）。 */
     config.max_width            = (width + 15) & ~15;
     config.max_height           = (height + 15) & ~15;
-    config.max_dpb_frames       = 4;
-    config.pipeline_depth       = 1;
+    config.max_dpb_frames       = 16; /* 1080p 流参考帧可能多于 4（EVO 用 -1）；太小会导致 Decode 不出帧 */
+    config.pipeline_depth       = 1; /* 保持 1：AU 环只有 3 槽，提高会互相覆盖 */
     config.compute_queue        = (uint64_t)compute_queue;
     config.cpu_affinity         = 0x3F;
     config.cpu_priority         = 700;
@@ -201,6 +202,12 @@ static int decoder_init(int width, int height) {
     mem.cpu_gpu_size      = cpu_gpu_size;
 
     g_frame_size = align16k(mem.max_frame_size);
+    {
+        char lb[200];
+        snprintf(lb, sizeof(lb), "player: dec mem frame_size=%d cpu=%d gpu=%d cpu_gpu=%d", (int)g_frame_size,
+                 (int)mem.cpu_size, (int)mem.gpu_size, (int)mem.cpu_gpu_size);
+        wiliwili_boot_log(lb);
+    }
     g_au_pool    = alloc_direct(limit, 0x800000u * AU_SLOTS, 0x32);
     g_frame_pool = alloc_direct(limit, g_frame_size * FRAME_SLOTS, 0x32);
         if (!g_au_pool || !g_frame_pool) return -1;
@@ -257,8 +264,12 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     avformat_network_init();
     {
         char lb[220];
-        snprintf(lb, sizeof(lb), "player: url=%.80s", url ? url : "(null)");
+        snprintf(lb, sizeof(lb), "player: url=%.150s", url ? url : "(null)");
         wiliwili_boot_log(lb);
+        if (url && strlen(url) > 150) {
+            snprintf(lb, sizeof(lb), "player: url2=%.150s", url + 150);
+            wiliwili_boot_log(lb);
+        }
         if (audio_url && audio_url[0]) {
             snprintf(lb, sizeof(lb), "player: audio_url=%.80s", audio_url);
             wiliwili_boot_log(lb);
@@ -291,22 +302,38 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     /* B 站 DASH：视频与音频是两条独立 URL（app 通过 audios 参数传进来）。
      * 音频单独开一个上下文，视频仍走 g_fmt。二者都只有一条流时最省事。 */
     if (audio_url != NULL && audio_url[0] != '\0' && strcmp(audio_url, url) != 0) {
-        AVDictionary *aopts = NULL;
-        av_dict_set(&aopts, "ca_file", "/app0/assets/ca-bundle.crt", 0);
-        av_dict_set(&aopts, "referer", "https://www.bilibili.com", 0);
-        av_dict_set(&aopts, "user_agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36",
-                    0);
-        int arc = avformat_open_input(&g_afmt, audio_url, NULL, &aopts);
-        av_dict_free(&aopts);
-        plog1("player: audio open rc=%d", arc);
-        if (arc >= 0) {
-            avformat_find_stream_info(g_afmt, NULL);
-            g_audio_index = av_find_best_stream(g_afmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-            wiliwili_boot_log("player: separate audio url");
-        } else {
-            g_afmt = NULL;
+        /* audio_url 可能是多行候选（app 的 audios 列表 = base + backup）：逐个试，
+         * 第一个能开的就用。B 站会下发 mcdn 这类 P2P CDN，实测会打不开（EIO），
+         * 只取第一个就是"有画面没声音"或反过来。 */
+        const char *p   = audio_url;
+        int tries       = 0;
+        while (*p != '\0' && g_afmt == NULL && tries < 6) {
+            const char *nl = strchr(p, '\n');
+            size_t len     = nl ? (size_t)(nl - p) : strlen(p);
+            char one[1024];
+            if (len >= sizeof(one)) len = sizeof(one) - 1;
+            memcpy(one, p, len);
+            one[len] = '\0';
+            ++tries;
+            AVDictionary *aopts = NULL;
+            av_dict_set(&aopts, "ca_file", "/app0/assets/ca-bundle.crt", 0);
+            av_dict_set(&aopts, "referer", "https://www.bilibili.com", 0);
+            av_dict_set(&aopts, "user_agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36",
+                        0);
+            int arc = avformat_open_input(&g_afmt, one, NULL, &aopts);
+            av_dict_free(&aopts);
+            plog2("player: audio open try=%d rc=%d", (long)tries, (long)arc);
+            if (arc >= 0) {
+                avformat_find_stream_info(g_afmt, NULL);
+                g_audio_index = av_find_best_stream(g_afmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+                wiliwili_boot_log("player: separate audio url");
+            } else {
+                g_afmt = NULL;
+            }
+            if (nl == NULL) break;
+            p = nl + 1;
         }
     }
     plog2("player: streams v=%d a=%d", g_video_index, g_audio_index);
@@ -385,6 +412,7 @@ static void video_submit_packet(AVPacket *pkt) {
     static int slot      = 0; /* AU 环 */
     static int fslot     = 0; /* 帧环（与 AU 环独立，避免互相覆盖） */
     static uint64_t au_seq = 0;
+    static int dbg_au = 0;
     if (!g_bsf) return;
     AVPacket *out = av_packet_alloc();
     int send_rc   = av_bsf_send_packet(g_bsf, pkt);
@@ -422,10 +450,21 @@ static void video_submit_packet(AVPacket *pkt) {
         memset(&oi, 0, sizeof(oi));
         oi.size = sizeof(oi);
         int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
+        int flush_rc = 0;
         if (rc == 0 && oi.valid == 0) {
             memset(&oi, 0, sizeof(oi));
             oi.size = sizeof(oi);
-            sceVideodec2Flush(g_decoder, &frame, &oi);
+            flush_rc = sceVideodec2Flush(g_decoder, &frame, &oi);
+        }
+        if (dbg_au < 12) {
+            ++dbg_au;
+            const uint8_t *h = (const uint8_t *)out->data;
+            char lb[220];
+            snprintf(lb, sizeof(lb),
+                     "player: au%d size=%d head=%02x%02x%02x%02x%02x dec=%d valid=%d flush=%d oi=%d %dx%d",
+                     dbg_au, (int)out->size, h[0], h[1], h[2], h[3], h[4], rc, oi.valid, flush_rc, (int)oi.buffer_size,
+                     (int)oi.width, (int)oi.height);
+            wiliwili_boot_log(lb);
         }
         if (oi.valid && oi.buffer) {
             int w = (int)oi.width, h = (int)oi.height;
@@ -477,6 +516,18 @@ void wiliwili_ps5player_pause(int paused) { g_paused = paused; }
  * （PS5 侧没有屏幕截图手段，只能靠电视确认）。真实播放走"nvg 之前"的正常路径。 */
 int wiliwili_ps5player_overlay(void) { return g_overlay; }
 
+/* 已成功起流？供 VideoView 判断是否需要改用备用视频地址。 */
+int wiliwili_ps5player_ready(void) { return g_ready; }
+
+/* VideoView::draw 每帧上报自己的矩形（nvg 坐标：左上角原点）。视频按 16:9 letterbox 放进这个区域，
+ * 区域之外（OSD、评论、标题）不受影响。 */
+void wiliwili_ps5player_set_rect(float x, float y, float w, float h) {
+    g_rect_x = x;
+    g_rect_y = y;
+    g_rect_w = w;
+    g_rect_h = h;
+}
+
 void wiliwili_ps5player_set_overlay(int on) { g_overlay = on; }
 
 /* 收尾：关音频、清状态（句柄判定按实测：>=1 才是有效句柄）。 */
@@ -487,8 +538,48 @@ void wiliwili_ps5player_close(void) {
     g_paused       = 0;
 }
 
+/* GL 视口：和本文件其它 GL 调用一样通过 SDL_GL_GetProcAddress 取（引擎是 C，不带 GL 头）。 */
+static void pl_viewport(int x, int y, int w, int h) {
+    typedef void (*Fn)(int, int, int, int);
+    static Fn fn;
+    if (!fn) fn = (Fn)SDL_GL_GetProcAddress("glViewport");
+    if (fn) fn(x, y, w, h);
+}
+static void pl_get_viewport(int vp[4]) {
+    typedef void (*Fn)(unsigned int, int *);
+    static Fn fn;
+    if (!fn) fn = (Fn)SDL_GL_GetProcAddress("glGetIntegerv");
+    vp[0] = 0;
+    vp[1] = 0;
+    vp[2] = 1920;
+    vp[3] = 1080;
+    if (fn) fn(0x0BA2 /* GL_VIEWPORT */, vp);
+}
+
 void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     if (!g_ready || g_paused) return;
+    /* 画面按区域画：16:9 适配进 g_rect_*（GL 视口原点在左下，y 要翻转）。
+     * 之前画全屏且在 nvgBeginFrame 之前，会被 VideoView 的不透明背景盖住 ⇒ 全白。 */
+    int old_vp[4];
+    pl_get_viewport(old_vp);
+    int vp[4]     = {0, 0, 0, 0};
+    int have_rect = (g_rect_w > 1.0f && g_rect_h > 1.0f);
+    if (have_rect) {
+        int win_h = old_vp[3]; /* 当前视口高度（整窗），用于 y 翻转 */
+        float src_ar = (g_y_width > 0 && g_y_height > 0) ? (float)g_y_width / (float)g_y_height : 16.0f / 9.0f;
+        float w      = g_rect_w;
+        float h      = w / src_ar;
+        if (h > g_rect_h) {
+            h = g_rect_h;
+            w = h * src_ar;
+        }
+        vp[0] = (int)(g_rect_x + (g_rect_w - w) * 0.5f);
+        vp[1] = (int)(win_h - (g_rect_y + (g_rect_h - h) * 0.5f) - h);
+        vp[2] = (int)w;
+        vp[3] = (int)h;
+        if (vp[2] <= 0 || vp[3] <= 0) have_rect = 0;
+    }
+    if (have_rect) pl_viewport(vp[0], vp[1], vp[2], vp[3]);
     static int draw_calls = 0;
     ++draw_calls;
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
@@ -553,6 +644,7 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     if (draw_calls <= 3) plog1("player: pushed blocks=%d", (long)g_audio_blocks);
 
     wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
+    if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
     if (draw_calls <= 3) plog1("player: drew %d", (long)g_y_width);
 
     static int report_at = 0;

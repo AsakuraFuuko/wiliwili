@@ -274,7 +274,13 @@ int main(int argc, char* argv[]) {
                 }
                 const char *playerUrl = getenv("WILIWILI_TEST_PLAYER");
                 if (playerUrl != nullptr && playerUrl[0] != '\0') {
-                    wiliwili_ps5player_open(playerUrl, getenv("WILIWILI_TEST_AUDIO"));
+                    const char *a1 = getenv("WILIWILI_TEST_AUDIO");
+                    /* 注意：不要用 WILIWILI_TEST_AUDIO2 —— 那个名字已被 audio2_probe（sceAudioOut2 探针，会让标题退出）占用 */
+                    const char *a2 = getenv("WILIWILI_TEST_AUDIO_ALT");
+                    std::string alist;
+                    if (a1 && *a1) alist = a1;
+                    if (a2 && *a2) alist += std::string("\n") + a2;
+                    wiliwili_ps5player_open(playerUrl, alist.empty() ? nullptr : alist.c_str());
                     wiliwili_ps5player_set_overlay(1); /* 探针模式：画在 UI 之上，便于肉眼确认 */
                 }
             }

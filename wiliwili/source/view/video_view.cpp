@@ -25,6 +25,11 @@
 extern "C" void wiliwili_boot_log(const char *);
 #define WILI_BOOT_LOG(m) wiliwili_boot_log(m)
 #include "view/video_view.hpp"
+#ifdef PS5_NATIVE_APP
+/* PS5 自管播放器（scripts/ps5/native/ps5_player.c）：mpv 在原生标题沙箱里不可用。 */
+extern "C" void wiliwili_ps5player_set_rect(float x, float y, float w, float h);
+extern "C" int wiliwili_ps5player_ready(void);
+#endif
 
 #include "utils/shortcut_helper.hpp"
 #include "view/live_core.hpp"
@@ -627,6 +632,10 @@ VideoView::~VideoView() {
 
 void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height, brls::Style style,
                      brls::FrameContext* ctx) {
+#ifdef PS5_NATIVE_APP
+    /* 每帧把播放器矩形告诉自管播放器：它在 UI 之后按这个区域（16:9 letterbox）画视频。 */
+    wiliwili_ps5player_set_rect(x, y, width, height);
+#endif
     if (!mpvCore->isValid()) return;
     float alpha        = this->getAlpha();
     brls::Time current = brls::getCPUTimeUsec();
@@ -842,14 +851,21 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
 extern "C" void wiliwili_ps5player_open(const char *url, const char *audio_url);
 extern "C" void wiliwili_ps5player_close(void);
 extern "C" void wiliwili_ps5player_pause(int paused);
+extern "C" void wiliwili_ps5player_set_rect(float x, float y, float w, float h);
 #endif
 
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
 #ifdef PS5_NATIVE_APP
     (void)start;
     (void)end;
-    /* B 站 DASH 是音视频两条 URL：audios[0] 是音轨，必须一起交给引擎。 */
-    wiliwili_ps5player_open(url.c_str(), audios.empty() ? nullptr : audios[0].c_str());
+    /* B 站 DASH 是音视频两条 URL，且每路都有 base + backup：用换行拼成候选列表交给引擎，
+     * 由它逐个尝试（mcdn 这类 CDN 实测会打不开）。 */
+    std::string audio_list;
+    for (auto& a : audios) {
+        if (!audio_list.empty()) audio_list += "\n";
+        audio_list += a;
+    }
+    wiliwili_ps5player_open(url.c_str(), audio_list.empty() ? nullptr : audio_list.c_str());
 #else
     mpvCore->setUrl(url, genExtraUrlParam(start, end, audios));
 #endif
@@ -860,7 +876,22 @@ void VideoView::setBackupUrl(const std::string& url, int start, int end, const s
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
+#ifdef PS5_NATIVE_APP
+    /* B 站会下发多个 CDN（base + backup）：基址没起流就用备用地址重开一次
+     * （音轨候选列表一起带上，由引擎逐个尝试）。 */
+    (void)start;
+    (void)end;
+    if (!wiliwili_ps5player_ready()) {
+        std::string audio_list;
+        for (auto& a : audios) {
+            if (!audio_list.empty()) audio_list += "\n";
+            audio_list += a;
+        }
+        wiliwili_ps5player_open(url.c_str(), audio_list.empty() ? nullptr : audio_list.c_str());
+    }
+#else
     mpvCore->setBackupUrl(url, genExtraUrlParam(start, end, audios));
+#endif
 }
 
 void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) {
