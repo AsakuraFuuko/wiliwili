@@ -142,8 +142,10 @@ static int g_au_size[MAX_AU];
 static int g_au_count;
 static int g_au_index;
 
-static uint8_t g_y_plane[1920 * 1088];  /* 稳定副本（帧池槽会被复用） */
-static uint8_t g_uv_plane[1920 * 544];  /* NV12 的 UV 平面：半高度、交织 CbCr */
+static uint8_t g_y_storage[1920 * 1088];  /* 稳定副本（帧池槽会被复用） */
+static uint8_t g_uv_storage[1920 * 544];  /* NV12 的 UV 平面：半高度、交织 CbCr */
+static const uint8_t *g_y_plane_ptr  = g_y_storage;
+static const uint8_t *g_uv_plane_ptr = g_uv_storage;
 static int g_y_width, g_y_height, g_y_pitch;
 static unsigned long long g_y_uploads;
 static double g_upload_ms_total;
@@ -339,10 +341,10 @@ void wiliwili_videodec2_probe(void) {
             const uint8_t *src = (const uint8_t *)out.buffer;
             /* Y：前 height 行；UV：紧跟其后、半高度（NV12 交织 CbCr）。都紧打包，便于直接上传。 */
             for (int y = 0; y < copy_h; ++y)
-                memcpy(g_y_plane + (size_t)y * copy_w, src + (size_t)y * out.pitch, (size_t)copy_w);
+                memcpy(g_y_storage + (size_t)y * copy_w, src + (size_t)y * out.pitch, (size_t)copy_w);
             const uint8_t *uv_src = src + (size_t)out.pitch * copy_h;
             for (int y = 0; y < copy_h / 2; ++y)
-                memcpy(g_uv_plane + (size_t)y * copy_w, uv_src + (size_t)y * out.pitch, (size_t)copy_w);
+                memcpy(g_uv_storage + (size_t)y * copy_w, uv_src + (size_t)y * out.pitch, (size_t)copy_w);
         }
         slot = (slot + 1) % PIPELINE_SLOTS;
     }
@@ -355,6 +357,18 @@ void wiliwili_videodec2_probe(void) {
 
 /* 由 borealis 帧循环在 nvgEndFrame 之后调用：raw GL 画全屏四边形，
  * 两个平面（Y=R8、UV=RG8）在片元着色器里做 BT.601 limited YUV→RGB。 */
+void wiliwili_videodec2_draw(struct NVGcontext *vg); /* 定义在下面 */
+
+/* 复用的 NV12 上屏（供播放器探针调用）：两平面纹理 + YUV 着色器。 */
+void wiliwili_draw_nv12(struct NVGcontext *vg, const uint8_t *y_plane, const uint8_t *uv_plane, int width, int height) {
+    if (!y_plane || width <= 0) return;
+    g_y_plane_ptr  = y_plane;
+    g_uv_plane_ptr = uv_plane;
+    g_y_width      = width;
+    g_y_height     = height;
+    wiliwili_videodec2_draw(vg);
+}
+
 void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     (void)vg;
     if (!g_ready || g_y_width <= 0) return;
@@ -437,7 +451,10 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     static int u_y_loc, u_uv_loc;
     static int pipeline_ready;
 
+    static int last_w = -1;
+    if (pipeline_ready && last_w != g_y_width) pipeline_ready = 0; /* 分辨率变化 ⇒ 重建纹理 */
     if (!pipeline_ready) {
+        last_w = g_y_width;
         p_pixel_store(0x0CF5 /*UNPACK_ALIGNMENT*/, 1);
 
         p_gen_textures(1, &tex_y);
@@ -446,7 +463,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         p_tex_param(0x0DE1, 0x2800, 0x2600);
         p_tex_param(0x0DE1, 0x2802, 0x812F);
         p_tex_param(0x0DE1, 0x2803, 0x812F);
-        p_tex_image(0x0DE1, 0, 0x8229 /*R8*/, g_y_width, g_y_height, 0, 0x1903 /*RED*/, 0x1401, g_y_plane);
+        p_tex_image(0x0DE1, 0, 0x8229 /*R8*/, g_y_width, g_y_height, 0, 0x1903 /*RED*/, 0x1401, g_y_plane_ptr);
 
         p_gen_textures(1, &tex_uv);
         p_bind_texture(0x0DE1, tex_uv);
@@ -455,7 +472,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         p_tex_param(0x0DE1, 0x2802, 0x812F);
         p_tex_param(0x0DE1, 0x2803, 0x812F);
         p_tex_image(0x0DE1, 0, 0x822B /*RG8*/, g_y_width / 2, g_y_height / 2, 0, 0x8227 /*RG*/, 0x1401,
-                    g_uv_plane);
+                    g_uv_plane_ptr);
 
         static const char *vs_src =
             "#version 330 core\n"
@@ -524,9 +541,9 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     p_bind_texture(0x0DE1, tex_y);
-    p_tex_sub(0x0DE1, 0, 0, g_y_width, g_y_height, 0x1903, 0x1401, g_y_plane);
+    p_tex_sub(0x0DE1, 0, 0, g_y_width, g_y_height, 0x1903, 0x1401, g_y_plane_ptr);
     p_bind_texture(0x0DE1, tex_uv);
-    p_tex_sub(0x0DE1, 0, 0, g_y_width / 2, g_y_height / 2, 0x8227, 0x1401, g_uv_plane);
+    p_tex_sub(0x0DE1, 0, 0, g_y_width / 2, g_y_height / 2, 0x8227, 0x1401, g_uv_plane_ptr);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_upload_ms_total += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     ++g_y_uploads;

@@ -767,3 +767,26 @@ sceAudioOutClose(handle);
 
 **仍然成立的部分**：SDL2 在该原生构建里没有音频后端（需自接系统接口）；`sceAudioOut2*` 不需要（经典 API 就够）；
 用户上下文与仲裁不是必需（`GetInitialUser`/`ArbitrationInitialize` 可以不做直接 open 成功）。
+
+
+### P2e 装配进展（2026-09-26）：三个零件串起来了，卡在重采样器初始化
+
+新增 `scripts/ps5/native/player_probe.c`（触发 `WILIWILI_TEST_PLAYER=<url>`）：ffmpeg 解封装 →
+`h264_mp4toannexb` 位流过滤 → `sceVideodec2` 硬解 → NV12 上屏；音频 ffmpeg 解码 → `sceAudioOut` 阻塞输出（时钟）。
+
+真机进度（每一行都是打点确认的）：
+
+```
+player: enter 1
+player: sysmodule rc=0            ← 硬解模块
+player: decoder reset rc=0        ← 解码器就绪
+player: audio handle=536870912    ← AudioOut 就绪（0x20000000 有效句柄）
+player: streams v=0 a=1           ← 找到视频流与音频流
+player: bsf lookup / filter=1 / bsf alloc ok / bsf params copied / bsf init rc=0   ← Annex-B 过滤就绪
+player: audio codec found / audio decoder open                                     ← AAC 解码器就绪
+（随后退出）                       ← 卡在 swr（重采样器）初始化
+```
+
+**下一步（明确且局部）**：把 `swr_alloc_set_opts2(...)` 换成 AVOption 手工配置（`swr_alloc()` +
+`av_opt_set_chlayout/av_opt_set_int` + `swr_init`），并保留打点；过了这一步接下来就是
+"按音频时钟解视频 + 上屏"的循环（那一套已在 `videodec2_probe.c` 里验证过）。
