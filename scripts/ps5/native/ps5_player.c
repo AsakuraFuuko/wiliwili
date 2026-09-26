@@ -109,7 +109,10 @@ static int64_t g_last_video_pts_us;
  * 曾经只开 1 块（AUDIO_GRAIN*2 个 int16）却按 g_pcm_frames 偏移连着转 4 块：
  * 第 2 次 swr_convert 起就越界，正好写进紧邻的 video_submit_packet.slot，
  * 表现为 AU 槽索引变成 PCM 采样值(0xB3E4A9C) → memcpy 野指针崩溃。 */
-#define PCM_TARGET_BLOCKS 4
+/* 每帧补料目标。**必须 >= 每秒渲染帧数 × 单帧所需块数**：播放页只有 6~8 fps
+ * （截图 FPS:6），4 块时每秒只能推进 24 块 ≈ 128ms 音频 ⇒ 画面像冻住（真机实测
+ * clock_ms 100 秒才走 2.5 秒）。32 块 ≈ 170ms，8fps 下就够实时。 */
+#define PCM_TARGET_BLOCKS 32
 static int16_t g_pcm[AUDIO_GRAIN * 2 * PCM_TARGET_BLOCKS];
 static int g_pcm_frames;
 static int g_audio_handle = -1;
@@ -439,6 +442,12 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
         }
     }
 
+    if (g_adec == NULL) {
+        /* 没有可用的音频源：直接视作 eof，让视频按帧自走（否则会被"时钟+300ms"冻住）。 */
+        g_audio_eof = 1;
+        wiliwili_boot_log("player: no audio source, video free-runs");
+    }
+
     g_pkt    = av_packet_alloc();
     g_aframe = av_frame_alloc();
     g_ready  = 1;
@@ -712,7 +721,7 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
     if (g_afmt) {
         /* 两条独立 URL：音频从 g_afmt 读，视频单独走 video_step（单源路径不动） */
         int aguard = 0;
-        while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 256) {
+        while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 1024) {
             if (av_read_frame(g_afmt, g_pkt) < 0) {
                 g_audio_eof = 1;
                 break;
@@ -764,7 +773,7 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
         av_packet_unref(g_pkt);
         g_pending_video = 0;
     }
-    while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && guard++ < 256) {
+    while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && guard++ < 1024) {
         int read_rc = av_read_frame(g_fmt, g_pkt);
         if (read_rc < 0) {
             g_audio_eof = 1;
