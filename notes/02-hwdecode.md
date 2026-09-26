@@ -1020,3 +1020,24 @@ B 站的 `.m4s` 是 fMP4、moov 内联，不受影响。）
 
 **另外**：引擎现在会把 app 传进来的真实 URL 打进日志（`player: url=…` / `player: audio_url=…`），
 便于在真机上直接确认 B 站下发的形态。
+
+
+### ★ 白屏真因：B 站 CDN 强制 Referer（2026-09-26）
+
+用户第二次截图仍是空白（换了视频、现象相同）。查到 `video_view.cpp:812` 给 mpv 设的是
+`referrer="https://www.bilibili.com",network-timeout=10` —— **B 站 CDN 强制校验 Referer**，
+而自管播放器只设了 UA，没设 Referer ⇒ CDN 403 ⇒ `avformat_open_input` 失败 ⇒ 播放器全白（无报错弹窗）。
+
+**修复**：引擎在 `avformat_open_input`（视频与音轨两处）都带上
+`referer=https://www.bilibili.com` + 浏览器 UA。
+
+**验证方式（可复现）**：起一个"不带 `Referer: https://www.bilibili.com` 就返回 403"的本地服务
+（`/tmp/refserver.py`，端口 8813），用 `WILIWILI_TEST_PLAYER/AUDIO` 指向它：
+```
+player: open rc=0 / audio open rc=0 / separate audio url
+player: clock_ms=2560→5120→6016  pts_ms=2900→5400→5966   ← 整片播完 ⇒ 头确实发出去了
+```
+若没带 Referer，open 必然是 403 而非 0 ⇒ 这条测试是**充分**的。
+
+**排查方法论补充**：这类"能进播放页、无报错、纯白屏"的问题，先在引擎里把 **app 传来的真实 URL 打进
+日志**，再对照 app 给 mpv 设的参数（`referrer`/`user-agent`/`network-timeout`）逐条补齐。

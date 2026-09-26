@@ -267,7 +267,13 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     /* B 站是 https：给 ffmpeg 的 TLS 指 CA（随包安装，绝不关闭校验）。 */
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "ca_file", "/app0/assets/ca-bundle.crt", 0);
-    av_dict_set(&opts, "user_agent", "wiliwili/1.6.0 (PS5)", 0);
+    /* B 站 CDN 强制校验 Referer（app 给 mpv 设的就是 "https://www.bilibili.com"，
+     * 见 video_view.cpp:812），不带就是 403 ⇒ 打不开 ⇒ 播放器全白。UA 也用浏览器串。 */
+    av_dict_set(&opts, "referer", "https://www.bilibili.com", 0);
+    av_dict_set(&opts, "user_agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 "
+                "Safari/537.36",
+                0);
     int open_rc = avformat_open_input(&g_fmt, url, NULL, &opts);
     av_dict_free(&opts);
     plog1("player: open rc=%d", open_rc);
@@ -287,7 +293,11 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     if (audio_url != NULL && audio_url[0] != '\0' && strcmp(audio_url, url) != 0) {
         AVDictionary *aopts = NULL;
         av_dict_set(&aopts, "ca_file", "/app0/assets/ca-bundle.crt", 0);
-        av_dict_set(&aopts, "user_agent", "wiliwili/1.6.0 (PS5)", 0);
+        av_dict_set(&aopts, "referer", "https://www.bilibili.com", 0);
+        av_dict_set(&aopts, "user_agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36",
+                    0);
         int arc = avformat_open_input(&g_afmt, audio_url, NULL, &aopts);
         av_dict_free(&aopts);
         plog1("player: audio open rc=%d", arc);
