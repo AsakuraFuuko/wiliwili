@@ -1107,3 +1107,24 @@ player: clock_ms=2560→5120→6016  pts_ms=2900→5400→5966   ← 整片播�
 
 另外一个可选的提速点：媒体取流改走应用里已验证的 cpr/curl（HTTP/2、连接复用、CA 已配好），
 再通过 `avio_alloc_context` 自定义读回调喂 ffmpeg —— 若瓶颈真的是 CDN 读取速率，这一步收益最大。
+
+
+### ★ 独立播放线程（2026-09-26 收尾，提交 c13325f）
+
+**为什么必须做**：播放页只有 6~8 fps，而 `av_read_frame`（网络）与 `sceAudioOutOutput`（阻塞到整块播完）
+都必须在 ~190 次/秒的节奏上推进。把它们留在渲染线程里 ⇒ 播放速度被帧率绑死
+（实测 `clock_ms` 每 22 秒才推进 2560 ms，即每帧只推进 ≈21 ms 音频）。
+
+**结构**（`scripts/ps5/native/ps5_player.c`，DASH 双 URL 时自动启用）：
+- **工作线程** `player_worker`：`player_audio_fill()`（从 `g_afmt` 读包→解码→`swr`→PCM 缓冲）
+  → `player_video_step_to_stage()`（从 `g_fmt` 读包→硬解→把 Y/UV 拷进暂存）
+  → `audio_push_blocks(64)`（阻塞式推送 = 音频时钟）；
+- **渲染线程** `wiliwili_ps5player_draw`：只 `player_take_frame()`（`trylock` 取最新帧）
+  → `wiliwili_draw_nv12()` 上传纹理并绘制；不做任何网络 IO 或阻塞调用；
+- `close()` 会 `pthread_join` 工作线程；`WILIWILI_PLAYER_THREAD` 环境变量可退出该路径以便对照。
+
+**验证方法**：日志里 `clock_ms` 应从"每 22 秒 +2560"变成"每秒 +1000"；
+前 6 帧的 `player: fill reads=… usec=… pcm=… pushed=… eof=…` 直接给出读取/解码/推送三段的耗时。
+
+**若仍有偶发崩溃**（`addr=0x86cad7`）：把暂存改成三缓冲/环形，彻底消除"解码槽位复用与显示读取"的竞争；
+目前靠"环 8/12 + Flush 独立整帧缓冲"缓解。
