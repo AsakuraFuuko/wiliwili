@@ -890,3 +890,31 @@ player: bsf recv rc=0            ← 位流过滤器转换成功
 **其余可复用的资产**：`player_probe.c`（装配版，含 ffmpeg 解封装 + bsf + 硬解 + AudioOut + 时钟）、
 `videodec2_probe.c`（纯硬解 + NV12 上屏，已验证）、`audio_probe.c`（音频配方）、`regen-cdb.sh`、
 以及 `notes/00..05` 的全部真机数据与踩坑记录。
+
+
+### ★ P2e 打通：自管播放器真机跑通（2026-09-26）
+
+**结论：硬解 + NV12 上屏 + `sceAudioOut` 的完整播放循环已无崩溃运行**，日志证据：
+
+```
+player: ready
+player: refilled pcm_frames=1024 / pushed blocks=1..3 / drew 640
+player: clock_ms=640  blocks=120 pts_ms=2700
+player: clock_ms=1280 blocks=240 pts_ms=5100     ← 音频时钟与视频 PTS 同步推进，进程存活
+```
+
+**根因（花了很久，记下来免得再踩）**：崩在 `memcpy(au_slot, out->data, out->size)`，但**崩因在音频侧** ——
+`g_pcm` 只开了 1 块（`AUDIO_GRAIN*2` 个 int16 = 1024 B），而 `audio_decode_one_frame` 按
+`g_pcm + g_pcm_frames*4` 的偏移、`out_count = AUDIO_GRAIN` 连续转换 4 块 ⇒ 第 2 次起越界写出缓冲。
+符号表给出铁证：`g_pcm @0x5c0fc00`（1024 B）与 `video_submit_packet.slot @0x5c10000` **紧邻**，
+越界的 PCM 采样把 AU 槽索引写成 `0xB3E4A9C`（= 音频采样值）⇒ `au_slot` 成野指针 ⇒ 崩。
+**排查手段**：`crash: addr=0x8000a7f3a ... base=0x961180`（base − 链接基址 0x561180 = 0x400000 ✓）
+⇒ `llvm-nm -n llvm-pie-symbols.elf` 定位到 `wiliwili_player_draw+0x43e`（`video_submit_packet` 被内联）
+⇒ 反汇编看到那是 `call memcpy` 的下一条 ⇒ 打点实参即现原形。**教训：别信"最后一条 UDP 日志=崩点"**（崩溃瞬间丢包）。
+
+**修复**：`g_pcm[AUDIO_GRAIN*2*PCM_TARGET_BLOCKS]`（4 块）+ `swr_convert` 的 out_count 用剩余空间
+（`room = AUDIO_GRAIN*PCM_TARGET_BLOCKS - g_pcm_frames`）+ 补料循环用同一常量。
+
+**遗留（下一步）**：`audio_push_blocks(1)` 让音频时钟被渲染帧率绑住（实测 28 s 只走 1.28 s 音频）。
+正确架构是把音频与渲染解耦（独立线程做 `Output` 阻塞循环，或每帧排空缓冲），视频按音频时钟丢/追赶；
+之后才是接入 `VideoView`（弹幕/OSD 不动）。

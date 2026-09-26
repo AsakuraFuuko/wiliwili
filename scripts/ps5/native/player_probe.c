@@ -52,11 +52,10 @@ int32_t sceVideodec2Flush(void *decoder, void *frame, void *output);
 #define SCE_SYSMODULE_VIDEODEC2 0xCF
 #define CODEC_AVC 1u
 #define RESOURCE_COMPUTE 1u
-/* 环大小按 EVO 的经验值：AU 环必须 ≥4（DecodeInputQueueDepth = 4），帧环要更多
- * （"8 keeps three spare slots beyond the deepest consumer"）。用 3 会在第 4 个 AU
- * 覆盖解码器仍持有的槽 → 真机表现为解到第 4~5 个包就退出。 */
-#define AU_SLOTS 8
-#define FRAME_SLOTS 12
+/* 环大小取已验证探针的值（pipeline_depth=1 时 3 槽足够；探针用 3 连解 30 帧无问题）。
+ * EVO 的 8/12 是针对它自己 DecodeInputQueueDepth=4 的配置，别照抄。 */
+#define AU_SLOTS 3
+#define FRAME_SLOTS 3
 #define AUDIO_GRAIN 256 /* 每块 256 帧（EVO 的可用实现用的就是它） */
 #define AUDIO_FREQ 48000
 
@@ -101,7 +100,12 @@ static AVFrame *g_aframe;
 static int64_t g_last_video_pts_us;
 
 /* 音频：按 256 帧一块喂；块数就是时钟 */
-static int16_t g_pcm[AUDIO_GRAIN * 2];
+/* PCM 缓冲要装下"补料目标"整批（AUDIO_GRAIN * PCM_TARGET_BLOCKS 帧）。
+ * 曾经只开 1 块（AUDIO_GRAIN*2 个 int16）却按 g_pcm_frames 偏移连着转 4 块：
+ * 第 2 次 swr_convert 起就越界，正好写进紧邻的 video_submit_packet.slot，
+ * 表现为 AU 槽索引变成 PCM 采样值(0xB3E4A9C) → memcpy 野指针崩溃。 */
+#define PCM_TARGET_BLOCKS 4
+static int16_t g_pcm[AUDIO_GRAIN * 2 * PCM_TARGET_BLOCKS];
 static int g_pcm_frames;
 static int g_audio_handle = -1;
 static unsigned long long g_audio_blocks;
@@ -163,8 +167,11 @@ static int decoder_init(int width, int height) {
     config.codec_type           = CODEC_AVC;
     config.profile              = 100;
     config.max_level            = 51;
-    config.max_width            = width;
-    config.max_height           = height;
+    /* 宽高必须按 16 对齐再交给解码器：对齐后的 max_frame_size 才是解码器真正要写的尺寸。
+     * 用未对齐的 360 会把帧缓冲算小 → 解码器越界写 → 前几帧看着正常、随后崩溃。
+     * 已验证的探针里写的是 640x368（= 360 对齐到 368）。 */
+    config.max_width            = (width + 15) & ~15;
+    config.max_height           = (height + 15) & ~15;
     config.max_dpb_frames       = 4;
     config.pipeline_depth       = 1;
     config.compute_queue        = (uint64_t)compute_queue;
@@ -191,7 +198,7 @@ static int decoder_init(int width, int height) {
     g_frame_size = align16k(mem.max_frame_size);
     g_au_pool    = alloc_direct(limit, 0x800000u * AU_SLOTS, 0x32);
     g_frame_pool = alloc_direct(limit, g_frame_size * FRAME_SLOTS, 0x32);
-    if (!g_au_pool || !g_frame_pool) return -1;
+        if (!g_au_pool || !g_frame_pool) return -1;
 
     if (sceVideodec2CreateDecoder(&config, &mem, &g_decoder) != 0) return -1;
     plog1("player: decoder reset rc=%d", sceVideodec2Reset(g_decoder));
@@ -218,8 +225,9 @@ static void audio_decode_one_frame(void) {
     if (g_audio_index < 0 || !g_adec) return;
     if (avcodec_receive_frame(g_adec, g_aframe) != 0) return;
 
+    int room               = AUDIO_GRAIN * PCM_TARGET_BLOCKS - g_pcm_frames;
     uint8_t *out[1]        = {(uint8_t *)g_pcm + (size_t)g_pcm_frames * 2 * sizeof(int16_t)};
-    int out_samples        = swr_convert(g_swr, out, AUDIO_GRAIN, (const uint8_t **)g_aframe->data, g_aframe->nb_samples);
+    int out_samples = room > 0 ? swr_convert(g_swr, out, room, (const uint8_t **)g_aframe->data, g_aframe->nb_samples) : 0;
     if (out_samples > 0) g_pcm_frames += out_samples;
     av_frame_unref(g_aframe);
 }
@@ -307,7 +315,7 @@ void wiliwili_player_probe(const char *url) {
 static void video_submit_packet(AVPacket *pkt) {
     static int slot      = 0; /* AU 环 */
     static int fslot     = 0; /* 帧环（与 AU 环独立，避免互相覆盖） */
-    static int au_logged = 0;
+    static uint64_t au_seq = 0;
     if (!g_bsf) return;
     AVPacket *out = av_packet_alloc();
     int send_rc   = av_bsf_send_packet(g_bsf, pkt);
@@ -316,9 +324,7 @@ static void video_submit_packet(AVPacket *pkt) {
         av_packet_free(&out);
         return;
     }
-    plog1("player: bsf sent size=%d", (long)pkt->size);
     int recv_rc = av_bsf_receive_packet(g_bsf, out);
-    plog1("player: bsf recv rc=%d", recv_rc);
     while (recv_rc == 0) {
         if (out->data == NULL || out->size <= 0 || out->size > 0x800000) {
             /* bsf 可能给出空包/异常长度：直接跳过，别把 memcpy 送到野指针上。 */
@@ -329,21 +335,14 @@ static void video_submit_packet(AVPacket *pkt) {
         }
         uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
         memcpy(au_slot, out->data, (size_t)out->size);
-        if (au_logged < 6) {
-            ++au_logged;
-            const uint8_t *h = (const uint8_t *)out->data;
-            plog1("player: au size=%d", (long)out->size);
-            plog2("player: au head=%02x%02x%02x%02x %02x%02x%02x%02x",
-                  (long)h[0], (long)h[1]);
-            /* 后四个字节单独打，避免自定义 plog 参数不够 */
-            plog2("player: au h4=%02x%02x%02x%02x", (long)h[4], (long)h[5]);
-        }
         InputData input;
         memset(&input, 0, sizeof(input));
         input.size    = sizeof(input);
         input.au      = au_slot;
         input.au_size = (uint64_t)out->size;
-        input.pts     = (uint64_t)(out->pts == AV_NOPTS_VALUE ? 0 : out->pts);
+        /* pts 用自增序号：已验证的探针就是 0,1,2…（bsf 给的 mp4 pts 在流时间基下不是这种语义，
+         * 解码器对它的校验/重排假设会不同）。A/V 同步靠音频时钟那边的 g_last_video_pts_us。 */
+        input.pts     = (uint64_t)(au_seq++);
         input.dts     = UINT64_MAX;
         FrameBuffer frame;
         memset(&frame, 0, sizeof(frame));
@@ -353,9 +352,7 @@ static void video_submit_packet(AVPacket *pkt) {
         OutputInfo oi;
         memset(&oi, 0, sizeof(oi));
         oi.size = sizeof(oi);
-        plog1("player: decode au=%d", (long)out->size);
         int rc  = sceVideodec2Decode(g_decoder, &input, &frame, &oi);
-        plog2("player: decode rc=%d valid=%d", rc, oi.valid);
         if (rc == 0 && oi.valid == 0) {
             memset(&oi, 0, sizeof(oi));
             oi.size = sizeof(oi);
@@ -392,22 +389,16 @@ void wiliwili_player_draw(struct NVGcontext *vg) {
     if (draw_calls <= 3) plog1("player: draw enter n=%d", (long)draw_calls);
 
     int guard = 0;
-    static int iter_log = 0;
-    while (g_pcm_frames < AUDIO_GRAIN * 4 && !g_audio_eof && guard++ < 64) {
+    while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && guard++ < 256) {
         int read_rc = av_read_frame(g_fmt, g_pkt);
-        if (iter_log < 200) plog2("player: iter=%d read_rc=%d", (long)guard, read_rc);
-        ++iter_log;
         if (read_rc < 0) {
             g_audio_eof = 1;
             break;
         }
         if (g_pkt->stream_index == g_audio_index && g_adec) {
             avcodec_send_packet(g_adec, g_pkt);
-            if (iter_log < 200) plog1("player: audio pkt size=%d", (long)g_pkt->size);
             audio_decode_one_frame();
-            if (iter_log < 200) plog1("player: audio decoded frames=%d", (long)g_pcm_frames);
         } else if (g_pkt->stream_index == g_video_index) {
-            if (iter_log < 200) plog1("player: video pkt size=%d", (long)g_pkt->size);
             video_submit_packet(g_pkt); /* 不再丢弃 */
         }
         av_packet_unref(g_pkt);
