@@ -299,6 +299,14 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
         wiliwili_boot_log("player: find stream info failed");
         return;
     }
+    extern int wiliwili_video_flip, wiliwili_video_swap, wiliwili_video_709;
+    {
+        /* 默认 180° 旋转（真机实测颠倒）；可用环境变量覆盖以便逐一比对。 */
+        const char *f = getenv("WILIWILI_VIDEO_FLIP");
+        const char *w = getenv("WILIWILI_VIDEO_SWAP");
+        if (f) wiliwili_video_flip = atoi(f);
+        if (w) wiliwili_video_swap = atoi(w);
+    }
     g_video_index = av_find_best_stream(g_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     g_audio_index = av_find_best_stream(g_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
 
@@ -356,6 +364,13 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
             }
         }
         plog2("player: video size w=%d h=%d", vw, vh);
+        wiliwili_video_709 = (vh >= 720) ? 1 : 0; /* HD 用 BT.709，SD 用 BT.601 */
+        {
+            char lb[160];
+            snprintf(lb, sizeof(lb), "player: display flip=%d swap=%d 709=%d", wiliwili_video_flip, wiliwili_video_swap,
+                     wiliwili_video_709);
+            wiliwili_boot_log(lb);
+        }
         if (decoder_init(vw, vh) != 0) {
             wiliwili_boot_log("player: decoder init failed");
             return;

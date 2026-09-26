@@ -151,6 +151,10 @@ static unsigned long long g_y_uploads;
 static double g_upload_ms_total;
 static unsigned long long g_draws;
 static int g_ready;
+/* 上屏修正开关：真机实测 PS5 硬解帧出来后方向与颜色对不上。默认 180 度旋转、HD 走 BT.709。 */
+int wiliwili_video_flip = 3;
+int wiliwili_video_swap = 0;
+int wiliwili_video_709  = 1;
 
 static void log2(const char *fmt, long a, long b) {
     char line[192];
@@ -451,7 +455,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     if (p_tex_sub == NULL || p_draw_arrays == NULL) return;
 
     static unsigned int tex_y, tex_uv, program, vao;
-    static int u_y_loc, u_uv_loc;
+    static int u_y_loc, u_uv_loc, u_flip_loc, u_swap_loc, u_709_loc;
     static int pipeline_ready;
 
     static int last_w = -1;
@@ -488,16 +492,25 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         static const char *fs_src =
             "#version 330 core\n"
             "in vec2 v_uv;\n"
+            "uniform int u_flip;\n"      /* 0=不翻 1=水平 2=垂直 3=180 */
+            "uniform int u_swap;\n"
+            "uniform int u_709;\n"      /* 1=交换 U/V */
             "uniform sampler2D u_y;\n"
             "uniform sampler2D u_uv;\n"
             "out vec4 o_color;\n"
             "void main() {\n"
-            "  float y = texture(u_y, v_uv).r;\n"
-            "  vec2 uv = texture(u_uv, v_uv).rg;\n"
+            "  vec2 t = v_uv;\n"
+            "  if (u_flip == 1 || u_flip == 3) t.x = 1.0 - t.x;\n"
+            "  if (u_flip == 2 || u_flip == 3) t.y = 1.0 - t.y;\n"
+            "  float y = texture(u_y, t).r;\n"
+            "  vec2 uv = texture(u_uv, t).rg;\n"
+            "  if (u_swap == 1) uv = uv.yx;\n"
             "  float Y = (y - 0.0625) * 1.164;\n"
             "  float U = uv.x - 0.5;\n"
             "  float V = uv.y - 0.5;\n"
-            "  vec3 rgb = vec3(Y + 1.596 * V, Y - 0.391 * U - 0.813 * V, Y + 2.018 * U);\n"
+            "  vec3 rgb;\n"
+            "  if (u_709 == 1) rgb = vec3(Y + 1.793 * V, Y - 0.213 * U - 0.533 * V, Y + 2.112 * U);\n"
+            "  else rgb = vec3(Y + 1.596 * V, Y - 0.391 * U - 0.813 * V, Y + 2.018 * U);\n"
             "  o_color = vec4(clamp(rgb, 0.0, 1.0), 1.0);\n"
             "}\n";
 
@@ -534,7 +547,10 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
             return;
         }
         u_y_loc  = p_uniform_location(program, "u_y");
-        u_uv_loc = p_uniform_location(program, "u_uv");
+        u_uv_loc   = p_uniform_location(program, "u_uv");
+        u_flip_loc = p_uniform_location(program, "u_flip");
+        u_swap_loc = p_uniform_location(program, "u_swap");
+        u_709_loc  = p_uniform_location(program, "u_709");
         p_gen_vaos(1, &vao);
         pipeline_ready = 1;
         wiliwili_boot_log("vdec: yuv pipeline ready");
@@ -558,6 +574,9 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     p_active_texture(0x84C1 /*TEXTURE1*/);
     p_bind_texture(0x0DE1, tex_uv);
     p_uniform1i(u_uv_loc, 1);
+    p_uniform1i(u_flip_loc, wiliwili_video_flip);
+    p_uniform1i(u_swap_loc, wiliwili_video_swap);
+    p_uniform1i(u_709_loc, wiliwili_video_709);
     p_bind_vao(vao);
     p_draw_arrays(0x0004 /*GL_TRIANGLES*/, 0, 3);
 
