@@ -16,6 +16,7 @@
 
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h> /* usleep */
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -165,6 +166,9 @@ static int64_t g_last_video_pts_us;
 static int16_t g_pcm[AUDIO_GRAIN * 2 * PCM_TARGET_BLOCKS];
 static int g_pcm_frames;
 static int g_audio_handle = -1;
+/* 欠载时送出的静音块：设备在"没有新块"时会**重放上一块**（真机表现为"声音一直在
+ * 循环一段"）。EVO 的做法是欠载即推一块静音（evo_audio_out.c:163），时钟不推进。 */
+static int16_t g_silence[AUDIO_GRAIN * 2];
 static unsigned long long g_audio_blocks;
 static int g_audio_eof;
 static int g_paused;
@@ -272,31 +276,110 @@ static int decoder_init(int width, int height) {
     return 0;
 }
 
-/* ---- 音频：把缓存的 PCM 按块送出（Output 阻塞 = 时钟） ---- */
-static void audio_push_blocks(int max_blocks) {
-    while (g_pcm_frames >= AUDIO_GRAIN && max_blocks > 0) {
-        int rc = sceAudioOutOutput(g_audio_handle, g_pcm);
-        if (rc < 0) {
-            plog1("player: audio out rc=%d", rc);
-            g_audio_eof = 1;
-            return;
-        }
-        ++g_audio_blocks;
-        g_pcm_frames -= AUDIO_GRAIN;
-        if (g_pcm_frames > 0) memmove(g_pcm, g_pcm + AUDIO_GRAIN * 2, (size_t)g_pcm_frames * 2 * sizeof(int16_t));
-        --max_blocks;
-    }
+/* ── 音频：块环形队列 + 独立推送线程 ──────────────────────────────────────
+ * 结构照 EVO-PLAYER-PS5（evo_audio_out.c）：**解码侧只入队，推送侧专职送块**。
+ * 之前是"worker 一轮里先补料再推 2 块"，于是网络读或视频解码一慢，音频推送
+ * 就被打断，设备在缺块时**重放上一块**——真机听起来就是"声音一直在循环一段"。
+ * 队列空（欠载）时送**静音**且不推进媒体时钟，与 EVO 的处理一致。
+ * ──────────────────────────────────────────────────────────────────────── */
+#define AUDIO_QUEUE_BLOCKS 32
+static int16_t g_aq[AUDIO_QUEUE_BLOCKS][AUDIO_GRAIN * 2];
+static int g_aq_head, g_aq_tail, g_aq_count;
+static pthread_mutex_t g_aq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_aq_cond        = PTHREAD_COND_INITIALIZER;
+static volatile int g_audio_run;
+static pthread_t g_audio_tid;
+
+/* 队列剩余槽位（供补料循环判断反压）。 */
+static int audio_queue_free(void) {
+    int free_slots;
+    pthread_mutex_lock(&g_aq_lock);
+    free_slots = AUDIO_QUEUE_BLOCKS - g_aq_count;
+    pthread_mutex_unlock(&g_aq_lock);
+    return free_slots;
 }
+
+/* 解码侧：把一块 PCM 放进队列（满则阻塞，形成对解码的反压）。 */
+static void audio_enqueue_block(const int16_t *block) {
+    pthread_mutex_lock(&g_aq_lock);
+    while (g_aq_count >= AUDIO_QUEUE_BLOCKS && g_audio_run)
+        pthread_cond_wait(&g_aq_cond, &g_aq_lock);
+    if (g_audio_run) {
+        memcpy(g_aq[g_aq_head], block, sizeof(g_aq[0]));
+        g_aq_head = (g_aq_head + 1) % AUDIO_QUEUE_BLOCKS;
+        ++g_aq_count;
+    }
+    pthread_mutex_unlock(&g_aq_lock);
+}
+
+/* 推送侧：专职线程，每次送一块；队列空就送静音（不计入时钟）。 */
+static void *audio_thread(void *arg) {
+    (void)arg;
+    while (g_audio_run) {
+        int16_t block[AUDIO_GRAIN * 2];
+        int have = 0;
+        pthread_mutex_lock(&g_aq_lock);
+        if (g_aq_count > 0) {
+            memcpy(block, g_aq[g_aq_tail], sizeof(block));
+            g_aq_tail = (g_aq_tail + 1) % AUDIO_QUEUE_BLOCKS;
+            --g_aq_count;
+            have = 1;
+            pthread_cond_broadcast(&g_aq_cond);
+        }
+        pthread_mutex_unlock(&g_aq_lock);
+
+        if (g_audio_handle < 1) {
+            wiliwili_boot_log("player: audio thread exit (no handle)");
+            break;
+        }
+        int rc;
+        if (have) {
+            rc = sceAudioOutOutput(g_audio_handle, block);
+            if (rc < 0) {
+                plog1("player: audio thread exit (out rc=%d)", rc);
+                break;
+            }
+            ++g_audio_blocks;
+        } else {
+            /* 欠载：送静音，避免设备重放上一块；不推进媒体时钟。 */
+            rc = sceAudioOutOutput(g_audio_handle, g_silence);
+            if (rc < 0) {
+                plog1("player: audio thread exit (silence rc=%d)", rc);
+                break;
+            }
+            usleep(500);
+        }
+        if (g_audio_blocks == 1 || g_audio_blocks == 20)
+            plog1("player: audio thread pushed=%d", (long)g_audio_blocks);
+    }
+    return NULL;
+}
+
+static void audio_push_blocks(int max_blocks) { (void)max_blocks; } /* 旧接口保留给非 worker 路径 */
 
 static void audio_decode_one_frame(void) {
     if (g_audio_index < 0 || !g_adec) return;
     if (avcodec_receive_frame(g_adec, g_aframe) != 0) return;
 
-    int room               = AUDIO_GRAIN * PCM_TARGET_BLOCKS - g_pcm_frames;
-    uint8_t *out[1]        = {(uint8_t *)g_pcm + (size_t)g_pcm_frames * 2 * sizeof(int16_t)};
+    /* 解码→重采样进 g_pcm，凑满一块就入队（队列满会阻塞 = 对解码反压）。 */
+    while (g_pcm_frames + g_aframe->nb_samples > AUDIO_GRAIN * PCM_TARGET_BLOCKS) {
+        /* 缓冲放不下这一帧：先把已有的整块送进队列腾地方。 */
+        if (g_pcm_frames < AUDIO_GRAIN) break;
+        audio_enqueue_block(g_pcm);
+        g_pcm_frames -= AUDIO_GRAIN;
+        memmove(g_pcm, g_pcm + AUDIO_GRAIN * 2, (size_t)g_pcm_frames * 2 * sizeof(int16_t));
+    }
+    int room        = AUDIO_GRAIN * PCM_TARGET_BLOCKS - g_pcm_frames;
+    uint8_t *out[1] = {(uint8_t *)g_pcm + (size_t)g_pcm_frames * 2 * sizeof(int16_t)};
     int out_samples = room > 0 ? swr_convert(g_swr, out, room, (const uint8_t **)g_aframe->data, g_aframe->nb_samples) : 0;
     if (out_samples > 0) g_pcm_frames += out_samples;
     av_frame_unref(g_aframe);
+
+    while (g_pcm_frames >= AUDIO_GRAIN) {
+        audio_enqueue_block(g_pcm);
+        g_pcm_frames -= AUDIO_GRAIN;
+        memmove(g_pcm, g_pcm + AUDIO_GRAIN * 2, (size_t)g_pcm_frames * 2 * sizeof(int16_t));
+    }
 }
 
 /* ---- 主循环（由帧循环驱动）：喂音频、按音频时钟解视频、上屏 ---- */
@@ -316,6 +399,13 @@ static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_
  * 但绝不允许它跑在真实时间前面 ⇒ 视频按真实时间均匀解码。 */
 static long long g_pace_start_us;
 static int64_t g_dbg_wall_us, g_dbg_audio_us; /* 诊断：两个时钟各跑到哪了 */
+/* ── 视频节拍时钟 ─────────────────────────────────────────────────────────
+ * **以墙钟为准**，不用音频时钟：`g_audio_blocks` 数的是"已提交给设备的块数"，
+ * 它有两种坏行为——① 设备缓冲一次吃多块时会跳进（视频被放行后连发一串，
+ * 实测发布间隔 444 次 <25ms、38 次 >50ms）；② 音频欠载时我们只送静音、不推进
+ * 该计数，它就会**停住**，若拿它当节拍就会把视频一起卡死（实测 pub=0、画面不出来）。
+ * 音频时钟仅用于上报与"长期漂移校正"：偏差超过 2 秒才把基准拉回音频时钟。
+ * ──────────────────────────────────────────────────────────────────────── */
 static int64_t video_pace_clock_us(void) {
     if (g_pace_start_us == 0) return g_audio_clock_us();
     struct timespec ts;
@@ -324,7 +414,12 @@ static int64_t video_pace_clock_us(void) {
     int64_t audio = g_audio_clock_us();
     g_dbg_wall_us  = wall;
     g_dbg_audio_us = audio;
-    return audio < wall ? audio : wall;
+    /* 长期漂移校正：墙钟与音频时钟差超过 2 秒时，以音频时钟重新对齐基准。 */
+    if (audio > 0 && (wall - audio > 2000000 || audio - wall > 2000000)) {
+        g_pace_start_us += (wall - audio);
+        wall = audio;
+    }
+    return wall;
 }
 
 
@@ -385,7 +480,7 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
      * 同一个 URL 直接忽略；换片则先真正收尾。 */
     if (g_ready && url != NULL && strcmp(g_url, url) == 0) {
         wiliwili_boot_log("player: same url, ignored");
-        return;
+        goto fail;
     }
     if (g_ready) {
         wiliwili_boot_log("player: switching source, closing previous");
@@ -399,7 +494,7 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     plog1("player: audio handle=%d", g_audio_handle);
     if (g_audio_handle < 1) {
         wiliwili_boot_log("player: audio open failed");
-        return;
+        goto fail;
     }
 
     avformat_network_init();
@@ -431,11 +526,11 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     plog1("player: open rc=%d", open_rc);
     if (open_rc < 0) {
         wiliwili_boot_log("player: open input failed");
-        return;
+        goto fail;
     }
     if (avformat_find_stream_info(g_fmt, NULL) < 0) {
         wiliwili_boot_log("player: find stream info failed");
-        return;
+        goto fail;
     }
     /* 报出探测到的流数与时长：`moov` 在文件尾且走 HTTP 顺序读时，ffmpeg 拿不到完整
      * 索引（nb_streams/duration 全 0 或异常），表现是"open rc=0 但一个包都读不出来"。
@@ -507,7 +602,7 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
                 /* 非 H.264（B 站 4K 是 HEVC）：先明确报出来，别装作能播。 */
                 plog1("player: unsupported codec id=%d", (long)vp->codec_id);
                 wiliwili_boot_log("player: only H.264 supported for now");
-                return;
+                goto fail;
             }
         }
         plog2("player: video size w=%d h=%d", vw, vh);
@@ -521,7 +616,7 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
         if (g_decoder == NULL) {
             if (decoder_init(vw, vh) != 0) {
                 wiliwili_boot_log("player: decoder init failed");
-                return;
+                goto fail;
             }
         } else {
             plog1("player: decoder reuse reset rc=%d", sceVideodec2Reset(g_decoder));
@@ -536,14 +631,14 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
         if (g_bsf_par == NULL ||
             avcodec_parameters_copy(g_bsf_par, g_fmt->streams[g_video_index]->codecpar) < 0) {
             wiliwili_boot_log("player: bsf params copy failed");
-            return;
+            goto fail;
         }
         plog1("player: bsf rebuild rc=%d", bsf_rebuild());
         if (g_bsf_par && g_bsf_par->extradata) {
         }
         if (g_bsf == NULL) {
             wiliwili_boot_log("player: bsf unavailable, video path disabled");
-            return;
+            goto fail;
         }
     }
 
@@ -594,6 +689,17 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     g_work_valid = 0;
     g_ready  = 1;
 
+    /* 音频推送线程：独立于解码/网络，保证设备永远按时拿到块（见 audio_thread）。 */
+    g_aq_head = g_aq_tail = g_aq_count = 0;
+    g_pcm_frames = 0;
+    g_audio_run  = 1;
+    if (pthread_create(&g_audio_tid, NULL, audio_thread, NULL) != 0) {
+        g_audio_run = 0;
+        wiliwili_boot_log("player: audio thread create failed");
+    } else {
+        wiliwili_boot_log("player: audio thread started");
+    }
+
     /* DASH（双 URL）时把读取/解码/音频推送搬到独立线程：渲染线程只有 6~8fps，
      * 留在渲染线程里播放速度会被帧率绑死（实测慢约 8 倍）。 */
     if (g_afmt != NULL && getenv("WILIWILI_PLAYER_THREAD") == NULL) {
@@ -606,6 +712,15 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
         }
     }
     wiliwili_boot_log("player: ready");
+
+    return;
+
+fail:
+    /* 失败必须**完整回滚**：否则下一次 open（app 会用 backup URL 重试）会再开一个
+     * 音频设备句柄、再起一个推送线程，两个线程抢同一个设备 ⇒ 声音错乱/听起来在
+     * 循环一段。真机实测第一次 open 失败后确实留下了多余的句柄与线程。 */
+    wiliwili_boot_log("player: open failed, rolling back");
+    wiliwili_ps5player_close();
 }
 
 /* ── Annex-B AU 聚合 ───────────────────────────────────────────────────────
@@ -769,7 +884,11 @@ static int player_audio_fill(int *out_reads, long *out_usec) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (g_afmt) {
         int aguard = 0;
-        while (g_pcm_frames < AUDIO_GRAIN * PCM_TARGET_BLOCKS && !g_audio_eof && aguard++ < 2048) {
+        /* 循环条件用**队列余量**（真正的反压信号），不是 g_pcm_frames：
+         * 解码函数现在每凑满 256 帧就入队、g_pcm_frames 几乎总 <256，
+         * 用旧条件会让这个循环一直读到 aguard 上限（2048 个包 ≈ 20 秒音频），
+         * 表现是 worker 第一轮就卡 20 秒、视频一帧都不出（实测 pub=0）。 */
+        while (!g_audio_eof && aguard++ < 4096 && audio_queue_free() > 0) {
             if (av_read_frame(g_afmt, g_pkt) < 0) {
                 g_audio_eof = 1;
                 break;
@@ -884,16 +1003,12 @@ static void *player_worker(void *arg) {
         if (t2 - t1 > g_max_step_us) g_max_step_us = t2 - t1;
         if (t1 - t0 > g_max_fillwall_us) g_max_fillwall_us = t1 - t0;
         if (!g_worker_run) break;
-        long long t3 = phase_us();
-        /* 每轮只推 2 块音频（≈10.7ms）——**不能推一大批**：`sceAudioOutOutput` 会阻塞到
-         * 该块播完，一轮推 32/64 块就是 170~340ms，而 worker 每轮只解 1 帧视频，
-         * 视频因此被压到 ~6 fps（实测 `pts_ms` 24 秒只前进 5 秒）。
-         * 小步推送让循环以 ~90Hz 转动，音频仍由设备排空天然限速。 */
-        audio_push_blocks(2);
         long long t4 = phase_us();
-        if (t4 - t3 > g_max_push_us) g_max_push_us = t4 - t3;
         if (t4 - t0 > g_max_iter_us) g_max_iter_us = t4 - t0;
         ++g_iters;
+        /* 音频由独立线程推送（见 audio_thread），worker 不再直接推块。
+         * 这里稍作让出，避免与解码争 CPU。 */
+        usleep(200);
     }
     g_worker_started = 0;
     return NULL;
@@ -1009,6 +1124,14 @@ void wiliwili_ps5player_close(void) {
         g_worker_run = 0;
         pthread_join(g_worker_tid, NULL);
         wiliwili_boot_log("player: worker thread joined");
+    }
+    if (g_audio_run) {
+        g_audio_run = 0;
+        pthread_mutex_lock(&g_aq_lock);
+        pthread_cond_broadcast(&g_aq_cond);
+        pthread_mutex_unlock(&g_aq_lock);
+        pthread_join(g_audio_tid, NULL);
+        wiliwili_boot_log("player: audio thread joined");
     }
     if (g_audio_handle >= 1) sceAudioOutClose(g_audio_handle);
     g_audio_handle = -1;
