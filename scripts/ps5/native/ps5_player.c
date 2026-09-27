@@ -29,6 +29,8 @@ struct NVGcontext;
 extern void wiliwili_boot_log(const char *message);
 extern void *SDL_GL_GetProcAddress(const char *proc);
 extern void wiliwili_draw_nv12(struct NVGcontext *vg, const uint8_t *y, const uint8_t *uv, int width, int height);
+/* 告诉上屏层"这一帧的数据是新的"：为 0 时它会跳过纹理上传，只重画上一次的纹理。 */
+extern void wiliwili_nv12_mark_fresh(int fresh);
 
 /* ---- 系统导入 ---- */
 int32_t sceSysmoduleLoadModule(unsigned short id);
@@ -105,6 +107,26 @@ static int g_ready;
 static unsigned g_au_ring;
 static uint64_t g_au_seq;
 static int g_dbg_au;
+static unsigned g_take_ok;   /* take 成功帧数（诊断） */
+static unsigned g_take_calls;/* take 调用次数（诊断） */
+static unsigned g_pub_ok;    /* worker 发布帧数（诊断） */
+/* 发布间隔统计（诊断，仅 trace 下打印）：间隔忽长忽短会让画面抖动，
+ * 即使平均帧率够——这类问题改节流逻辑就能修，不需要动渲染后端。 */
+static long long g_pub_last_us;
+static unsigned g_gap_short, g_gap_ok, g_gap_long;
+static long long g_gap_max_us;
+static int g_gap_ring[8]; /* 最近 8 次发布间隔（ms，诊断用） */
+static int g_gap_ring_n;
+/* worker 各阶段的最大耗时（诊断）：区分"卡在网络读"还是"卡在解码/推送"。 */
+static long g_max_fill_us, g_max_step_us;
+static long long g_max_fillwall_us;
+static long long g_max_push_us, g_max_iter_us;
+static unsigned g_iters;
+static long long phase_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
 /* 帧搬运：工作线程写、渲染线程读。锁保护，只搬运"最新一帧"。
  * 详见文件后部"播放线程"小节对单生产者约束的说明。 */
 static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -114,6 +136,9 @@ static uint8_t g_stage_uv[1920 * 544];  /* NV12 的 UV 面只有 Y 的一半 */
 /* 工作线程私有的解码目标：解码在这里做（不持锁），解完才在锁内拷进 g_stage_*。 */
 static uint8_t g_work_y[1920 * 1088];
 static uint8_t g_work_uv[1920 * 544];
+/* 「解码到暂存、到期再发布」用的暂存帧信息（见 player_video_step_to_stage）。 */
+static int g_work_valid, g_work_w, g_work_h;
+static int64_t g_work_pts;
 static int g_stage_w, g_stage_h;
 
 /* ffmpeg */
@@ -136,7 +161,7 @@ static int64_t g_last_video_pts_us;
 /* 每帧补料目标。**必须 >= 每秒渲染帧数 × 单帧所需块数**：播放页只有 6~8 fps
  * （截图 FPS:6），4 块时每秒只能推进 24 块 ≈ 128ms 音频 ⇒ 画面像冻住（真机实测
  * clock_ms 100 秒才走 2.5 秒）。32 块 ≈ 170ms，8fps 下就够实时。 */
-#define PCM_TARGET_BLOCKS 32
+#define PCM_TARGET_BLOCKS 8
 static int16_t g_pcm[AUDIO_GRAIN * 2 * PCM_TARGET_BLOCKS];
 static int g_pcm_frames;
 static int g_audio_handle = -1;
@@ -276,6 +301,31 @@ static void audio_decode_one_frame(void) {
 
 /* ---- 主循环（由帧循环驱动）：喂音频、按音频时钟解视频、上屏 ---- */
 static int64_t g_audio_clock_us(void) { return (int64_t)(g_audio_blocks * AUDIO_GRAIN * 1000000ULL / AUDIO_FREQ); }
+
+/* 视频允许的**超前余量**：0 = 严格跟着节拍时钟走。
+ * 曾经用 300ms/120ms，结果是解码器一口气连发 3~4 帧（33ms/帧）而渲染侧"取最新帧"
+ * 把它们一次吞掉，随后静等 ⇒ 实测 444 次发布间隔 <25ms、39 次 >50ms（最长 521ms），
+ * 30fps 内容本该均匀 33ms。余量必须小于一帧时长，画面才连惯。 */
+#define VIDEO_LEAD_US 0
+
+/* ── 视频节拍时钟 ─────────────────────────────────────────────────────────
+ * `g_audio_clock_us()` 数的是**已提交**给设备的块数，而设备缓冲会一次吃掉多块
+ * ⇒ 该计数器会"跳进"（实测视频帧因此突发到达：444 次间隔 <25ms、39 次 >50ms、
+ * 最长 521ms，而 30fps 内容本该均匀 33ms），画面看起来一顿一顿。
+ * 这里取 `min(音频时钟, 墙钟)`：音频时钟仍是主时钟（保证 A/V 对齐），
+ * 但绝不允许它跑在真实时间前面 ⇒ 视频按真实时间均匀解码。 */
+static long long g_pace_start_us;
+static int64_t g_dbg_wall_us, g_dbg_audio_us; /* 诊断：两个时钟各跑到哪了 */
+static int64_t video_pace_clock_us(void) {
+    if (g_pace_start_us == 0) return g_audio_clock_us();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t wall = ((long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL) - g_pace_start_us;
+    int64_t audio = g_audio_clock_us();
+    g_dbg_wall_us  = wall;
+    g_dbg_audio_us = audio;
+    return audio < wall ? audio : wall;
+}
 
 
 void wiliwili_ps5player_close(void); /* 定义在下面：换片时先收尾 */
@@ -534,7 +584,14 @@ void wiliwili_ps5player_open(const char *url, const char *audio_url) {
     g_au_seq     = 0;
     g_dbg_au     = 0;
     g_au_ring    = 0;
+    {
+        /* 视频节拍基准 = 本次 open 的墙钟时刻（见 video_pace_clock_us）。 */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        g_pace_start_us = (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+    }
     g_frame_new  = 0;
+    g_work_valid = 0;
     g_ready  = 1;
 
     /* DASH（双 URL）时把读取/解码/音频推送搬到独立线程：渲染线程只有 6~8fps，
@@ -737,24 +794,59 @@ static int player_audio_fill(int *out_reads, long *out_usec) {
  * 所以这里循环到 decode_au 产出帧为止。 */
 static void player_video_step_to_stage(void) {
     if (g_video_index < 0 || g_video_eof) return;
-    if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
+
+    /* ── 发布与解码解耦 ────────────────────────────────────────────────────
+     * 硬解按 AU 出帧的节奏是**成串**的：喂若干 AU 才吐一帧、有时连着吐两帧。
+     * 曾经"解出即发布"，渲染侧又是"取最新帧"⇒ 一串帧被一次吞掉、随后静等，
+     * 实测发布间隔 444 次 <25ms、38 次 >50ms（30fps 内容本该均匀 33ms），
+     * 画面一顿一顿。这里改成：解出的帧先留在暂存，**等它的 pts 到期再发布**，
+     * 发布节奏由时间决定而不是由硬解节奏决定（mpv/EVO 都是这个结构）。
+     * ------------------------------------------------------------------ */
+    int64_t pace = video_pace_clock_us();
+
+    if (g_work_valid) {
+        if (g_work_pts > pace + VIDEO_LEAD_US) return; /* 未到期：本轮不解码，保住顺序 */
+        pthread_mutex_lock(&g_frame_lock);
+        size_t ysz  = (size_t)g_work_w * (size_t)g_work_h;
+        size_t uvsz = ysz / 2;
+        memcpy(g_stage_y, g_work_y, ysz);
+        memcpy(g_stage_uv, g_work_uv, uvsz);
+        g_stage_w   = g_work_w;
+        g_stage_h   = g_work_h;
+        g_frame_new = 1;
+        pthread_mutex_unlock(&g_frame_lock);
+        g_work_valid = 0;
+        ++g_pub_ok;
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            long long now = (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+            if (g_pub_last_us > 0) {
+                long long d = now - g_pub_last_us;
+                if (d < 25000) ++g_gap_short;
+                else if (d <= 50000) ++g_gap_ok;
+                else ++g_gap_long;
+                if (d > g_gap_max_us) g_gap_max_us = d;
+                g_gap_ring[g_gap_ring_n++ & 7] = (int)(d / 1000);
+            }
+            g_pub_last_us = now;
+        }
+        return;
+    }
+
+    /* 暂存为空：解码一帧进去（不发布，等下一轮到期）。 */
     int guard = 0;
     while (guard++ < 256) {
         if (av_read_frame(g_fmt, g_pkt) < 0) {
-            /* 流末尾攒着的那个 AU 必须送出去，否则最后一帧永远不解（同样不持锁解码）。 */
+            /* 流末尾攒着的那个 AU 必须送出去，否则最后一帧永远不解。 */
             int w = 0, h = 0;
             g_video_eof = 1;
             video_submit_flush(g_work_y, g_work_uv, &w, &h);
             if (w > 0 && h > 0) {
-                size_t ysz  = (size_t)w * (size_t)h;
-                size_t uvsz = ysz / 2;
-                pthread_mutex_lock(&g_frame_lock);
-                memcpy(g_stage_y, g_work_y, ysz);
-                memcpy(g_stage_uv, g_work_uv, uvsz);
-                g_stage_w   = w;
-                g_stage_h   = h;
-                g_frame_new = 1;
-                pthread_mutex_unlock(&g_frame_lock);
+                g_work_w = w;
+                g_work_h = h;
+                g_work_pts = pace; /* 末帧立即到期 */
+                g_work_valid = 1;
             }
             return;
         }
@@ -762,24 +854,18 @@ static void player_video_step_to_stage(void) {
             av_packet_unref(g_pkt);
             continue;
         }
-        /* 解码**不持锁**：临界区只做"发布"这一次拷贝。曾经把整段解码（+两个整帧
-         * memcpy）放在锁内，而渲染侧用 trylock ⇒ 渲染线程每帧都可能撞上持锁窗口，
-         * 彻底取不到帧（真机表现为 audec 正常、画面一直是首帧）。 */
+        /* 解码**不持锁**：临界区只做发布那一次拷贝。 */
         int w = 0, h = 0;
+        int64_t before = g_last_video_pts_us;
         video_submit_packet(g_pkt, g_work_y, g_work_uv, &w, &h);
         av_packet_unref(g_pkt);
         if (w > 0 && h > 0) {
-            size_t ysz  = (size_t)w * (size_t)h;
-            size_t uvsz = ysz / 2;
-            pthread_mutex_lock(&g_frame_lock);
-            memcpy(g_stage_y, g_work_y, ysz);
-            memcpy(g_stage_uv, g_work_uv, uvsz);
-            g_stage_w   = w;
-            g_stage_h   = h;
-            g_frame_new = 1;
-            pthread_mutex_unlock(&g_frame_lock);
-            return; /* 产出一帧，交回工作循环去推音频 */
+            g_work_w     = w;
+            g_work_h     = h;
+            g_work_pts   = (g_last_video_pts_us != before) ? g_last_video_pts_us : pace;
+            g_work_valid = 1;
         }
+        return;
     }
 }
 
@@ -788,17 +874,26 @@ static void *player_worker(void *arg) {
     g_worker_started = 1;
     while (g_worker_run) {
         int reads = 0;
-        long usec = 0;
-        player_audio_fill(&reads, &usec); /* 输出参数此处不用：只关心副作用 */
-        (void)reads;
-        (void)usec;
+        long fill_usec = 0;
+        long long t0 = phase_us();
+        player_audio_fill(&reads, &fill_usec); /* fill_usec = 网络读取耗时 */
+        long long t1 = phase_us();
         player_video_step_to_stage();
+        long long t2 = phase_us();
+        if (fill_usec > g_max_fill_us) g_max_fill_us = fill_usec;
+        if (t2 - t1 > g_max_step_us) g_max_step_us = t2 - t1;
+        if (t1 - t0 > g_max_fillwall_us) g_max_fillwall_us = t1 - t0;
         if (!g_worker_run) break;
+        long long t3 = phase_us();
         /* 每轮只推 2 块音频（≈10.7ms）——**不能推一大批**：`sceAudioOutOutput` 会阻塞到
          * 该块播完，一轮推 32/64 块就是 170~340ms，而 worker 每轮只解 1 帧视频，
          * 视频因此被压到 ~6 fps（实测 `pts_ms` 24 秒只前进 5 秒）。
          * 小步推送让循环以 ~90Hz 转动，音频仍由设备排空天然限速。 */
         audio_push_blocks(2);
+        long long t4 = phase_us();
+        if (t4 - t3 > g_max_push_us) g_max_push_us = t4 - t3;
+        if (t4 - t0 > g_max_iter_us) g_max_iter_us = t4 - t0;
+        ++g_iters;
     }
     g_worker_started = 0;
     return NULL;
@@ -823,6 +918,8 @@ static int player_take_frame(void) {
         }
     }
     pthread_mutex_unlock(&g_frame_lock);
+    ++g_take_calls;
+    if (got) ++g_take_ok;
     return got;
 }
 
@@ -833,7 +930,7 @@ static void video_step(void) {
     if (g_video_index < 0 || g_video_eof) return;
     /* 音频源断流时**不要跟着卡死**：B 站会下发 mcdn 这类 P2P CDN，实测"能开、放几秒、然后断"
      * （真机表现为每次固定停在 clock_ms=2560）。此时改为每帧送一包的自走节奏。 */
-    if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > g_audio_clock_us() + 300000) return;
+    if (!g_audio_eof && g_last_video_pts_us > 0 && g_last_video_pts_us > video_pace_clock_us() + VIDEO_LEAD_US) return;
     int guard = 0;
     while (guard++ < 256) {
         if (av_read_frame(g_fmt, g_pkt) < 0) {
@@ -942,7 +1039,9 @@ void wiliwili_ps5player_close(void) {
     g_au_seq     = 0;
     g_dbg_au     = 0;
     g_au_ring    = 0;
+    g_pace_start_us = 0;
     g_frame_new  = 0;
+    g_work_valid = 0;
     g_stage_w    = 0;
     g_stage_h    = 0;
     g_video_index = -1;
@@ -1036,18 +1135,23 @@ void wiliwili_ps5player_draw(struct NVGcontext *vg) {
      * 走的是前面的 g_afmt 分支，于是渲染线程与 worker 同时读同一条流、抢同一个
      * g_pkt，播放全程都在互相破坏（杂音、节奏乱、addr=0x86caed 崩溃）。 */
     if (g_worker_run) {
-        player_take_frame();
+        int took = player_take_frame();
+        wiliwili_nv12_mark_fresh(took);
         if (g_y_width > 0) wiliwili_draw_nv12(vg, g_y_plane, g_uv_plane, g_y_width, g_y_height);
         if (have_rect) pl_viewport(old_vp[0], old_vp[1], old_vp[2], old_vp[3]);
         static int report_w = 0;
-        if (++report_w >= 30) {
+        extern int wiliwili_trace_enabled(void);
+        if (++report_w >= 30 && wiliwili_trace_enabled()) {
             report_w = 0;
             /* 全部状态放在**同一行**：UDP 日志连续两行会丢后一行（实测），
              * 分两行打印会得到"clock 到了、REND 没到"的假象。 */
+            /* trace 下的健康检查：lead = 视频相对音频时钟的偏移（应接近 0）；
+             * gaps = 最近 4 次发布的间隔（30fps 内容应稳定在 ~33ms 量级，
+             * 出现 10ms 成串或几百 ms 空档即为节奏问题）。 */
             char lb[220];
-            snprintf(lb, sizeof(lb), "player: clock_ms=%d blocks=%d pts_ms=%d y=%dx%d new=%d stage=%d",
-                     (int)(g_audio_clock_us() / 1000), (int)g_audio_blocks, (int)(g_last_video_pts_us / 1000),
-                     g_y_width, g_y_height, g_frame_new, g_stage_w);
+            snprintf(lb, sizeof(lb), "player: clock=%d lead=%dms pub=%u gaps=%d,%d,%d,%d", (int)(g_dbg_audio_us / 1000),
+                     (int)((g_last_video_pts_us - g_dbg_audio_us) / 1000), g_pub_ok, g_gap_ring[0], g_gap_ring[1],
+                     g_gap_ring[2], g_gap_ring[3]);
             wiliwili_boot_log(lb);
         }
         return;

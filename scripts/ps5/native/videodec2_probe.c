@@ -148,6 +148,41 @@ static const uint8_t *g_y_plane_ptr  = g_y_storage;
 static const uint8_t *g_uv_plane_ptr = g_uv_storage;
 static int g_y_width, g_y_height, g_y_pitch;
 static unsigned long long g_y_uploads;
+/* 每帧是否真的来了新数据（由播放器在取到新帧时置位）。为 0 时跳过纹理上传，
+ * 只重画上一次的纹理——重传同样的数据在 AGC 上要 4+ ms/帧，纯属浪费。 */
+static int g_nv12_fresh = 1;
+void wiliwili_nv12_mark_fresh(int fresh) { g_nv12_fresh = fresh; }
+
+/* ── 帧耗时分段统计（原生线调优） ─────────────────────────────────────────
+ * 由 borealis 帧循环在三个位置调用：GL 提交开始 / 视频上屏结束 / swap 结束。
+ * 每 30 帧汇总一行：submit 与 swap 各占多少毫秒——用来判断"卡"到底卡在
+ * 提交（UI+视频绘制）还是卡在呈现（swap）。
+ * ──────────────────────────────────────────────────────────────────────── */
+static long long g_phase_submit_us, g_phase_swap_us;
+static int g_phase_frames;
+static long long phase_now_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000LL + t.tv_nsec / 1000LL;
+}
+void wiliwili_frame_phase_begin(void) { g_phase_submit_us = phase_now_us(); }
+void wiliwili_frame_phase_submit(void) {
+    long long now = phase_now_us();
+    g_phase_submit_us = now - g_phase_submit_us;
+    g_phase_swap_us   = now;
+}
+void wiliwili_frame_phase_swap(void) {
+    long long now = phase_now_us();
+    g_phase_swap_us = now - g_phase_swap_us;
+    extern int wiliwili_trace_enabled(void);
+    if (++g_phase_frames >= 30 && wiliwili_trace_enabled()) {
+        char lb[160];
+        snprintf(lb, sizeof(lb), "frame: submit=%lldms swap=%lldms",
+                 g_phase_submit_us / 1000, g_phase_swap_us / 1000);
+        wiliwili_boot_log(lb);
+        g_phase_frames = 0;
+    }
+}
 static double g_upload_ms_total;
 static unsigned long long g_draws;
 static int g_ready;
@@ -403,6 +438,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     typedef void (*PFN_GenVertexArrays)(int, unsigned int *);
     typedef void (*PFN_BindVertexArray)(unsigned int);
     typedef void (*PFN_DrawArrays)(GLenum_t, int, int);
+    typedef GLenum_t (*PFN_GetError)(void);
 
     static PFN_TexImage2D p_tex_image;
     static PFN_TexSubImage2D p_tex_sub;
@@ -426,6 +462,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     static PFN_GenVertexArrays p_gen_vaos;
     static PFN_BindVertexArray p_bind_vao;
     static PFN_DrawArrays p_draw_arrays;
+    static PFN_GetError p_get_error;
 
     if (p_tex_image == NULL) {
         void *(*get)(const char *) = SDL_GL_GetProcAddress;
@@ -451,6 +488,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         p_gen_vaos       = (PFN_GenVertexArrays)get("glGenVertexArrays");
         p_bind_vao       = (PFN_BindVertexArray)get("glBindVertexArray");
         p_draw_arrays    = (PFN_DrawArrays)get("glDrawArrays");
+        p_get_error      = (PFN_GetError)get("glGetError");
     }
     if (p_tex_sub == NULL || p_draw_arrays == NULL) return;
 
@@ -556,15 +594,20 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         wiliwili_boot_log("vdec: yuv pipeline ready");
     }
 
-    /* 每帧更新两个平面 */
+    /* 每帧更新两个平面。只有**真的来了新数据**才重传：在 AGC 上两次 glTexImage2D
+     * 要 4+ ms，而渲染线程每帧都调用这里，重传未变的数据纯属浪费。
+     * 另外**必须**用 glTexImage2D，不能用 glTexSubImage2D：实测该 GL 实现的
+     * glTexSubImage2D 对任何 (format,type) 组合都返回 GL_INVALID_ENUM(0x500)，
+     * 包括 RGBA/U8 ⇒ 纹理只被首帧填充过一次，之后每次上传都被拒、画面停在第一帧。 */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    p_bind_texture(0x0DE1, tex_y);
-    p_tex_sub(0x0DE1, 0, 0, g_y_width, g_y_height, 0x1903, 0x1401, g_y_plane_ptr);
-    p_bind_texture(0x0DE1, tex_uv);
-    p_tex_sub(0x0DE1, 0, 0, g_y_width / 2, g_y_height / 2, 0x8227, 0x1401, g_uv_plane_ptr);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    g_upload_ms_total += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (g_nv12_fresh) {
+        p_bind_texture(0x0DE1, tex_y);
+        p_tex_image(0x0DE1, 0, 0x8229 /*R8*/, g_y_width, g_y_height, 0, 0x1903 /*RED*/, 0x1401, g_y_plane_ptr);
+        p_bind_texture(0x0DE1, tex_uv);
+        p_tex_image(0x0DE1, 0, 0x822B /*RG8*/, g_y_width / 2, g_y_height / 2, 0, 0x8227 /*RG*/, 0x1401,
+                    g_uv_plane_ptr);
+    }
     ++g_y_uploads;
 
     p_use_program(program);
@@ -578,15 +621,23 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     p_uniform1i(u_swap_loc, wiliwili_video_swap);
     p_uniform1i(u_709_loc, wiliwili_video_709);
     p_bind_vao(vao);
+    static unsigned gl_err_seen, gl_err_last;
+    if (p_get_error) {
+        GLenum_t e = 0;
+        while ((e = p_get_error()) != 0) { ++gl_err_seen; gl_err_last = (unsigned)e; }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_upload_ms_total += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     p_draw_arrays(0x0004 /*GL_TRIANGLES*/, 0, 3);
 
     ++g_draws;
     static int report_at = 0;
-    if (++report_at >= 180) {
+    extern int wiliwili_trace_enabled(void);
+    if (++report_at >= 60 && wiliwili_trace_enabled()) {
         report_at = 0;
         char line[200];
-        snprintf(line, sizeof(line), "vdec: fps~%d upload_avg_x100=%d", (int)g_draws / 3,
-                 (int)(g_y_uploads ? g_upload_ms_total / (double)g_y_uploads * 100.0 : 0));
+        snprintf(line, sizeof(line), "vdec: fps~%d upload_avg_x100=%d glerr=%u last=0x%x uploads=%u", (int)g_draws / 3,
+                 (int)(g_upload_ms_total / (double)g_y_uploads * 100.0), gl_err_seen, gl_err_last, (unsigned)g_y_uploads);
         wiliwili_boot_log(line);
         g_draws = 0;
     }
