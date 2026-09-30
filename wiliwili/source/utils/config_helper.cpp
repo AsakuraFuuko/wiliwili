@@ -198,12 +198,18 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     /// bool
     {SettingItem::APP_SWAP_ABXY, {"app_swap_abxy", {}, {}, 0}},
     {SettingItem::GAMEPAD_VIBRATION, {"gamepad_vibration", {}, {}, 1}},
-#if defined(IOS) || defined(__PSV__) || defined(PS5)
+#if defined(IOS) || defined(__PSV__)
     {SettingItem::HIDE_BOTTOM_BAR, {"hide_bottom_bar", {}, {}, 1}},
 #else
+    // First launch keeps the bottom bar visible, including PS5 native titles.
     {SettingItem::HIDE_BOTTOM_BAR, {"hide_bottom_bar", {}, {}, 0}},
 #endif
+#if defined(PS5)
+    // First launch shows the FPS counter so the renderer is observable.
+    {SettingItem::HIDE_FPS, {"hide_fps", {}, {}, 0}},
+#else
     {SettingItem::HIDE_FPS, {"hide_fps", {}, {}, 1}},
+#endif
 #if defined(__APPLE__) || !defined(NDEBUG)
     // mac使用原生全屏按钮效果更好，不通过软件来控制
     // win32 debug 模式不全屏，调试时会挡住 vs
