@@ -1067,3 +1067,10 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 - **F6**：脚本默认值——`build-native.sh` / `install-ffpkg.sh` / `deploy-native.sh` / `launch-native.sh` 的标题号默认值已改为 `PPSA99233`（环境变量/参数仍可覆盖）。
 
 > 区分：以上"已观察"项均有原始日志行或源码 file:line 支撑；`frame:` 根因已由代码与日志数值确认；`to_bytes` 的具体触发输入仍是推测，待 F2 真机复测确认。
+
+**验证结果（2026-10-03 21:52:22 构建，PPSA99233，已 ffpkg 安装运行 PID 210）**：
+
+- 默认运行：`img-multi: lanes=4 max-inflight=4 async-dns=1`；12 张图片请求全部 `code=200`（10–162 ms，queue ≤180 ms）；`img-net: failed=0`、`img-stall=0`、`terminate:0`、`crash:0`；`frame:` 行 **0**（门控生效）；`agc health` 至 `frame=15600`，`dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`，`direct_mem=7,794,432/134,217,728`。
+- trace 运行（`WILIWILI_TRACE=1` 打包）：`frame: clear=0ms ui=0ms submit=0ms video=0ms swap=15ms calls=0/30` —— 钩子生效，clear/ui 不再是垃圾值；验证后已恢复干净包部署。
+- 未覆盖：F1 的直播/动态长浏览场景（无自动入口）、F2 的搜索页触发路径（无手柄输入通道）；trace 模式 `fps:` 行的相位字段仍是旧记录（只有 slot 1 被置位），不可信，默认运行不受影响。
+- 提交：borealis `39f2da9d`、应用层+notes `f3c7f21`（未 push）。
