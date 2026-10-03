@@ -1108,3 +1108,12 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 **结论/未解**：慢的是"curl 传输在标题运行时里"这一路径，而裸握手不慢；原因仍未定位（线程亲和、sandbox 网络栈在 curl 路径上的某些调用、或 curl 内部 poll 行为都还是候选）。实验用的"阻塞 runner"与 curl 变体探针已回滚，正式线保持已提交的 multi runner；只保留一次性探针：`WILIWILI_CRYPTO_PROBE=1`（options 文件）→ `crypto:` / `tls:` 行（`native_shims.c`）。
 
 **下一步建议**：① 给 `img-net` / `http: slow` 日志加 URL/host 维度，确认是否与特定主机相关；② 在 payload 环境用同一探针做 A/B（需一次 payload 构建）验证"payload 不慢"这一前提。
+
+**追加探针（2026-10-04 07:1x–07:25，全部 `WILIWILI_CRYPTO_PROBE=1` 一次性触发）**：
+
+- 并发裸握手（4 线程同主机）：`handshake=35/54/56/57 ms`（单条 6–9 ms）⇒ **并发新建连接不是瓶颈**。
+- 裸握手 + SNI + ALPN(`h2,http/1.1`) + `TCP_NODELAY`（对齐 curl 的 ClientHello）：`handshake=9 ms`。
+- `select` 等待可读 vs 阻塞 `read`（同一条 :80 连接）：`28 ms vs 6 ms` ⇒ select 唤醒正常。
+- 结论：标题内**所有裸层路径都正常**（6–57 ms），唯一能复现 1.4–2.8 s 的只有 "curl 传输" 本身（multi 与 blocking-easy 两种驱动都一样）。
+
+**新增日志维度（本批代码）**：`img-net: total=...`、`img-net: failed ...`、`http: slow ...` 现在都带 `host=` 与 `up=`（进程内 uptime ms），便于与 UDP 时间戳对齐。首份样本（2026-10-04 07:14，直播页加载）：4 条**同时**新建连接（`up≈43.1s`）到 `i0.hdslb.com`，各自 `tls=1722/1734/1736/1736 ms`、全 200；而同一次启动的首屏（`up=0–368 ms`）i0/i1/i2 请求只有 7–348 ms ⇒ 慢事件与"某次页面加载时刻的批量新连接"相关。

@@ -26,7 +26,7 @@
 #include <unordered_map>
 
 #if defined(PS5_NATIVE_APP)
-extern "C" void wiliwili_boot_log(const char *message);
+extern "C" void wiliwili_boot_log(const char* message);
 #define WILI_HTTP_TRACE(message) wiliwili_boot_log(message)
 #else
 #define WILI_HTTP_TRACE(message) (void)0
@@ -60,30 +60,24 @@ public:
         curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, unlock_callback);
         curl_share_setopt(share, CURLSHOPT_USERDATA, lock_array);
     }
-    ~CurlSharedObject() {
-        curl_share_cleanup(share);
-    }
+    ~CurlSharedObject() { curl_share_cleanup(share); }
 
-    static void lock_callback(CURL *handle, curl_lock_data data, curl_lock_access access, void *userptr) {
-        auto *lock_array = (std::recursive_mutex *)userptr;
+    static void lock_callback(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr) {
+        auto* lock_array = (std::recursive_mutex*)userptr;
         lock_array[data].lock();
     }
 
-    static void unlock_callback(CURL *handle, curl_lock_data data, void *userptr) {
-        auto *lock_array = (std::recursive_mutex *)userptr;
+    static void unlock_callback(CURL* handle, curl_lock_data data, void* userptr) {
+        auto* lock_array = (std::recursive_mutex*)userptr;
         lock_array[data].unlock();
     }
 
-    CURLSH* getShare() {
-        return share;
-    }
+    CURLSH* getShare() { return share; }
 
 private:
     CURLSH* share;
     std::recursive_mutex lock_array[CURL_LOCK_DATA_LAST];
 };
-
-
 
 class HTTP {
 public:
@@ -93,9 +87,9 @@ public:
         {"Referer", "https://www.bilibili.com/client"},
         {"Origin", "https://www.bilibili.com"},
     };
-    static inline int TIMEOUT = 10000;
+    static inline int TIMEOUT            = 10000;
     static inline int CONNECTION_TIMEOUT = 0;
-    static inline int DNS_CACHE_TIMEOUT = 60;
+    static inline int DNS_CACHE_TIMEOUT  = 60;
     static inline cpr::Proxies PROXIES;
     static inline cpr::VerifySsl VERIFY;
     static inline std::string PROTOCOL = "https:";
@@ -113,7 +107,7 @@ public:
 
     static std::shared_ptr<cpr::Session> createSession() {
         auto session = std::make_shared<cpr::Session>();
-        CURL* curl = session->GetCurlHolder()->handle;
+        CURL* curl   = session->GetCurlHolder()->handle;
         curl_easy_setopt(curl, CURLOPT_SHARE, HTTP::CURL_SHARE.getShare());
         curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, HTTP::DNS_CACHE_TIMEOUT);
 #ifdef PS5
@@ -128,10 +122,11 @@ public:
     }
 
     static void _cpr_post(const std::string& url, const cpr::Parameters& parameters = {},
-                           const cpr::Payload& payload                               = {},
-                           const std::function<void(const cpr::Response&)>& callback = nullptr,
-                           const ErrorCallback& error                                = nullptr) {
-        auto session = createSession();;
+                          const cpr::Payload& payload                               = {},
+                          const std::function<void(const cpr::Response&)>& callback = nullptr,
+                          const ErrorCallback& error                                = nullptr) {
+        auto session = createSession();
+        ;
         session->SetUrl(cpr::Url{parseLink(url)});
         session->SetParameters(parameters);
         session->SetPayload(payload);
@@ -149,7 +144,6 @@ public:
         }
     }
 
-
     /**
      * Run one request on a dedicated thread using curl's easy interface.
      *
@@ -163,8 +157,8 @@ public:
         try {
             std::thread([session, callback]() {
                 WILI_HTTP_TRACE("http: request start");
-                const auto start_at = std::chrono::steady_clock::now();
-                CURL* handle = session->GetCurlHolder()->handle;
+                const auto start_at    = std::chrono::steady_clock::now();
+                CURL* handle           = session->GetCurlHolder()->handle;
                 cpr::Response response = session->Get();
                 WILI_HTTP_TRACE("http: request done");
                 /* 慢请求检查点：真机上出现过"请求发出但迟迟不回来"（加载卡住）。
@@ -179,11 +173,30 @@ public:
                     curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &conn_t);
                     curl_easy_getinfo(handle, CURLINFO_APPCONNECT_TIME, &tls_t);
                     curl_easy_getinfo(handle, CURLINFO_STARTTRANSFER_TIME, &first_t);
-                    char line[256];
+                    char* effectiveUrl = nullptr;
+                    curl_easy_getinfo(handle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
+                    char host[96] = "?";
+                    if (effectiveUrl != nullptr) {
+                        const char* begin = std::strstr(effectiveUrl, "://");
+                        begin             = begin == nullptr ? effectiveUrl : begin + 3;
+                        const char* stop  = begin;
+                        while (*stop != '\0' && *stop != '/' && *stop != ':') ++stop;
+                        const size_t hostLen = (size_t)(stop - begin);
+                        if (hostLen > 0 && hostLen < sizeof(host)) {
+                            std::memcpy(host, begin, hostLen);
+                            host[hostLen] = '\0';
+                        }
+                    }
+                    static const auto httpStart = std::chrono::steady_clock::now();
+                    const auto upMs             = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - httpStart)
+                                          .count();
+                    char line[320];
                     std::snprintf(line, sizeof(line),
-                                  "http: slow %lldms dns=%.0f tcp=%.0f tls=%.0f first=%.0f code=%ld err=%d",
+                                  "http: slow %lldms dns=%.0f tcp=%.0f tls=%.0f first=%.0f code=%ld err=%d host=%s "
+                                  "up=%lldms",
                                   elapsed_ms, dns_t * 1000, conn_t * 1000, tls_t * 1000, first_t * 1000,
-                                  (long)response.status_code, (int)response.error.code);
+                                  (long)response.status_code, (int)response.error.code, host, upMs);
                     WILI_HTTP_TRACE(line);
                 }
                 callback(response);
@@ -213,9 +226,10 @@ public:
     }
 
     static void _cpr_get(const std::string& url, const cpr::Parameters& parameters = {},
-                          const std::function<void(const cpr::Response&)>& callback = nullptr,
-                          const ErrorCallback& error                                = nullptr) {
-        auto session = createSession();;
+                         const std::function<void(const cpr::Response&)>& callback = nullptr,
+                         const ErrorCallback& error                                = nullptr) {
+        auto session = createSession();
+        ;
         session->SetUrl(cpr::Url{parseLink(url)});
         session->SetParameters(parameters);
 
@@ -224,12 +238,12 @@ public:
 
     template <typename ReturnType>
     static int parseJson(const cpr::Response& r, const std::function<void(ReturnType)>& callback = nullptr,
-                          const ErrorCallback& error = nullptr) {
+                         const ErrorCallback& error = nullptr) {
         try {
             WILI_HTTP_TRACE("http: parsing json");
             nlohmann::json res = nlohmann::json::parse(r.text);
             WILI_HTTP_TRACE("http: json parsed");
-            int code           = res.at("code").get<int>();
+            int code = res.at("code").get<int>();
             if (code == 0) {
                 if (res.contains("data") && (res.at("data").is_object() || res.at("data").is_array())) {
                     HTTP_CALLBACK(res.at("data").get<ReturnType>());
@@ -257,51 +271,39 @@ public:
     static void signParameters(cpr::Parameters& parameters);
 
     template <typename ReturnType>
-    static void getResultAsync(const std::string& url,
-                               cpr::Parameters parameters                      = {},
+    static void getResultAsync(const std::string& url, cpr::Parameters parameters = {},
                                const std::function<void(ReturnType)>& callback = nullptr,
-                               const ErrorCallback& error                      = nullptr,
-                               bool needSign                                   = false) {
+                               const ErrorCallback& error = nullptr, bool needSign = false) {
         if (needSign) {
             signParameters(parameters);
         }
         _cpr_get(
-            url,
-            parameters,
-            [callback, error](const cpr::Response& r) {
-                parseJson<ReturnType>(r, callback, error);
+            url, parameters, [callback, error](const cpr::Response& r) { parseJson<ReturnType>(r, callback, error); },
+            error);
+    }
+
+    template <typename ReturnType>
+    static void getResultWithWbiAsync(const std::string& url, cpr::Parameters parameters = {},
+                                      const std::function<void(ReturnType)>& callback = nullptr,
+                                      const ErrorCallback& error = nullptr, bool needSign = false) {
+        wbi::updateWbiKeys(
+            [url, parameters, callback, error, needSign]() mutable {
+                if (needSign) {
+                    signParameters(parameters);
+                }
+                wbi::encWbi(parameters);
+                _cpr_get(
+                    url, parameters,
+                    [callback, error](const cpr::Response& r) { parseJson<ReturnType>(r, callback, error); }, error);
             },
             error);
     }
 
     template <typename ReturnType>
-    static void getResultWithWbiAsync(const std::string& url,
-                                      cpr::Parameters parameters                      = {},
-                                      const std::function<void(ReturnType)>& callback = nullptr,
-                                      const ErrorCallback& error                      = nullptr,
-                                      bool needSign                                   = false) {
-        wbi::updateWbiKeys([url, parameters, callback, error, needSign]() mutable {
-            if (needSign) {
-                signParameters(parameters);
-            }
-            wbi::encWbi(parameters);
-            _cpr_get(
-                url,
-                parameters,
-                [callback, error](const cpr::Response& r) {
-                    parseJson<ReturnType>(r, callback, error);
-                },
-                error);
-        }, error);
-    }
-
-    template <typename ReturnType>
-    static void postResultAsync(const std::string& url,
-                                cpr::Parameters parameters                      = {},
+    static void postResultAsync(const std::string& url, cpr::Parameters parameters = {},
                                 const cpr::Payload& payload                     = {},
                                 const std::function<void(ReturnType)>& callback = nullptr,
-                                const ErrorCallback& error                      = nullptr,
-                                bool needSign                                   = false) {
+                                const ErrorCallback& error = nullptr, bool needSign = false) {
         if (needSign) {
             signParameters(parameters);
         }
@@ -332,11 +334,9 @@ public:
             error);
     }
 
-    static void postResultAsync(const std::string& url,
-                                const cpr::Parameters& parameters     = {},
-                                const cpr::Payload& payload           = {},
-                                const std::function<void()>& callback = nullptr,
-                                const ErrorCallback& error            = nullptr) {
+    static void postResultAsync(const std::string& url, const cpr::Parameters& parameters = {},
+                                const cpr::Payload& payload = {}, const std::function<void()>& callback = nullptr,
+                                const ErrorCallback& error = nullptr) {
         _cpr_post(
             url, parameters, payload,
             [callback, error](const cpr::Response& r) {
@@ -359,4 +359,3 @@ public:
 };
 
 }  // namespace bilibili
-

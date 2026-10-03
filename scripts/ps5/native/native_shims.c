@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <sys/time.h>
 #include <stdlib.h>
 #include <time.h>
@@ -607,7 +608,6 @@ static void wiliwili_crash_handler(int signal_number, siginfo_t *info, void *con
     }
     static const char digits[] = "0123456789abcdef";
     extern void *malloc(size_t);
-    extern int pthread_create(void *, const void *, void *(*)(void *), void *);
     const char *labels[5]              = {"addr=0x", " rip=0x", " base=0x", " rsp=0x", " rb=0x"};
     const unsigned long long values[5] = {fault, instruction_pointer, (unsigned long long)(uintptr_t)&wiliwili_boot_log,
                                           ucontext != NULL ? (unsigned long long)ucontext->uc_mcontext.mc_rsp : 0,
@@ -731,6 +731,8 @@ SSL *SSL_new(SSL_CTX *ctx);
 int SSL_set_fd(SSL *ssl, int fd);
 int SSL_connect(SSL *ssl);
 void SSL_set_verify(SSL *ssl, int mode, int (*callback)(int, void *));
+long SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg);
+int SSL_set_alpn_protos(SSL *ssl, const unsigned char *protos, unsigned int protos_len);
 const char *SSL_get_version(const SSL *ssl);
 void SSL_free(SSL *ssl);
 
@@ -755,7 +757,7 @@ static void wiliwili_tls_probe(const char *host) {
     }
     long long dns_ms = wiliwili_probe_ms() - t0;
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
         int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) break;
         struct timeval tv;
@@ -796,6 +798,118 @@ static void wiliwili_tls_probe(const char *host) {
     freeaddrinfo(res);
 }
 
+/* 并发对照：4 条同时发起的裸握手（curl-free），用于判断"并发新建连接"是否为瓶颈。
+ * 由 `WILIWILI_CRYPTO_PROBE=1` 触发，紧跟在单条握手之后。 */
+static void *wiliwili_par_probe_thread(void *arg) {
+    long idx = (long)arg;
+    char line[128];
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct addrinfo hints;
+    struct addrinfo *res = 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    long long t0      = wiliwili_probe_ms();
+    if (fd < 0 || getaddrinfo("i0.hdslb.com", "443", &hints, &res) != 0 || res == 0) {
+        wiliwili_boot_log("tls-par: setup failed");
+        if (res) freeaddrinfo(res);
+        return 0;
+    }
+    struct timeval tv;
+    tv.tv_sec  = 8;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    long long start = wiliwili_probe_ms();
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        snprintf(line, sizeof(line), "tls-par: idx=%ld connect-fail errno=%d", idx, errno);
+        wiliwili_boot_log(line);
+        close(fd);
+        freeaddrinfo(res);
+        return 0;
+    }
+    long long tcp = wiliwili_probe_ms() - start;
+    long long hs  = -1;
+    SSL_CTX *ctx  = SSL_CTX_new(TLS_client_method());
+    if (ctx != 0) {
+        SSL *ssl = SSL_new(ctx);
+        if (ssl != 0) {
+            SSL_set_fd(ssl, fd);
+            long long h0 = wiliwili_probe_ms();
+            int rc       = SSL_connect(ssl);
+            hs           = wiliwili_probe_ms() - h0;
+            if (rc != 1) hs = -hs;
+            SSL_free(ssl);
+        }
+        SSL_CTX_free(ctx);
+    }
+    snprintf(line, sizeof(line), "tls-par: idx=%ld dns_setup=%lld tcp=%lld handshake=%lld", idx,
+             (long long)(start - t0), tcp, hs);
+    wiliwili_boot_log(line);
+    close(fd);
+    freeaddrinfo(res);
+    return 0;
+}
+
+/* select 延迟对照：同一条 TCP 连接（:80）分别用
+ * ① select 等待可读后 read  ② 直接阻塞 read，比较首字节耗时。 */
+static void wiliwili_select_probe(void) {
+    char line[192];
+    struct addrinfo hints;
+    struct addrinfo *res = 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo("i0.hdslb.com", "80", &hints, &res) != 0 || res == 0) return;
+
+    for (int mode = 0; mode < 2; ++mode) {
+        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) continue;
+        struct timeval tv;
+        tv.tv_sec  = 5;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+            close(fd);
+            continue;
+        }
+        const char req[] = "GET / HTTP/1.0\r\nHost: i0.hdslb.com\r\n\r\n";
+        long long t0     = wiliwili_probe_ms();
+        ssize_t sent     = write(fd, req, sizeof(req) - 1);
+        char buf[256];
+        long long firstByte = -1;
+        const char *how     = mode == 0 ? "select" : "blocking";
+        if (sent > 0) {
+            if (mode == 0) {
+                fd_set rf;
+                FD_ZERO(&rf);
+                FD_SET(fd, &rf);
+                struct timeval wt;
+                wt.tv_sec  = 5;
+                wt.tv_usec = 0;
+                if (select(fd + 1, &rf, 0, 0, &wt) > 0) {
+                    if (read(fd, buf, sizeof(buf)) > 0) firstByte = wiliwili_probe_ms() - t0;
+                }
+            } else {
+                if (read(fd, buf, sizeof(buf)) > 0) firstByte = wiliwili_probe_ms() - t0;
+            }
+        }
+        snprintf(line, sizeof(line), "select-probe: mode=%s first_byte=%lldms", how, firstByte);
+        wiliwili_boot_log(line);
+        close(fd);
+    }
+    freeaddrinfo(res);
+}
+
+static void wiliwili_tls_parallel_probe(void) {
+    pthread_t threads[4];
+    int started = 0;
+    for (long i = 0; i < 4; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_par_probe_thread, (void *)i) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
 static void wiliwili_crypto_probe(void) {
     char line[192];
     unsigned char buf[32];
@@ -829,6 +943,8 @@ static void wiliwili_crypto_probe(void) {
     wiliwili_boot_log(line);
 
     wiliwili_tls_probe("i0.hdslb.com");
+    wiliwili_tls_parallel_probe();
+    wiliwili_select_probe();
 }
 
 static void wiliwili_early_marker(void) {

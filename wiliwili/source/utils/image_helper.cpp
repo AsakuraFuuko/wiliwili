@@ -127,6 +127,24 @@ static constexpr int IMAGE_CONNECTION_TIMEOUT_MS  = 3000;
 static constexpr int IMAGE_NO_PROGRESS_DEADLINE_MS = 6000;
 #endif
 
+#if defined(PS5_NATIVE_APP)
+// 慢请求相关性：给 img-net 行带上 host 与进程内 uptime，便于和 UDP 日志时间戳对齐。
+static long long imageUptimeMs() {
+    static const auto start = std::chrono::steady_clock::now();
+    return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+        .count();
+}
+static std::string imageUrlHost(const std::string& url) {
+    const auto scheme  = url.find("://");
+    const size_t begin = scheme == std::string::npos ? 0 : scheme + 3;
+    const auto slash   = url.find('/', begin);
+    const auto colon   = url.find(':', begin);
+    size_t stop        = slash;
+    if (colon != std::string::npos && (stop == std::string::npos || colon < stop)) stop = colon;
+    return url.substr(begin, stop == std::string::npos ? std::string::npos : stop - begin);
+}
+#endif
+
 static size_t effectiveImageRequestThreads(size_t configured) {
 #if defined(PS5_NATIVE_APP)
     return std::min(std::max<size_t>(2, configured), MAX_IMAGE_REQUEST_THREADS);
@@ -287,13 +305,15 @@ private:
         curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME, &firstByte);
         curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &newConnections);
         if (totalMs < 250 && !initialSample) return;
-        char message[256];
+        char message[320];
+        const std::string host = imageUrlHost(request.url);
         std::snprintf(
             message, sizeof(message),
-            "img-net: total=%lldms queue=%lldms dns=%lld tcp=%lld tls=%lld first=%lld newconn=%ld code=%ld bytes=%lld",
+            "img-net: total=%lldms queue=%lldms dns=%lld tcp=%lld tls=%lld first=%lld newconn=%ld code=%ld bytes=%lld "
+            "host=%s up=%lldms",
             totalMs, queueMs, (long long)(dns * 1000), (long long)((connected - dns) * 1000),
             (long long)((tls - connected) * 1000), (long long)(firstByte * 1000), newConnections, response.status_code,
-            (long long)response.downloaded_bytes);
+            (long long)response.downloaded_bytes, host.c_str(), imageUptimeMs());
         wiliwili_boot_log(message);
     }
 
@@ -309,13 +329,15 @@ private:
         if (result == CURLE_OK && !failed) {
             logSlowTransfer(curl, request.request, response, request.startedAt);
         } else if (!cancelled) {
-            char message[128];
+            char message[192];
             const auto elapsed = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::steady_clock::now() - request.startedAt)
                                      .count();
-            std::snprintf(message, sizeof(message), "img-net: failed curl=%d code=%ld bytes=%lld elapsed=%lldms try=%u",
-                          result, response.status_code, (long long)response.downloaded_bytes, elapsed,
-                          request.request.attempt + 1);
+            const std::string host = imageUrlHost(request.request.url);
+            std::snprintf(message, sizeof(message),
+                          "img-net: failed curl=%d code=%ld bytes=%lld elapsed=%lldms try=%u host=%s up=%lldms", result,
+                          response.status_code, (long long)response.downloaded_bytes, elapsed,
+                          request.request.attempt + 1, host.c_str(), imageUptimeMs());
             wiliwili_boot_log(message);
         }
         curl_multi_remove_handle(multi, curl);
