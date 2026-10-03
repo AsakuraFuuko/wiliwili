@@ -73,6 +73,9 @@ public:
 
     void stop();
 
+    /// 仅让当前显示的播放器接收 MPV 事件；后台 Activity 保持静默。
+    void setMpvEventActive(bool active);
+
     void togglePlay();
 
     void setSpeed(float speed);
@@ -298,9 +301,6 @@ private:
     bool isTvControlMode = false;
     // 是否展示重播按钮
     bool showReplay = false;
-#ifdef PS5_NATIVE_APP
-    bool ps5Paused = false; /* PS5 自管播放器的暂停状态（mpv 在原生标题里不可用） */
-#endif
     std::string bangumiTitle;
     unsigned int bangumiSeasonId = 0;
     MPVEvent::Subscription eventSubscribeID;

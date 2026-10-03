@@ -96,52 +96,48 @@ void APPVersion::checkUpdate(int delay, bool showUpToDateDialog) {
         std::string url =
             ProgramConfig::instance().getSettingItem(SettingItem::CUSTOM_UPDATE_API, APPVersion::RELEASE_API);
 
-        cpr::GetCallback(
-            [showUpToDateDialog](cpr::Response r) {
-                checking_update = false;
-                try {
-                    if (showUpToDateDialog && r.status_code == 403) {
-                        // GitHub api limited
-                        if (const nlohmann::json res = nlohmann::json::parse(r.text); res.contains("message")) {
-                            auto msg = res.at("message").get<std::string>();
-                            brls::sync([msg]() { brls::Application::notify(msg); });
-                        }
-                        return;
+        auto session = bilibili::HTTP::createSession();
+        session->SetUrl(cpr::Url{url});
+        bilibili::HTTP::runAsync(session, [showUpToDateDialog](cpr::Response r) {
+            checking_update = false;
+            try {
+                if (showUpToDateDialog && r.status_code == 403) {
+                    // GitHub api limited
+                    if (const nlohmann::json res = nlohmann::json::parse(r.text); res.contains("message")) {
+                        auto msg = res.at("message").get<std::string>();
+                        brls::sync([msg]() { brls::Application::notify(msg); });
                     }
-                    if (r.status_code != 200 || r.text.empty()) {
-                        brls::Logger::error("Cannot check update: {} {}", r.status_code, r.error.message);
-                        if (showUpToDateDialog) {
-                            auto msg = r.reason;
-                            brls::sync([msg]() { brls::Application::notify(msg); });
-                        }
-                        return;
-                    }
-                    const nlohmann::json res = nlohmann::json::parse(r.text);
-                    auto info          = res.get<ReleaseNote>();
-                    if (info.tag_name.empty()) {
-                        brls::Logger::error("Cannot parse update info, tag_name is empty");
-                        return;
-                    }
-                    if (!APPVersion::instance().needUpdate(info.tag_name)) {
-                        brls::Logger::info("App is up to date");
-                        if (showUpToDateDialog) {
-                            brls::sync(
-                                []() { brls::Application::notify("wiliwili/setting/tools/others/up2date"_i18n); });
-                        }
-                        return;
-                    }
-                    brls::sync([info]() {
-                        auto container = new LatestUpdate(info);
-                        auto dialog    = new brls::Dialog((brls::Box*)container);
-                        dialog->open();
-                    });
-                } catch (const std::exception& e) {
-                    brls::Logger::error("check update failed: {} {} {}", r.status_code, r.text.c_str(), e.what());
+                    return;
                 }
-            },
-#ifdef PS5
-            cpr::Ssl(cpr::ssl::CaInfo{cpr::fs::path{bilibili::HTTP::CA_BUNDLE}}),
-#endif
-            bilibili::HTTP::VERIFY, bilibili::HTTP::PROXIES, cpr::Url{url}, cpr::Timeout{10000});
+                if (r.status_code != 200 || r.text.empty()) {
+                    brls::Logger::error("Cannot check update: {} {}", r.status_code, r.error.message);
+                    if (showUpToDateDialog) {
+                        auto msg = r.reason;
+                        brls::sync([msg]() { brls::Application::notify(msg); });
+                    }
+                    return;
+                }
+                const nlohmann::json res = nlohmann::json::parse(r.text);
+                auto info                = res.get<ReleaseNote>();
+                if (info.tag_name.empty()) {
+                    brls::Logger::error("Cannot parse update info, tag_name is empty");
+                    return;
+                }
+                if (!APPVersion::instance().needUpdate(info.tag_name)) {
+                    brls::Logger::info("App is up to date");
+                    if (showUpToDateDialog) {
+                        brls::sync([]() { brls::Application::notify("wiliwili/setting/tools/others/up2date"_i18n); });
+                    }
+                    return;
+                }
+                brls::sync([info]() {
+                    auto container = new LatestUpdate(info);
+                    auto dialog    = new brls::Dialog((brls::Box*)container);
+                    dialog->open();
+                });
+            } catch (const std::exception& e) {
+                brls::Logger::error("check update failed: {} {} {}", r.status_code, r.text.c_str(), e.what());
+            }
+        });
     });
 }

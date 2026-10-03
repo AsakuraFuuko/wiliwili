@@ -42,8 +42,12 @@ sleep 25
 sleep 2
 
 echo "==> launching"
-curl -sS --fail --connect-timeout 3 --max-time 25 \
-  "http://$host:$web_port/launch?titleId=$title_id" >/dev/null
+launch_status=$(curl -sS --connect-timeout 3 --max-time 25 -o /dev/null -w '%{http_code}' \
+  "http://$host:$web_port/launch?titleId=$title_id" || true)
+if [[ "$launch_status" != 503 && ! "$launch_status" =~ ^2[0-9][0-9]$ ]]; then
+  echo "launch failed with HTTP $launch_status" >&2
+  exit 1
+fi
 
 sleep $((listen_seconds - 5))
 echo "==> log ($log)"

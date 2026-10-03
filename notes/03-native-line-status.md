@@ -1,4 +1,6 @@
 # 03 — 原生标题线现状盘点 + 新树（`wiliwili-native/`）迁移清单
+> **状态（2026-10-03）：本文是迁移期盘点；当前状态优先看 `notes/06` 末尾与 `run-continuation/ps5-native-handoff.md`。**
+
 
 > 调研笔记。**未改动任何源码、未构建、未跑测试。** 全部路径以 `/root/workspace/ps5wiliwili/` 为根。
 > 相关工作：`notes/01-agc-bringup.md`（AGC 最小上屏：DCB/寄存器/shader 工具链）——本文件只做**现状盘点 + 迁移**，不重复那份的 AGC 细节。
@@ -17,6 +19,7 @@
 7. 标题内两条硬边界，所有移植决定都由它们推出：**不能 `dlopen`**（连自己镜像里的 50 KB 库都失败 ⇒ 一切静态链接）、**不能 klog**（`syscall 0x259` 在沙箱内直接杀进程 ⇒ 日志改走 `/download0` + UDP）。两者已由 `native_shims.c` / `native_libc_compat.c` 兜住（§1.4）。
 8. §4 列了 **13 条真机已证伪的坑**（含 AGC 空桩、BGRA 互换、`/system_ex` 空间、JIT 权限、键盘模块缺失等），**不要重踩**。
 9. 工作量诚实估计（§5）：新树产出**可安装/可启动/能联网/能画界面的 GL 原生标题** ≈ **1.5–2 人天**（8–14 人时，其中一半是首次构建与真机往返）；把软渲染恢复到可用 **+3–5 人天**；AGC 渲染层重写是另一量级（见 `notes/01-agc-bringup.md`）。
+> **备注（2026-10-03 工作树状态）**：`wiliwili-native` 有 35 个未提交文件；borealis 子模块的 AGC 后端（`nanovg_agc.cpp`、`agc/`、`platforms/agc/`）是 **untracked**——这是已知风险，正式提交前必须 `git add` 并确认不与上游冲突。
 
 ---
 
@@ -50,11 +53,11 @@
 |---|---|---|
 | `PS5_NATIVE_TOOLCHAIN` | `<ws>/ps5-native/ps5-native-app-boilerplate` | PIE 链接脚本、`app_crt.cpp`、`prospero-clang18` 包装器、`runtime/libc.prx` |
 | `PS5_NATIVE_SDK` | `/opt/ps5-payload-sdk` | `prospero-lld`/`prospero-strip`、`target/lib`、homebrew 端口库（mpv/ffmpeg/curl/…） |
-| `PS5_NATIVE_SDL2_PREFIX` | `<ws>/ps5-native/ps5-opengl/build/native-sdl2/sdk` | 原生 SDL2（`libSDL2.a` + 头） |
+| `PS5_NATIVE_SDL2_PREFIX` | `<ws>/ps5-native/ps5-opengl/build/native-sdl2-audio/sdk` | 原生 SDL2（`libSDL2.a` + 头） |
 | `PS5_OPENGL_PREFIX` | `<ws>/ps5-native/ps5-opengl/build/sdk/ps5-opengl-sdk-0.3.0/sdk` | `libPS5OpenGLCore33.a`、`libSceAgc.so`/`libSceAgcDriver.so` |
 | `PS5_NATIVE_OUT` | `<repo>/build-ps5/native` | 对象/中间产物/`dist/` |
 | `PS5_NATIVE_CDB` | `<repo>/build-ps5/compile_commands.json` | payload 构建的编译数据库（**唯一源清单**） |
-| `PS5_NATIVE_TITLE_ID` | `PPSA99010` | 输出 `dist/<ID>/` |
+| `PS5_NATIVE_TITLE_ID` | `PPSA99233`（脚本默认值，2026-10-03 起） | 输出 `dist/<ID>/` |
 | `PS5_NATIVE_JOBS` | `nproc` | 并行编译 |
 
 **附加开关**（`native_build.py` 读环境）：`WILIWILI_NATIVE_PROBE`（`:41-42`，只编启动探针）、`PS5_NATIVE_OSMESA_DIR`（`:47-48`，软渲染）、`PS5_NATIVE_OSMESA_LLVM=0`（`:265,279`，去掉 llvmpipe/LLVM）、`WILIWILI_SKIP_HOME_REQUEST=1`（`:49-50`）、`PS5_NATIVE_LIBC_TRACE=1`（`:205-206`）、`PS5_NATIVE_ROMFS_ARCHIVE`（`:239-242`）、`PS5_NATIVE_STUB_DIR`（`:369`）、`PS5_OPENGL_NATIVE_APP`（`:186-187`）。
@@ -92,8 +95,8 @@
 | `kernel_mprotect`（payload 跨进程补丁能力） | 返回 `EPERM` | `native_shims.c:130-140` |
 | `__dlopen/__dlsym/__dlclose/__dladdr` | 返回 `ENOSYS`/假句柄（标题禁止运行期加载） | `native_shims.c:146-183` |
 | `klog_puts`（0x259） | 改写入启动日志 | `native_shims.c:813-818` |
-| clean-room libc 面（locale `*_l`、`regcomp` 家族、`localtime_r/gmtime_r`、`pipe2/recvmmsg/sendmmsg/mkostemp/mkstemps/utimensat`、`popen/pclose`、`catopen/catgets/catclose`、`dladdr`、`getpwuid_r`、`if_nametoindex`、`__emutls_get_address`、`strsignal`、`sbrk`、`__xuname`、`dirfd`、`qsort_r`、`aligned_alloc`、`printf` 重定向、`realpath`、`isatty`、zstd 的 4 个 trace 钩子…） | `native_libc_compat.c`（1602 行，`newlocale:89`、`pipe2:455`、`recvmmsg:539`、`__emutls_get_address:681`、`getaddrinfo:990`、`fcntl:1081`、`dlopen:1564`…） | `ps5-port-status.md`「原生标题运行期排障记录」 |
-| `getaddrinfo`/`getnameinfo`（平台版在 `libScePosixForWebKit` 里，标题内空指针崩） | 自实现：DNS 走 `sceNetResolverStartNtoa`（**timeout/retry/flags 必须为 0**）、必要时自写 UDP 查询 | `native_libc_compat.c:719-1060` |
+| clean-room libc 面（locale `*_l`、`regcomp` 家族、`localtime_r/gmtime_r`、`pipe2/recvmmsg/sendmmsg/mkostemp/mkstemps/utimensat`、`popen/pclose`、`catopen/catgets/catclose`、`dladdr`、`getpwuid_r`、`if_nametoindex`、`__emutls_get_address`、`strsignal`、`sbrk`、`__xuname`、`dirfd`、`qsort_r`、`aligned_alloc`、`printf` 重定向、`realpath`、`isatty`、zstd 的 4 个 trace 钩子…） | `native_libc_compat.c`（1602 行，`newlocale:89`、`pipe2:455`、`recvmmsg:539`、`__emutls_get_address:681`、`fcntl:1081`、`dlopen:1564`…） | `ps5-port-status.md`「原生标题运行期排障记录」 |
+| `getaddrinfo`/`getnameinfo`（标题不使用固件 `libScePosixForWebKit` 版本） | payload libc 的 `netdb.o` + `sceNetResolver*`（解析器走平台接口） | `native_build.py:257-264` |
 | POSIX 正则 | `native_regex.c`（631 行，扩展子集，超范围报 `REG_BADPAT`） | `native_regex.c:1-19` |
 | 软件渲染期的 `dlopen`（SDL 用它取 OSMesa） | `#ifdef WILIWILI_SOFTWARE_RENDER` 的假句柄 + 静态符号表 | `native_libc_compat.c:1512-1602` |
 | 符号可见性 | `app-symbols.map` = `{ local: *; }`（模块转换器只发布 import，不支持应用导出；上游那份只藏 `_Zn*`/`_Zd*`，静态链 libc/mpv/Mesa 时会有 559 个导出被拒） | `app-symbols.map:1-14`、`ps5-port-status.md`「符号可见性」 |
@@ -128,8 +131,8 @@
 | # | 文件 | payload 形态 | 原生线形态（要回改成的样子） | 关键行 |
 |---|---|---|---|---|
 | 1 | `wiliwili/include/api/bilibili/util/http.hpp` | `#if defined(PS5)` 下用 `wiliwili_boot_log`；CA = `/data/homebrew/wiliwili/ca-bundle.crt`；`session->GetCallback(...)` | 宏改 `PS5_NATIVE_APP`；CA = `/app0/assets/ca-bundle.crt`；新增 `curl` `SetDebugCallback`；新增并使用 **`HTTP::runAsync()`**（阻塞 `session->Get()` 跑在 detach 线程）替代 cpr multi | CA `91`/`93`、`runAsync` 定义 `171-183`、`_cpr_get` 调用点 `192`（老树） |
-| 2 | `wiliwili/include/utils/image_helper.hpp` | 通用/桌面尺寸；无上传队列 | `#elif defined(PS5_NATIVE_APP)` 封面缩到 `@336w_189h`；新增 `static void drainUploads()` | `83-95`、`125`（老树） |
-| 3 | `wiliwili/source/utils/image_helper.cpp` | 内联 `brls::sync` 直接上传 | 上传入队（`std::deque`+`mutex`），每帧 1 张；`extern "C" wiliwili_drain_image_uploads()` | `218`、`220-228`、`296-307`（老树） |
+| 2 | `wiliwili/include/utils/image_helper.hpp` | 通用/桌面尺寸；无上传队列 | native `PS5_NATIVE_APP` 图片尺寸口径为 **336/156/270**，TextureCache 限 **24** 项 | `image_helper.hpp:84-93`、`config_helper.cpp:819-827` |
+| 3 | `wiliwili/source/utils/image_helper.cpp` | 解码后通过 `brls::sync` 直接上传 | native 通过 `ImageUploadQueue` 排队上传，最多 **8** 项待上传、每帧最多 **2** 项 | `image_helper.cpp:601-667` |
 | 4 | `wiliwili/source/main.cpp` | **定义** `wiliwili_boot_log`（`klog_puts` 包装，`:16`） | 只 `extern` 声明（定义在 `native_shims.c`）；加 `WILIWILI_OSMESA_PROBE` 调用；加 `WILIWILI_TEST_BV` 调试入口 | `16-17`、`26-39`、`56-66`、`105-118`（老树） |
 | 5 | `wiliwili/source/utils/config_helper.cpp` | 无网络初始化；`getcwd`；`/data/homebrew/wiliwili[\/config]` | `#if defined(PS5_NATIVE_APP)`：`sceNetCtlInit/sceNetInit/sceNetPoolCreate/sceSslInit`；跳过 `getcwd`；路径改 `/download0/wiliwili[\/config]` | `30-35`、`1046-1058`、`1088-1091`、`1157-1160`、`1176-1178`（老树） |
 | 6 | `wiliwili/source/utils/number_helper.cpp` | `std::random_device`（打不开 `/dev/urandom`） | 时钟+pid+计数器种子 | `68-77`（老树） |
@@ -145,7 +148,7 @@
 
 **必须"双向合并"的两处（单向覆盖会丢东西）**：
 - `config_helper.cpp`：老树有 `PS5_NATIVE_APP` 网络初始化 + `/download0` 路径，payload（`1c84a1a`）有 `danmaku_style_font` 的 PS5 默认 `incline`（`#if defined(PS5) …1… #else 0`）⇒ 合并时把 `#if defined(PS5)` 保留（`PS5_NATIVE_APP` 也定义 `PS5`）。
-- `image_helper.hpp`：老树有 `@336w_189h` 与 `drainUploads`，payload 侧无；直接取老树版即可（payload 的这一处没有新东西）。
+- `image_helper.hpp`：native 图片尺寸口径为 **336/156/270**（`@336w_189h` / `@156w_210h` / `@270w_270h`），TextureCache 固定 **24** 项；**旧的 `@448w_252h` / `@208w_280h` 是被否的高清试验，不是现状**，不要恢复。
 
 **必须新增（老树与 payload 都还没有）**：`wiliwili_boot_log` 的定义方（`native_shims.c`）已在 native 脚本目录里，但**payload 的 `main.cpp` 定义必须删掉**，否则重复定义/走错通道。
 
@@ -203,6 +206,7 @@ PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash scripts/ps5/build.sh
 `sdl_input.cpp` **不要改**：`407`（无 haptics）与 `605`（`sendRumble` no-op）已随 payload 提交 `135c4a0f` 在新树里。
 
 ### Step 4 — 选定渲染路线（互斥；建议先只做 GL）
+> **状态：已完成/作废，见现状。** 迁移期路线选择不再代表当前方案；正式标题状态见 `notes/06` 末尾。
 
 | 路线 | 需要的额外准备 | 命令差异 |
 |---|---|---|
@@ -210,6 +214,7 @@ PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash scripts/ps5/build.sh
 | 软渲染（未完成） | ① 用 `build-osmesa.sh` 产出 `stage-softpipe`（llvmpipe 被 JIT 挡，见 §4）；② **SDL 必须换成带 OSMesa 后端的 payload SDL 前缀**（`build-ps5/ps5-sdl-prefix`），并按 §4「键盘/IME」给它加 `SDL_PS5_KEYBOARD=OFF`；③ softpipe 建 core profile context 会被 Mesa 版本判定拒绝（`ctx->Version==0`）⇒ 需补 `softpipe` 能力或改判定阈值（或确认探针已改用的 `OSMESA_COMPAT_PROFILE` 路线可用） | 增加：`PS5_NATIVE_SDL2_PREFIX=$PWD/build-ps5/ps5-sdl-prefix PS5_NATIVE_OSMESA_DIR=../ps5-native/mesa-build/stage-softpipe PS5_NATIVE_OSMESA_LLVM=0` |
 
 ### Step 5 — 选 TITLE_ID
+> **状态：已完成/作废，见现状。** 迁移期 TITLE_ID 选择不再代表当前默认值；正式标题为 `PPSA99233`。
 
 - 已占用：`PPSA99010`（GL/AGC）、`PPSA99011`（llvmpipe ffpkg）、`PPSA99012`（OSMesa 调试）。**建议新任务用 `PPSA99013`**，避免与主机上已注册标题/残留挂载点冲突。
 - 约束：9 字符（`register_title.c:24`）；`conceptId` = 后 5 位、`contentId` = `UP9000-<ID>_00-WILIWILI00000000`（`native_build.py:443-456` 自动生成，不用手改）。
@@ -268,7 +273,7 @@ bash scripts/ps5/native/launch-native.sh 192.168.102.118 PPSA99013   # 或用 80
 | 1 | 画面全黑但 GL 无报错 | 链接了 SDK 模板里的 **AGC 空桩**（`agc_link_stub.c`/`agc_driver_link_stub.c`），GPU 提交全变 no-op | **不编这两个文件**（现在只编 `app_heap.c`），AGC 走导入 `-lSceAgc -lSceAgcDriver` + 含 AGC 桩的 `--stub-dir` | `native_build.py:171-199`、`ps5-port-status.md`「五个真机定位的坑」 |
 | 2 | 红蓝互换 | SDK 扫描输出 RGBA8，主机 video-out 是 BGRA | nanovg 片段着色器 `outColor = result.bgra`（**必须用 C 预处理选择**，写进 GLSL 字符串无效）+ `clear()` 同步交换；**软渲染变体不能交换** | `nanovg_gl.h:688-698`、`sdl_video.cpp:538-551` |
 | 3 | 整屏从左到右刷新/撕裂 | `eglSwapBuffers` 不等 GPU 完成就 present | `glFinish()`/`glFlush()` + `SDL_GL_SetSwapInterval(1)` | `sdl_video.cpp:489-525` |
-| 4 | 封面加载冻住界面 | 纹理上传压在 UI 线程（11 ms/张、队列 ~400 ms） | 上传队列 + 每帧 1 张（`ImageHelper::drainUploads` ← `wiliwili_drain_image_uploads` 弱符号钩子）；封面尺寸降 `@336w_189h` | `image_helper.cpp:218-307` |
+| 4 | 封面加载冻住界面 | 图片解码后直接在渲染线程上传，连续卡片会放大纹理占用 | native 图片尺寸口径为 **336/156/270**，TextureCache 限 **24** 项；上传走队列（最多 **8** 项、每帧最多 **2** 项）；旧的 448/208 高清试验不是现状 | `image_helper.hpp:84-93`、`config_helper.cpp:819-827`、`image_helper.cpp:601-667` |
 | 5 | DNS/首个请求崩 | 平台 `getaddrinfo` 在 `libScePosixForWebKit` 里；`sceNetResolverStartNtoa` 的 timeout/retry/flags **必须为 0**（否则 `0x80410116`） | 兼容层自实现 `getaddrinfo` + DNS | `native_libc_compat.c:719-1060` |
 | 6 | 首个请求 SIGSYS 杀进程 | 裸 `syscall`；`fcntl(F_SETFL)` 被判非法（klog `PPRBUG-22859 … syscall 92`） | 零裸 syscall；`F_GETFD/F_SETFD` 直接成功，`F_SETFL` 用 `ioctl(FIONBIO)` | `native_libc_compat.c:1081-1120` |
 | 7 | 标题"无法启动"/部署静默失败 | `/system_ex` 只剩 19.5 MB；FTP 大文件 ~85 MB 处 `ENOSPC` | 走 ffpkg 到 `/data/homebrew`；大文件只从 PC 上传，**别让主机侧 `http2_get` 拉** | `install-ffpkg.sh`、`ps5-port-status.md` |

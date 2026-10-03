@@ -21,7 +21,7 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 
 host=$1
-title_id=${2:-PPSA99010}
+title_id=${2:-PPSA99233}
 ftp_port=${PS5_FTP_PORT:-2120}
 ftp_user=${PS5_FTP_USER:-anonymous:}
 remote_dir=${PS5_FFPKG_DIR:-/data/homebrew}

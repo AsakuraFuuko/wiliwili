@@ -373,7 +373,7 @@ public:
 
 private:
     const bilibili::DynamicArticleResult& data;  // 动态原始数据
-    bilibili::DynamicArticleModuleState state;  // 动态赞评转数据，为方便修改，不使用 data 内的数据
+    bilibili::DynamicArticleModuleState state;   // 动态赞评转数据，为方便修改，不使用 data 内的数据
     brls::Event<size_t>* likeState;
     brls::Event<size_t>* likeNum;
     bilibili::VideoCommentListResult dataList;
@@ -382,8 +382,8 @@ private:
 };
 
 void DynamicArticleDetail::initList(const bilibili::DynamicArticleResult& result,
-                                const bilibili::DynamicArticleModuleState& moduleState) {
-    data = result;
+                                    const bilibili::DynamicArticleModuleState& moduleState) {
+    data  = result;
     state = moduleState;
     this->recyclingGrid->registerCell("Cell", []() { return DynamicArticleView::create(); });
     this->recyclingGrid->registerCell("Reply", []() { return VideoCommentReply::create(); });
@@ -412,7 +412,7 @@ DynamicArticleDetail::DynamicArticleDetail(const std::string& id) {
     this->inflateFromXMLRes("xml/fragment/dynamic_detail.xml");
     requestDynamicArticle(id);
     this->buttonClose->setFocusable(true);
-    this->buttonClose->registerClickAction([](...){
+    this->buttonClose->registerClickAction([](...) {
         brls::Application::popActivity(brls::TransitionAnimation::NONE);
         return true;
     });
@@ -436,8 +436,7 @@ void DynamicArticleDetail::onDynamicArticle(const bilibili::DynamicArticleResult
     }
     initList(result, state);
     this->buttonClose->setFocusable(false);
-    if (brls::Application::getCurrentFocus() == this->buttonClose)
-        brls::Application::giveFocus(this->recyclingGrid);
+    if (brls::Application::getCurrentFocus() == this->buttonClose) brls::Application::giveFocus(this->recyclingGrid);
 }
 
 void DynamicArticleDetail::onCommentInfo(const bilibili::VideoCommentResultWrapper& result) {
@@ -486,6 +485,9 @@ DynamicArticleView::DynamicArticleView() {
 
 void DynamicArticleView::setCard(const bilibili::DynamicArticleResult& result) {
     this->articleData = result;
+    // 清空旧富文本，释放隐藏动态仍持有的图片请求和纹理引用。
+    this->imageBox->setRichText({});
+    this->imageBoxForward->setRichText({});
     // 清空内容
     this->contentArea->setVisibility(brls::Visibility::GONE);
     this->imageArea->setVisibility(brls::Visibility::GONE);
@@ -506,7 +508,7 @@ void DynamicArticleView::setCard(const bilibili::DynamicArticleResult& result) {
                 if (data->user.vip.nickname_color.empty()) {
                     this->author->setMainTextColor(brls::Application::getTheme().getColor("brls/text"));
                 } else {
-                    const std::string& nc = data->user.vip.nickname_color;
+                    const std::string& nc          = data->user.vip.nickname_color;
                     const std::string& customColor = Register::getCustomThemeColorHex();
                     if (!customColor.empty() && Register::isBilibiliDefaultPink(nc)) {
                         this->author->getLabelName()->applyXMLAttribute("textColor", customColor);
@@ -661,7 +663,7 @@ void DynamicArticleView::setForwardCard(const bilibili::dynamic_forward::Dynamic
                 if (data->user.vip.nickname_color.empty()) {
                     this->authorForward->setTextColor(brls::Application::getTheme().getColor("color/link"));
                 } else {
-                    const std::string& nc = data->user.vip.nickname_color;
+                    const std::string& nc          = data->user.vip.nickname_color;
                     const std::string& customColor = Register::getCustomThemeColorHex();
                     if (!customColor.empty() && Register::isBilibiliDefaultPink(nc)) {
                         this->authorForward->applyXMLAttribute("textColor", customColor);
@@ -781,6 +783,8 @@ void DynamicArticleView::openDetail() {
 void DynamicArticleView::prepareForReuse() {}
 
 void DynamicArticleView::cacheForReuse() {
+    this->imageBox->setRichText({});
+    this->imageBoxForward->setRichText({});
     ImageHelper::clear(this->author->getAvatar());
     if (this->videoArea->getVisibility() == brls::Visibility::VISIBLE) {
         ImageHelper::clear(this->videoArea->picture);

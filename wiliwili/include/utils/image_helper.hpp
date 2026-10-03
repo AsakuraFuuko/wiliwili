@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cpr/cpr.h>
+#include <atomic>
 #include <ctime>
 #include <random>
 #include <unordered_map>
@@ -81,10 +82,6 @@ public:
     static constexpr float note_small               = 0.5f;
 #endif
 #elif defined(PS5_NATIVE_APP)
-    /* Texture uploads on the native GL stack cost roughly 90 MB/s, so a grid
-     * cover is fetched at the size the card actually shows (the 1080p layout
-     * uses ~340x190 cards) instead of the desktop-sized variant: four times
-     * less data per upload and no visible loss. */
     inline static const std::string h_ext           = "@336w_189h_1c" IMAGE_EXT;
     inline static const std::string v_ext           = "@156w_210h_1c" IMAGE_EXT;
     inline static const std::string face_ext        = "@48w_48h_1c_1s" IMAGE_EXT;
@@ -112,22 +109,18 @@ public:
 
 protected:
     virtual void requestImage();
+    void handleImageResponse(cpr::Response response);
 
     /**
      * 图片请求结束时调用
      */
     void clean();
 
-public:
-    /* Uploads at most one queued texture. Called once per frame by the render
-     * loop: doing it inline from the network callback blocks the loop for the
-     * length of the whole queue and freezes the interface. */
-    static void drainUploads();
-
 private:
-    bool isCancel{};
+    std::atomic<bool> isCancel{};
     brls::Image* imageView;
     std::string imageUrl;
+    unsigned decodeAttempts = 0;
     Pool::iterator currentIter;
 
 #ifdef BOREALIS_USE_GXM

@@ -33,4 +33,5 @@ android-project
 .claude/
 CLAUDE.md
 # Other AI
-AGENT.md
+AGENT.md__pycache__/
+*.pyc

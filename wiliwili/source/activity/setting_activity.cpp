@@ -609,7 +609,7 @@ void SettingActivity::onContentAvailable() {
     }
 #endif
 
-#if defined(__PSV__) || defined(PS4)
+#if defined(__PSV__) || defined(PS4) || defined(PS5_NATIVE_APP)
     selectorTexture->setVisibility(brls::Visibility::GONE);
 #else
     selectorTexture->init("wiliwili/setting/app/image/texture"_i18n,

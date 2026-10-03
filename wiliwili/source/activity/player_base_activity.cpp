@@ -287,6 +287,7 @@ void BasePlayerActivity::setCommonData() {
     this->setRelationButton(false, false, false);
 
     eventSubscribeID = MPV_E->subscribe([this](MpvEventEnum event) {
+        if (!activityShown) return;
         // 上一次报告历史记录的时间点
         static int64_t lastProgress = MPVCore::instance().video_progress;
         switch (event) {
@@ -370,6 +371,7 @@ void BasePlayerActivity::setCommonData() {
     });
 
     customEventSubscribeID = APP_E->subscribe([this](const std::string& event, void* data) {
+        if (!activityShown) return;
         if (event == VideoView::QUALITY_CHANGE) {
             this->setVideoQuality();
         } else if (event == VideoView::SWITCH_TO_LAST) {
@@ -516,6 +518,7 @@ void BasePlayerActivity::setCommentMode() {
 }
 
 void BasePlayerActivity::onVideoPlayUrl(const bilibili::VideoUrlResult& result) {
+    if (!activityShown) return;
     brls::Logger::debug("onVideoPlayUrl quality: {}", result.quality);
 
     if (result.accept_quality.empty() || result.accept_description.empty()) {
@@ -621,6 +624,11 @@ void BasePlayerActivity::onVideoPlayUrl(const bilibili::VideoUrlResult& result) 
             }
         }
 
+        if (codecs.empty()) {
+            brls::Logger::error("onVideoPlayUrl: no video codec matches quality {}", videoUrlResult.quality);
+            return;
+        }
+
         // 匹配当前设定的视频编码
         bilibili::DashMedia v = codecs[0];  // 默认是 AVC/H.264
         for (const auto& i : codecs) {
@@ -710,7 +718,17 @@ void BasePlayerActivity::onVideoPlayUrl(const bilibili::VideoUrlResult& result) 
 
     // 设置mpv事件
     // 1.更新清晰度
-    std::string quality = videoUrlResult.accept_description[getQualityIndex()];
+    size_t qualityIndex = static_cast<size_t>(getQualityIndex());
+    if (videoUrlResult.accept_description.empty()) {
+        brls::Logger::error("onVideoPlayUrl: empty quality descriptions");
+        return;
+    }
+    if (qualityIndex >= videoUrlResult.accept_description.size()) {
+        brls::Logger::error("onVideoPlayUrl: quality index {} exceeds descriptions {}", qualityIndex,
+                            videoUrlResult.accept_description.size());
+        qualityIndex = 0;
+    }
+    std::string quality = videoUrlResult.accept_description[qualityIndex];
     APP_E->fire(VideoView::SET_QUALITY, (void*)quality.c_str());
     // 2.绘制进度条标记点（例如：片头片尾）
     if (clipOpen > 0) {
@@ -827,12 +845,26 @@ void BasePlayerActivity::onError(const std::string& error) {
 
 void BasePlayerActivity::willDisappear(bool resetState) {
     activityShown = false;
+    this->video->setMpvEventActive(false);
     brls::Activity::willDisappear(resetState);
 }
 
 void BasePlayerActivity::willAppear(bool resetState) {
     activityShown = true;
+    this->video->setMpvEventActive(true);
     brls::Activity::willAppear(resetState);
+}
+
+void BasePlayerActivity::onPause() {
+    activityShown = false;
+    this->video->setMpvEventActive(false);
+    brls::Activity::onPause();
+}
+
+void BasePlayerActivity::onResume() {
+    activityShown = true;
+    this->video->setMpvEventActive(true);
+    brls::Activity::onResume();
 }
 
 BasePlayerActivity::~BasePlayerActivity() {

@@ -55,6 +55,11 @@ if (MPV_SW_RENDER)
     list(APPEND APP_PLATFORM_OPTION -DMPV_SW_RENDER)
 endif ()
 
+option(PS5_NATIVE_AGC "Use the direct sceAgc Borealis backend" OFF)
+if (PS5_NATIVE_AGC)
+    list(APPEND APP_PLATFORM_OPTION -DPS5_NATIVE_AGC)
+endif ()
+
 # On systems that do not support framebuffer, let MPV to draw to full screen and
 # then cover unnecessary areas with UI.
 option(MPV_NO_FB "Using system provided framebuffer" OFF)

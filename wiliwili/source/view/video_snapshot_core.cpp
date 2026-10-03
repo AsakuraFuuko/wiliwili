@@ -21,7 +21,7 @@ void VideoSnapshotCore::reset() {
     }
     // 自增世代计数器，使所有正在飞行中的异步回调失效
     snapshotGeneration++;
-    snapshotData    = bilibili::VideoSnapshotData{};
+    snapshotData = bilibili::VideoSnapshotData{};
     snapshotTextures.clear();
     snapshotLoading.clear();
 }
@@ -79,12 +79,13 @@ void VideoSnapshotCore::loadTexture(size_t index) {
     int gen         = snapshotGeneration;  // 捕获当前世代，用于检测过期回调
     brls::Logger::info("[Snapshot] loadTexture start: index={} url={} gen={}", index, url, gen);
 
-    // Use cpr async callback to avoid std::thread + detach
+    // Use the native title-safe blocking curl path; cpr's multi callback path is unstable in the sandbox.
     auto session = bilibili::HTTP::createSession();
     session->SetUrl(cpr::Url{url});
-    session->GetCallback([this, gen, index, url](const cpr::Response& r) {
+    bilibili::HTTP::runAsync(session, [this, gen, index, url](const cpr::Response& r) {
         if (r.status_code != 200 || r.text.empty()) {
-            brls::Logger::error("[Snapshot] HTTP failed: index={} url={} status={} size={}", index, url, r.status_code, r.text.size());
+            brls::Logger::error("[Snapshot] HTTP failed: index={} url={} status={} size={}", index, url, r.status_code,
+                                r.text.size());
             brls::sync([this, gen, index]() {
                 if (gen != snapshotGeneration) return;  // 已 reset，忽略
                 if (index < snapshotLoading.size()) snapshotLoading[index] = false;
@@ -92,10 +93,12 @@ void VideoSnapshotCore::loadTexture(size_t index) {
             return;
         }
         int imageW = 0, imageH = 0, n;
-        uint8_t* imageData = stbi_load_from_memory(
-            (unsigned char*)r.text.data(), (int)r.text.size(), &imageW, &imageH, &n, 4);
+        uint8_t* imageData =
+            stbi_load_from_memory((unsigned char*)r.text.data(), (int)r.text.size(), &imageW, &imageH, &n, 4);
         if (!imageData) {
-            brls::Logger::error("[Snapshot] stb_image decode failed: index={} url={} gen={} stb_error={}", index, url, gen, stbi_failure_reason());
+            const char* failureReason = stbi_failure_reason();
+            brls::Logger::error("[Snapshot] stb_image decode failed: index={} url={} gen={} stb_error={}", index, url,
+                                gen, failureReason != nullptr ? failureReason : "unknown");
             brls::sync([this, gen, index]() {
                 if (gen != snapshotGeneration) return;  // 已 reset，忽略
                 if (index < snapshotLoading.size()) snapshotLoading[index] = false;
@@ -107,16 +110,19 @@ void VideoSnapshotCore::loadTexture(size_t index) {
             int tex        = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
             stbi_image_free(imageData);
             if (gen != snapshotGeneration) {
-                brls::Logger::error("[Snapshot] gen mismatch: index={} url={} gen={} curGen={}, deleting tex={}", index, url, gen, snapshotGeneration, tex);
+                brls::Logger::error("[Snapshot] gen mismatch: index={} url={} gen={} curGen={}, deleting tex={}", index,
+                                    url, gen, snapshotGeneration, tex);
                 if (tex > 0) nvgDeleteImage(vg, tex);
                 return;
             }
             if (tex <= 0) {
-                brls::Logger::error("[Snapshot] nvgCreateImageRGBA failed: index={} url={} gen={} imageW={} imageH={}", index, url, gen, imageW, imageH);
+                brls::Logger::error("[Snapshot] nvgCreateImageRGBA failed: index={} url={} gen={} imageW={} imageH={}",
+                                    index, url, gen, imageW, imageH);
             }
             if (index < snapshotTextures.size()) {
                 if (snapshotTextures[index] > 0) {
-                    brls::Logger::error("[Snapshot] duplicate tex: index={} url={} oldTex={} newTex={}, deleting new", index, url, snapshotTextures[index], tex);
+                    brls::Logger::error("[Snapshot] duplicate tex: index={} url={} oldTex={} newTex={}, deleting new",
+                                        index, url, snapshotTextures[index], tex);
                     if (tex > 0) nvgDeleteImage(vg, tex);
                 } else {
                     snapshotTextures[index] = tex;
@@ -135,9 +141,9 @@ void VideoSnapshotCore::draw(NVGcontext* vg, float x, float y, float width, floa
     if (!snapshotData.isValid()) return;
     if (snapshotTextures.empty()) return;
 
-    int imageIdx       = findIndex(progress);
-    size_t sheetIdx    = (size_t)(imageIdx / tilesPerSheet());
-    int posInSheet     = imageIdx % tilesPerSheet();
+    int imageIdx    = findIndex(progress);
+    size_t sheetIdx = (size_t)(imageIdx / tilesPerSheet());
+    int posInSheet  = imageIdx % tilesPerSheet();
 
     // Start loading the needed sprite sheet if not yet loaded
     loadTexture(sheetIdx);
@@ -153,9 +159,9 @@ void VideoSnapshotCore::draw(NVGcontext* vg, float x, float y, float width, floa
     float displayH = displayW * (float)snapshotData.img_y_size / (float)snapshotData.img_x_size;
 
     // 计算缩略图中心点横坐标，钳制到 VideoView 区域
-    float minX = x + displayW / 2 + 8.0f;
-    float maxX = x + width - displayW / 2 - 8.0f;
-    float realCenterX = positionX + 22; // 保证相对拖动条按钮居中
+    float minX        = x + displayW / 2 + 8.0f;
+    float maxX        = x + width - displayW / 2 - 8.0f;
+    float realCenterX = positionX + 22;  // 保证相对拖动条按钮居中
     if (realCenterX < minX) realCenterX = minX;
     if (realCenterX > maxX) realCenterX = maxX;
 
@@ -173,11 +179,7 @@ void VideoSnapshotCore::draw(NVGcontext* vg, float x, float y, float width, floa
     // 缩略图
     nvgSave(vg);
     nvgScissor(vg, dstX, dstY, displayW, displayH);
-    NVGpaint paint = nvgImagePattern(vg,
-                                     dstX - srcX * scaleX,
-                                     dstY - srcY * scaleY,
-                                     totalW * scaleX,
-                                     totalH * scaleY,
+    NVGpaint paint = nvgImagePattern(vg, dstX - srcX * scaleX, dstY - srcY * scaleY, totalW * scaleX, totalH * scaleY,
                                      0, snapshotTextures[sheetIdx], 1.0f);
     nvgBeginPath(vg);
     nvgRoundedRect(vg, dstX, dstY, displayW, displayH, 4.0f);

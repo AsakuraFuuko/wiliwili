@@ -20,6 +20,7 @@
 struct NVGcontext;
 
 extern void wiliwili_boot_log(const char *message);
+extern int wiliwili_trace_enabled(void);
 extern void *SDL_GL_GetProcAddress(const char *proc);
 extern void wiliwili_draw_gl_texture(struct NVGcontext *vg, unsigned int texture, int width, int height);
 
@@ -142,8 +143,8 @@ static int g_au_size[MAX_AU];
 static int g_au_count;
 static int g_au_index;
 
-static uint8_t g_y_storage[1920 * 1088];  /* 稳定副本（帧池槽会被复用） */
-static uint8_t g_uv_storage[1920 * 544];  /* NV12 的 UV 平面：半高度、交织 CbCr */
+static uint8_t g_y_storage[1920 * 1088]; /* 稳定副本（帧池槽会被复用） */
+static uint8_t g_uv_storage[1920 * 544]; /* NV12 的 UV 平面：半高度、交织 CbCr */
 static const uint8_t *g_y_plane_ptr  = g_y_storage;
 static const uint8_t *g_uv_plane_ptr = g_uv_storage;
 static int g_y_width, g_y_height, g_y_pitch;
@@ -154,33 +155,75 @@ static int g_nv12_fresh = 1;
 void wiliwili_nv12_mark_fresh(int fresh) { g_nv12_fresh = fresh; }
 
 /* ── 帧耗时分段统计（原生线调优） ─────────────────────────────────────────
- * 由 borealis 帧循环在三个位置调用：GL 提交开始 / 视频上屏结束 / swap 结束。
- * 每 30 帧汇总一行：submit 与 swap 各占多少毫秒——用来判断"卡"到底卡在
- * 提交（UI+视频绘制）还是卡在呈现（swap）。
+ * 由 borealis 帧循环在四个位置调用，分成四段（每段都有明确的绘制内容）：
+ *   ui     = beginFrame/clear + 整棵视图树的 nanovg 绘制与 GL 提交
+ *   submit = nvgEndFrame（UI 收尾提交）
+ *   video  = 视频上屏（硬解探针叠加 + 自管播放器的 NV12 纹理上传与绘制）
+ *   swap   = endFrame（eglSwapBuffers：AGC 批次提交 + flip 与等待）
+ * 每 30 帧汇总一行，用来判断"卡"到底卡在哪一段。
  * ──────────────────────────────────────────────────────────────────────── */
-static long long g_phase_submit_us, g_phase_swap_us;
+static long long g_t0, g_t1, g_t2, g_t3, g_t_clear, g_t_video_end;
+static long long g_ui_us, g_submit_us, g_video_us, g_swap_us, g_clear_us;
 static int g_phase_frames;
 static long long phase_now_us(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (long long)t.tv_sec * 1000000LL + t.tv_nsec / 1000LL;
 }
-void wiliwili_frame_phase_begin(void) { g_phase_submit_us = phase_now_us(); }
+
+/* ── 每帧 draw 调用计数 ───────────────────────────────────────────────────
+ * nanovg 的 GL 后端对每个记录调用发一次 draw（nanovg_gl.h:1124 等，绘制
+ * 只在 nvgEndFrame 里真正提交），而 ps5-opengl 的每次 draw 都有一份固定的
+ * 提交开销：真机实测主页 nvgEndFrame ≈ 0 ms、播放页 290 ms 且随时间增长，
+ * 差别就在调用数/单次成本上。borealis 通过 glad 用函数指针调 GL
+ * （`glad_glDrawArrays` 是变量，链接期 --wrap 拦不到），所以在运行时把指针
+ * 换成计数版：第一次帧钩子时安装，之后每个 draw +1。 */
+static void (*g_real_draw_arrays)(unsigned int, int, int);
+static unsigned g_draw_calls_frame, g_draw_calls_report;
+extern void (*glad_glDrawArrays)(unsigned int mode, int first, int count);
+static void wiliwili_counting_draw_arrays(unsigned int mode, int first, int count) {
+    ++g_draw_calls_frame;
+    g_real_draw_arrays(mode, first, count);
+}
+static void wiliwili_draw_counter_install(void) {
+    if (g_real_draw_arrays == 0 && glad_glDrawArrays != 0) {
+        g_real_draw_arrays = glad_glDrawArrays;
+        glad_glDrawArrays  = wiliwili_counting_draw_arrays;
+    }
+}
+
+void wiliwili_frame_phase_begin(void) {
+    if (g_real_draw_arrays == 0) wiliwili_draw_counter_install();
+    g_t0 = phase_now_us();
+}
+/* beginFrame+clear 的结束点：由 SDLVideoContext::clear() 调用（见 sdl_video.cpp）。 */
+void wiliwili_frame_phase_clear(void) { g_t_clear = phase_now_us(); }
+void wiliwili_frame_phase_ui(void) { g_t1 = phase_now_us(); }
+void wiliwili_frame_phase_video_begin(void) { g_t2 = phase_now_us(); }
+/* 视频画完的时刻：视频已挪到 UI 之前，submit 段现在只含 nvgEndFrame。 */
+void wiliwili_frame_phase_video_end(void) { g_t_video_end = phase_now_us(); }
 void wiliwili_frame_phase_submit(void) {
-    long long now = phase_now_us();
-    g_phase_submit_us = now - g_phase_submit_us;
-    g_phase_swap_us   = now;
+    g_t3        = phase_now_us();
+    g_clear_us  = g_t_clear - g_t0;
+    g_ui_us     = g_t1 - g_t_clear;
+    g_video_us  = g_t_video_end - g_t2;
+    g_submit_us = g_t3 - g_t_video_end;
 }
 void wiliwili_frame_phase_swap(void) {
     long long now = phase_now_us();
-    g_phase_swap_us = now - g_phase_swap_us;
-    extern int wiliwili_trace_enabled(void);
-    if (++g_phase_frames >= 30 && wiliwili_trace_enabled()) {
-        char lb[160];
-        snprintf(lb, sizeof(lb), "frame: submit=%lldms swap=%lldms",
-                 g_phase_submit_us / 1000, g_phase_swap_us / 1000);
-        wiliwili_boot_log(lb);
-        g_phase_frames = 0;
+    g_swap_us     = now - g_t3;
+    /* 每 30 帧计数一次，但每行都要 open/write/fsync/close；AGC 已有 agc health，只有诊断时
+     * 用 WILIWILI_TRACE 打开此逐帧段统计，避免正常运行被文件日志拖慢。 */
+    if (++g_phase_frames >= 30) {
+        if (wiliwili_trace_enabled()) {
+            char lb[256];
+            snprintf(lb, sizeof(lb), "frame: clear=%lldms ui=%lldms submit=%lldms video=%lldms swap=%lldms calls=%u/30",
+                     g_clear_us / 1000, g_ui_us / 1000, g_submit_us / 1000, g_video_us / 1000, g_swap_us / 1000,
+                     g_draw_calls_frame - g_draw_calls_report);
+            wiliwili_boot_log(lb);
+        }
+        g_phase_frames      = 0;
+        g_draw_calls_report = g_draw_calls_frame;
     }
 }
 static double g_upload_ms_total;
@@ -264,9 +307,9 @@ void wiliwili_videodec2_probe(void) {
 
     ComputeConfigInfo cc;
     memset(&cc, 0, sizeof(cc));
-    cc.size            = sizeof(cc);
+    cc.size             = sizeof(cc);
     void *compute_queue = NULL;
-    rc                 = sceVideodec2AllocateComputeQueue(&cc, &cm, &compute_queue);
+    rc                  = sceVideodec2AllocateComputeQueue(&cc, &cm, &compute_queue);
     log2("vdec: compute_queue rc=%d", rc, 0);
     if (rc != 0) return;
 
@@ -296,11 +339,11 @@ void wiliwili_videodec2_probe(void) {
     uint64_t cpu_size = align16k(mem.cpu_size);
     void *cpu_ws      = NULL;
     if (cpu_size) sceKernelMapNamedFlexibleMemory(&cpu_ws, (size_t)cpu_size, 0x03, 0, "VdecCpu");
-    mem.cpu      = cpu_ws;
-    mem.cpu_size = cpu_size;
-    uint64_t gpu_size = align16k(mem.gpu_size);
-    mem.gpu           = gpu_size ? alloc_direct(limit, gpu_size, 0x32) : NULL;
-    mem.gpu_size      = gpu_size;
+    mem.cpu               = cpu_ws;
+    mem.cpu_size          = cpu_size;
+    uint64_t gpu_size     = align16k(mem.gpu_size);
+    mem.gpu               = gpu_size ? alloc_direct(limit, gpu_size, 0x32) : NULL;
+    mem.gpu_size          = gpu_size;
     uint64_t cpu_gpu_size = align16k(mem.cpu_gpu_size);
     mem.cpu_gpu           = cpu_gpu_size ? alloc_direct(limit, cpu_gpu_size, 0x33) : NULL;
     mem.cpu_gpu_size      = cpu_gpu_size;
@@ -331,10 +374,10 @@ void wiliwili_videodec2_probe(void) {
     log2("vdec: aus=%d", g_au_count, 0);
 
     /* 连续解：环状 AU/帧槽，valid 时把 Y 平面拷进稳定缓冲 */
-    int decoded  = 0;
-    int buffered = 0;
+    int decoded     = 0;
+    int buffered    = 0;
     double total_ms = 0.0;
-    int slot = 0;
+    int slot        = 0;
     for (g_au_index = 0; g_au_index < g_au_count; ++g_au_index) {
         uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
         memcpy(au_slot, g_stream + g_au_offset[g_au_index], (size_t)g_au_size[g_au_index]);
@@ -372,11 +415,11 @@ void wiliwili_videodec2_probe(void) {
         if (rc == 0 && out.valid) {
             ++decoded;
             /* 拷一份 Y 平面（NV12：Y 在前，pitch 个采样一行） */
-            int copy_w = (int)out.width < 1920 ? (int)out.width : 1920;
-            int copy_h = (int)out.height < 1088 ? (int)out.height : 1088;
-            g_y_width  = copy_w;
-            g_y_height = copy_h;
-            g_y_pitch  = (int)out.pitch;
+            int copy_w         = (int)out.width < 1920 ? (int)out.width : 1920;
+            int copy_h         = (int)out.height < 1088 ? (int)out.height : 1088;
+            g_y_width          = copy_w;
+            g_y_height         = copy_h;
+            g_y_pitch          = (int)out.pitch;
             const uint8_t *src = (const uint8_t *)out.buffer;
             /* Y：前 height 行；UV：紧跟其后、半高度（NV12 交织 CbCr）。都紧打包，便于直接上传。 */
             for (int y = 0; y < copy_h; ++y)
@@ -410,9 +453,7 @@ void wiliwili_draw_nv12(struct NVGcontext *vg, const uint8_t *y_plane, const uin
 
 void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     (void)vg;
-    /* 注意：**不要**在这里判 g_ready —— 它是本探针自己的状态，只有 WILIWILI_TEST_VDEC 会置位。
-     * 播放器（scripts/ps5/native/ps5_player.c）复用本函数做 NV12 上屏，一旦依赖它就永远
-     * 在第一行 return：真机表现为"解码全部 valid=1、也有声音，但屏幕全白"。只用尺寸判断。 */
+    /* 探针只有在 WILIWILI_TEST_VDEC 下才会产生帧；无帧时不触碰 GL 状态。 */
     if (g_y_width <= 0) return;
 
     typedef unsigned int GLenum_t;
@@ -466,29 +507,29 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
 
     if (p_tex_image == NULL) {
         void *(*get)(const char *) = SDL_GL_GetProcAddress;
-        p_tex_image      = (PFN_TexImage2D)get("glTexImage2D");
-        p_tex_sub        = (PFN_TexSubImage2D)get("glTexSubImage2D");
-        p_gen_textures   = (PFN_GenTextures)get("glGenTextures");
-        p_bind_texture   = (PFN_BindTexture)get("glBindTexture");
-        p_tex_param      = (PFN_TexParameteri)get("glTexParameteri");
-        p_pixel_store    = (PFN_PixelStorei)get("glPixelStorei");
-        p_active_texture = (PFN_ActiveTexture)get("glActiveTexture");
-        p_create_shader  = (PFN_CreateShader)get("glCreateShader");
-        p_shader_source  = (PFN_ShaderSource)get("glShaderSource");
-        p_compile_shader = (PFN_CompileShader)get("glCompileShader");
-        p_get_shader_iv  = (PFN_GetShaderiv)get("glGetShaderiv");
-        p_shader_log     = (PFN_GetShaderInfoLog)get("glGetShaderInfoLog");
-        p_create_program = (PFN_CreateProgram)get("glCreateProgram");
-        p_attach_shader  = (PFN_AttachShader)get("glAttachShader");
-        p_link_program   = (PFN_LinkProgram)get("glLinkProgram");
-        p_get_program_iv = (PFN_GetProgramiv)get("glGetProgramiv");
-        p_use_program    = (PFN_UseProgram)get("glUseProgram");
-        p_uniform_location = (PFN_GetUniformLocation)get("glGetUniformLocation");
-        p_uniform1i      = (PFN_Uniform1i)get("glUniform1i");
-        p_gen_vaos       = (PFN_GenVertexArrays)get("glGenVertexArrays");
-        p_bind_vao       = (PFN_BindVertexArray)get("glBindVertexArray");
-        p_draw_arrays    = (PFN_DrawArrays)get("glDrawArrays");
-        p_get_error      = (PFN_GetError)get("glGetError");
+        p_tex_image                = (PFN_TexImage2D)get("glTexImage2D");
+        p_tex_sub                  = (PFN_TexSubImage2D)get("glTexSubImage2D");
+        p_gen_textures             = (PFN_GenTextures)get("glGenTextures");
+        p_bind_texture             = (PFN_BindTexture)get("glBindTexture");
+        p_tex_param                = (PFN_TexParameteri)get("glTexParameteri");
+        p_pixel_store              = (PFN_PixelStorei)get("glPixelStorei");
+        p_active_texture           = (PFN_ActiveTexture)get("glActiveTexture");
+        p_create_shader            = (PFN_CreateShader)get("glCreateShader");
+        p_shader_source            = (PFN_ShaderSource)get("glShaderSource");
+        p_compile_shader           = (PFN_CompileShader)get("glCompileShader");
+        p_get_shader_iv            = (PFN_GetShaderiv)get("glGetShaderiv");
+        p_shader_log               = (PFN_GetShaderInfoLog)get("glGetShaderInfoLog");
+        p_create_program           = (PFN_CreateProgram)get("glCreateProgram");
+        p_attach_shader            = (PFN_AttachShader)get("glAttachShader");
+        p_link_program             = (PFN_LinkProgram)get("glLinkProgram");
+        p_get_program_iv           = (PFN_GetProgramiv)get("glGetProgramiv");
+        p_use_program              = (PFN_UseProgram)get("glUseProgram");
+        p_uniform_location         = (PFN_GetUniformLocation)get("glGetUniformLocation");
+        p_uniform1i                = (PFN_Uniform1i)get("glUniform1i");
+        p_gen_vaos                 = (PFN_GenVertexArrays)get("glGenVertexArrays");
+        p_bind_vao                 = (PFN_BindVertexArray)get("glBindVertexArray");
+        p_draw_arrays              = (PFN_DrawArrays)get("glDrawArrays");
+        p_get_error                = (PFN_GetError)get("glGetError");
     }
     if (p_tex_sub == NULL || p_draw_arrays == NULL) return;
 
@@ -516,8 +557,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         p_tex_param(0x0DE1, 0x2800, 0x2600);
         p_tex_param(0x0DE1, 0x2802, 0x812F);
         p_tex_param(0x0DE1, 0x2803, 0x812F);
-        p_tex_image(0x0DE1, 0, 0x822B /*RG8*/, g_y_width / 2, g_y_height / 2, 0, 0x8227 /*RG*/, 0x1401,
-                    g_uv_plane_ptr);
+        p_tex_image(0x0DE1, 0, 0x822B /*RG8*/, g_y_width / 2, g_y_height / 2, 0, 0x8227 /*RG*/, 0x1401, g_uv_plane_ptr);
 
         static const char *vs_src =
             "#version 330 core\n"
@@ -530,9 +570,9 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         static const char *fs_src =
             "#version 330 core\n"
             "in vec2 v_uv;\n"
-            "uniform int u_flip;\n"      /* 0=不翻 1=水平 2=垂直 3=180 */
+            "uniform int u_flip;\n" /* 0=不翻 1=水平 2=垂直 3=180 */
             "uniform int u_swap;\n"
-            "uniform int u_709;\n"      /* 1=交换 U/V */
+            "uniform int u_709;\n" /* 1=交换 U/V */
             "uniform sampler2D u_y;\n"
             "uniform sampler2D u_uv;\n"
             "out vec4 o_color;\n"
@@ -584,7 +624,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
             wiliwili_boot_log("vdec: program link failed");
             return;
         }
-        u_y_loc  = p_uniform_location(program, "u_y");
+        u_y_loc    = p_uniform_location(program, "u_y");
         u_uv_loc   = p_uniform_location(program, "u_uv");
         u_flip_loc = p_uniform_location(program, "u_flip");
         u_swap_loc = p_uniform_location(program, "u_swap");
@@ -605,8 +645,7 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         p_bind_texture(0x0DE1, tex_y);
         p_tex_image(0x0DE1, 0, 0x8229 /*R8*/, g_y_width, g_y_height, 0, 0x1903 /*RED*/, 0x1401, g_y_plane_ptr);
         p_bind_texture(0x0DE1, tex_uv);
-        p_tex_image(0x0DE1, 0, 0x822B /*RG8*/, g_y_width / 2, g_y_height / 2, 0, 0x8227 /*RG*/, 0x1401,
-                    g_uv_plane_ptr);
+        p_tex_image(0x0DE1, 0, 0x822B /*RG8*/, g_y_width / 2, g_y_height / 2, 0, 0x8227 /*RG*/, 0x1401, g_uv_plane_ptr);
     }
     ++g_y_uploads;
 
@@ -624,7 +663,10 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
     static unsigned gl_err_seen, gl_err_last;
     if (p_get_error) {
         GLenum_t e = 0;
-        while ((e = p_get_error()) != 0) { ++gl_err_seen; gl_err_last = (unsigned)e; }
+        while ((e = p_get_error()) != 0) {
+            ++gl_err_seen;
+            gl_err_last = (unsigned)e;
+        }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_upload_ms_total += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
@@ -637,7 +679,8 @@ void wiliwili_videodec2_draw(struct NVGcontext *vg) {
         report_at = 0;
         char line[200];
         snprintf(line, sizeof(line), "vdec: fps~%d upload_avg_x100=%d glerr=%u last=0x%x uploads=%u", (int)g_draws / 3,
-                 (int)(g_upload_ms_total / (double)g_y_uploads * 100.0), gl_err_seen, gl_err_last, (unsigned)g_y_uploads);
+                 (int)(g_upload_ms_total / (double)g_y_uploads * 100.0), gl_err_seen, gl_err_last,
+                 (unsigned)g_y_uploads);
         wiliwili_boot_log(line);
         g_draws = 0;
     }

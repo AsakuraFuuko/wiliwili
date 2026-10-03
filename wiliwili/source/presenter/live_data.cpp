@@ -121,7 +121,7 @@ void LiveDataRequest::requestLiveAnchorInfo(int roomid) {
         // 从liveRoomPlayInfo中获取的数据
         std::string uid = std::to_string(liveRoomPlayInfo.uid);
         brls::Logger::debug("get live anchor info, uid: {}", uid);
-        
+
         // 调用已有的用户卡片API
         std::vector<std::string> uids = {uid};
         ASYNC_RETAIN
@@ -129,9 +129,9 @@ void LiveDataRequest::requestLiveAnchorInfo(int roomid) {
             uids,
             [ASYNC_TOKEN](const bilibili::UserCardListResult& result) {
                 if (!result.empty()) {
-                    std::string face = result[0].face;
+                    std::string face  = result[0].face;
                     std::string uname = result[0].name;
-                    
+
                     brls::sync([ASYNC_TOKEN, face, uname]() {
                         ASYNC_RELEASE
                         this->onAnchorInfo(face, uname);
@@ -147,8 +147,7 @@ void LiveDataRequest::requestLiveAnchorInfo(int roomid) {
                     ASYNC_RELEASE
                     this->onAnchorInfo("", "主播");
                 });
-            }
-        );
+            });
     } else {
         brls::Logger::error("get live anchor info: no uid available");
         this->onAnchorInfo("", "主播");
@@ -158,39 +157,38 @@ void LiveDataRequest::requestLiveAnchorInfo(int roomid) {
 // 新增：获取主播称号信息
 void LiveDataRequest::requestLiveAnchorTitle(int roomid) {
     brls::Logger::debug("requesting anchor title for room: {}", roomid);
-    
+
     ASYNC_RETAIN
     cpr::Parameters params = {{"roomid", std::to_string(roomid)}};
-    cpr::Url url = cpr::Url{"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room"};
-    
+    cpr::Url url           = cpr::Url{"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room"};
+
     auto session = bilibili::HTTP::createSession();
     session->SetUrl(url);
     session->SetParameters(params);
-    
-    session->GetCallback<>(
-        [ASYNC_TOKEN](const cpr::Response& r) {
-            if (r.status_code == 200) {
-                try {
-                    auto json = nlohmann::json::parse(r.text);
-                    std::string title = "";
-                    
-                    if (json.contains("data") && json["data"].contains("info") && 
-                        json["data"]["info"].contains("official_verify") && 
-                        json["data"]["info"]["official_verify"].contains("desc")) {
-                        title = json["data"]["info"]["official_verify"]["desc"].get<std::string>();
-                    }
-                    
-                    brls::sync([ASYNC_TOKEN, title]() {
-                        ASYNC_RELEASE
-                        this->onAnchorTitleInfo(title);
-                    });
-                } catch (const std::exception& e) {
-                    brls::Logger::error("Failed to parse anchor title data: {}", e.what());
-                    ASYNC_RELEASE
+
+    bilibili::HTTP::runAsync(session, [ASYNC_TOKEN](const cpr::Response& r) {
+        if (r.status_code == 200) {
+            try {
+                auto json         = nlohmann::json::parse(r.text);
+                std::string title = "";
+
+                if (json.contains("data") && json["data"].contains("info") &&
+                    json["data"]["info"].contains("official_verify") &&
+                    json["data"]["info"]["official_verify"].contains("desc")) {
+                    title = json["data"]["info"]["official_verify"]["desc"].get<std::string>();
                 }
-            } else {
-                brls::Logger::error("Failed to get anchor title: HTTP {}", r.status_code);
+
+                brls::sync([ASYNC_TOKEN, title]() {
+                    ASYNC_RELEASE
+                    this->onAnchorTitleInfo(title);
+                });
+            } catch (const std::exception& e) {
+                brls::Logger::error("Failed to parse anchor title data: {}", e.what());
                 ASYNC_RELEASE
             }
-        });
+        } else {
+            brls::Logger::error("Failed to get anchor title: HTTP {}", r.status_code);
+            ASYNC_RELEASE
+        }
+    });
 }

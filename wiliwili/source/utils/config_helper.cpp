@@ -38,7 +38,6 @@ extern "C" int sceSslInit(size_t);
 #define WILI_BOOT_LOG(message) (void)0
 #endif
 
-
 #include "pystring.h"
 #include "utils/crash_helper.hpp"
 #include "utils/vibration_helper.hpp"
@@ -73,12 +72,11 @@ extern in_addr_t secondary_dns;
 #include <psp2/vshbridge.h>
 #include <psp2/gxm.h>
 #include <psp2/kernel/sysmem.h>
-extern "C"
-{
+extern "C" {
 unsigned int _newlib_heap_size_user      = 220 * 1024 * 1024;
 unsigned int _pthread_stack_default_user = 2 * 1024 * 1024;
 #ifndef BOREALIS_USE_GXM
-unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
+unsigned int sceLibcHeapSize = 24 * 1024 * 1024;
 #endif
 }
 #endif
@@ -231,7 +229,8 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
 #endif
     {SettingItem::PLAYER_HWDEC_CUSTOM, {"player_hwdec_custom", {}, {}, 0}},
     {SettingItem::PLAYER_EXIT_FULLSCREEN_ON_END, {"player_exit_fullscreen_on_end", {}, {}, 1}},
-    {SettingItem::PLAYER_WINDOW_FULLSCREEN_ON_APP_FULLSCREEN, {"player_window_fullscreen_on_app_fullscreen", {}, {}, 0}},
+    {SettingItem::PLAYER_WINDOW_FULLSCREEN_ON_APP_FULLSCREEN,
+     {"player_window_fullscreen_on_app_fullscreen", {}, {}, 0}},
     {SettingItem::PLAYER_AUTO_FULLSCREEN, {"player_auto_fullscreen", {}, {}, 0}},
     {SettingItem::PLAYER_OSD_TV_MODE, {"player_osd_tv_mode", {}, {}, 0}},
     {SettingItem::OPENCC_ON, {"opencc", {}, {}, 1}},
@@ -254,7 +253,7 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
       1}},
 #endif
 
-    /// number
+/// number
 #if defined(__PSV__)
     {SettingItem::PLAYER_INMEMORY_CACHE, {"player_inmemory_cache", {"0MB", "1MB", "5MB", "10MB"}, {0, 1, 5, 10}, 0}},
 #elif defined(__SWITCH__)
@@ -278,7 +277,11 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::VIDEO_QUALITY_PORTRAIT_MAX, {"video_quality_portrait_max", {}, {}, 128}},
     {SettingItem::IMAGE_REQUEST_THREADS,
      {"image_request_threads",
-#if defined(__SWITCH__) || defined(__PSV__)
+#if defined(PS5_NATIVE_APP)
+      {"2", "3", "4"},
+      {2, 3, 4},
+      2}},
+#elif defined(__SWITCH__) || defined(__PSV__)
       {"1", "2", "3", "4"},
       {1, 2, 3, 4},
       1}},
@@ -290,7 +293,10 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::VIDEO_FORMAT, {"file_format", {"Dash (AVC/HEVC/AV1)", "FLV/MP4"}, {4048, 0}, 0}},
     {SettingItem::VIDEO_CODEC, {"video_codec", {"AVC/H.264", "HEVC/H.265", "AV1"}, {7, 12, 13}, 0}},
     {SettingItem::AUDIO_QUALITY,
-     {"audio_quality", {"Dolby Atmos", "Hi-Res", "High", "Medium", "Low"}, {30250, 30251, 30280, 30232, 30216}, WILI_AUDIO_QUALITY_DEFAULT}},
+     {"audio_quality",
+      {"Dolby Atmos", "Hi-Res", "High", "Medium", "Low"},
+      {30250, 30251, 30280, 30232, 30216},
+      WILI_AUDIO_QUALITY_DEFAULT}},
     {SettingItem::DANMAKU_FILTER_LEVEL,
      {"danmaku_filter_level", {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 0}},
     {SettingItem::DANMAKU_STYLE_AREA, {"danmaku_style_area", {"1/4", "1/2", "3/4", "1"}, {25, 50, 75, 100}, 3}},
@@ -586,14 +592,13 @@ void ProgramConfig::load() {
     }
 
     // 初始化视频清晰度最高限制
-    VideoDetail::landscapeQualityMax = getSettingItem(SettingItem::VIDEO_QUALITY_LANDSCAPE_MAX,
-                                                      WILI_VIDEO_QUALITY_LANDSCAPE_MAX);
-    VideoDetail::portraitQualityMax = getSettingItem(SettingItem::VIDEO_QUALITY_PORTRAIT_MAX,
-                                                     WILI_VIDEO_QUALITY_PORTRAIT_MAX);
+    VideoDetail::landscapeQualityMax =
+        getSettingItem(SettingItem::VIDEO_QUALITY_LANDSCAPE_MAX, WILI_VIDEO_QUALITY_LANDSCAPE_MAX);
+    VideoDetail::portraitQualityMax =
+        getSettingItem(SettingItem::VIDEO_QUALITY_PORTRAIT_MAX, WILI_VIDEO_QUALITY_PORTRAIT_MAX);
 
     // 初始化视频清晰度
-    VideoDetail::defaultQuality = getSettingItem(SettingItem::VIDEO_QUALITY,
-                                                 WILI_VIDEO_QUALITY_DEFAULT);
+    VideoDetail::defaultQuality = getSettingItem(SettingItem::VIDEO_QUALITY, WILI_VIDEO_QUALITY_DEFAULT);
     if (!hasLoginInfo()) {
         // 用户未登录时跟随官方将默认清晰度设置到 360P
         VideoDetail::defaultQuality = 16;
@@ -616,20 +621,20 @@ void ProgramConfig::load() {
     MPVCore::VIDEO_GAMMA      = getSettingItem(SettingItem::PLAYER_GAMMA, 0);
 
     // 初始化弹幕相关内容
-    DanmakuCore::DANMAKU_ON = getBoolOption(SettingItem::DANMAKU_ON);
-    DanmakuCore::DANMAKU_SMART_MASK = getBoolOption(SettingItem::DANMAKU_SMART_MASK);
-    DanmakuCore::DANMAKU_FILTER_SHOW_TOP = getBoolOption(SettingItem::DANMAKU_FILTER_TOP);
-    DanmakuCore::DANMAKU_FILTER_SHOW_BOTTOM = getBoolOption(SettingItem::DANMAKU_FILTER_BOTTOM);
-    DanmakuCore::DANMAKU_FILTER_SHOW_SCROLL = getBoolOption(SettingItem::DANMAKU_FILTER_SCROLL);
-    DanmakuCore::DANMAKU_FILTER_SHOW_COLOR = getBoolOption(SettingItem::DANMAKU_FILTER_COLOR);
-    DanmakuCore::DANMAKU_FILTER_SHOW_ADVANCED = getBoolOption(SettingItem::DANMAKU_FILTER_ADVANCED);
-    DanmakuCore::DANMAKU_FILTER_LEVEL = getIntOption(SettingItem::DANMAKU_FILTER_LEVEL);
+    DanmakuCore::DANMAKU_ON                    = getBoolOption(SettingItem::DANMAKU_ON);
+    DanmakuCore::DANMAKU_SMART_MASK            = getBoolOption(SettingItem::DANMAKU_SMART_MASK);
+    DanmakuCore::DANMAKU_FILTER_SHOW_TOP       = getBoolOption(SettingItem::DANMAKU_FILTER_TOP);
+    DanmakuCore::DANMAKU_FILTER_SHOW_BOTTOM    = getBoolOption(SettingItem::DANMAKU_FILTER_BOTTOM);
+    DanmakuCore::DANMAKU_FILTER_SHOW_SCROLL    = getBoolOption(SettingItem::DANMAKU_FILTER_SCROLL);
+    DanmakuCore::DANMAKU_FILTER_SHOW_COLOR     = getBoolOption(SettingItem::DANMAKU_FILTER_COLOR);
+    DanmakuCore::DANMAKU_FILTER_SHOW_ADVANCED  = getBoolOption(SettingItem::DANMAKU_FILTER_ADVANCED);
+    DanmakuCore::DANMAKU_FILTER_LEVEL          = getIntOption(SettingItem::DANMAKU_FILTER_LEVEL);
     LiveDanmakuCore::DANMAKU_FILTER_LEVEL_LIVE = getIntOption(SettingItem::LIVE_DANMAKU_FILTER_LEVEL);
-    DanmakuCore::DANMAKU_STYLE_AREA = getIntOption(SettingItem::DANMAKU_STYLE_AREA);
-    DanmakuCore::DANMAKU_STYLE_ALPHA = getIntOption(SettingItem::DANMAKU_STYLE_ALPHA);
-    DanmakuCore::DANMAKU_STYLE_FONTSIZE = getIntOption(SettingItem::DANMAKU_STYLE_FONTSIZE);
-    DanmakuCore::DANMAKU_STYLE_LINE_HEIGHT = getIntOption(SettingItem::DANMAKU_STYLE_LINE_HEIGHT);
-    DanmakuCore::DANMAKU_STYLE_SPEED = getIntOption(SettingItem::DANMAKU_STYLE_SPEED);
+    DanmakuCore::DANMAKU_STYLE_AREA            = getIntOption(SettingItem::DANMAKU_STYLE_AREA);
+    DanmakuCore::DANMAKU_STYLE_ALPHA           = getIntOption(SettingItem::DANMAKU_STYLE_ALPHA);
+    DanmakuCore::DANMAKU_STYLE_FONTSIZE        = getIntOption(SettingItem::DANMAKU_STYLE_FONTSIZE);
+    DanmakuCore::DANMAKU_STYLE_LINE_HEIGHT     = getIntOption(SettingItem::DANMAKU_STYLE_LINE_HEIGHT);
+    DanmakuCore::DANMAKU_STYLE_SPEED           = getIntOption(SettingItem::DANMAKU_STYLE_SPEED);
     DanmakuCore::DANMAKU_STYLE_FONT = DanmakuFontStyle{getStringOptionIndex(SettingItem::DANMAKU_STYLE_FONT)};
 
     DanmakuCore::DANMAKU_RENDER_QUALITY = getIntOption(SettingItem::DANMAKU_RENDER_QUALITY);
@@ -711,7 +716,7 @@ void ProgramConfig::load() {
 
     // 初始化i18n
     std::set<std::string> i18nData{
-        brls::LOCALE_AUTO, brls::LOCALE_EN_US, brls::LOCALE_JA, brls::LOCALE_RYU,
+        brls::LOCALE_AUTO,    brls::LOCALE_EN_US,   brls::LOCALE_JA, brls::LOCALE_RYU,
         brls::LOCALE_ZH_HANS, brls::LOCALE_ZH_HANT, brls::LOCALE_Ko, brls::LOCALE_IT,
     };
     std::string langData = getSettingItem(SettingItem::APP_LANG, brls::LOCALE_AUTO);
@@ -748,18 +753,18 @@ void ProgramConfig::load() {
     // 初始化快捷键
     ShortcutHelper::setRefresh(getSettingItem(SettingItem::SHORTCUT_REFRESH, std::string{
 #ifdef __APPLE__
-                                                  "meta-r"
+                                                                                 "meta-r"
 #else
-                                                  "ctrl-r"
+                                                                                 "ctrl-r"
 #endif
-                                              }));
+                                                                             }));
     ShortcutHelper::setSearch(getSettingItem(SettingItem::SHORTCUT_SEARCH, std::string{
 #ifdef __APPLE__
-                                                 "meta-f"
+                                                                               "meta-f"
 #else
-                                                 "ctrl-f"
+                                                                               "ctrl-f"
 #endif
-                                             }));
+                                                                           }));
 
     ShortcutHelper::setLast(getSettingItem(SettingItem::SHORTCUT_LAST, std::string{"pgup"}));
     ShortcutHelper::setNext(getSettingItem(SettingItem::SHORTCUT_NEXT, std::string{"pgdn"}));
@@ -812,7 +817,10 @@ void ProgramConfig::load() {
         }
 
         // 初始化纹理缓存数量
-#if defined(__PSV__) || defined(PS4)
+#if defined(PS5_NATIVE_APP)
+        // Keep native card textures bounded: their direct-memory pool is also used by video/UI textures.
+        brls::TextureCache::instance().cache.setCapacityExact(24);
+#elif defined(__PSV__) || defined(PS4)
         brls::TextureCache::instance().cache.setCapacity(1);
 #else
         brls::TextureCache::instance().cache.setCapacity(getSettingItem(SettingItem::TEXTURE_CACHE_NUM, 200));
@@ -840,7 +848,7 @@ void ProgramConfig::load() {
                         ProgramConfig::instance().toggleFullscreen();
                         break;
 #else
-                        // macOS 可以直接使用 ctrl-cmd-f 官方快捷键
+                // macOS 可以直接使用 ctrl-cmd-f 官方快捷键
 #endif
                     default:
                         break;
@@ -891,13 +899,11 @@ int ProgramConfig::getIntOption(SettingItem item) {
             return this->setting.at(optionData.key).get<int>();
         } catch (const std::exception& e) {
             brls::Logger::error("Damaged config found: {}/{}", optionData.key, e.what());
-            if (!optionData.rawOptionList.empty())
-                return optionData.rawOptionList[optionData.defaultOption];
+            if (!optionData.rawOptionList.empty()) return optionData.rawOptionList[optionData.defaultOption];
             return 0;
         }
     }
-    if (!optionData.rawOptionList.empty())
-        return optionData.rawOptionList[optionData.defaultOption];
+    if (!optionData.rawOptionList.empty()) return optionData.rawOptionList[optionData.defaultOption];
     return 0;
 }
 
@@ -958,7 +964,7 @@ void ProgramConfig::checkOnTop() {
             return;
         case 2: {
             // 自动模式，根据窗口大小判断是否需要切换到置顶模式
-            double factor = brls::Application::getPlatform()->getVideoContext()->getScaleFactor();
+            double factor     = brls::Application::getPlatform()->getVideoContext()->getScaleFactor();
             uint32_t minWidth = ProgramConfig::instance().getIntOption(SettingItem::ON_TOP_WINDOW_WIDTH) * factor + 0.1;
             uint32_t minHeight =
                 ProgramConfig::instance().getIntOption(SettingItem::ON_TOP_WINDOW_HEIGHT) * factor + 0.1;
@@ -974,35 +980,28 @@ void ProgramConfig::checkOnTop() {
 #ifdef __PSV__
 #define MEM_POOL_SIZE (26 * 1024 * 1024)
 #define MEM_POOL_TYPE SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW
-static void *s_mspace = nullptr;
-static SceUID mempool_id = 0;
-static void *mempool_addr = nullptr;
+static void* s_mspace      = nullptr;
+static SceUID mempool_id   = 0;
+static void* mempool_addr  = nullptr;
 static size_t mempool_size = MEM_POOL_SIZE;
 
 int __attribute__((optimize("no-optimize-sibling-calls"))) malloc_finalize() {
-    if (s_mspace)
-        sceClibMspaceDestroy(s_mspace);
-    if (mempool_addr)
-        sceGxmUnmapMemory(mempool_addr);
-    if (mempool_id)
-        sceKernelFreeMemBlock(mempool_id);
+    if (s_mspace) sceClibMspaceDestroy(s_mspace);
+    if (mempool_addr) sceGxmUnmapMemory(mempool_addr);
+    if (mempool_id) sceKernelFreeMemBlock(mempool_id);
     return 0;
 }
 
 int malloc_init() {
     int res;
-    if (s_mspace)
-        return 0;
+    if (s_mspace) return 0;
     mempool_id = sceKernelAllocMemBlock("curl_mempool", MEM_POOL_TYPE, mempool_size, NULL);
     sceKernelGetMemBlockBase(mempool_id, &mempool_addr);
-    if (!mempool_addr)
-        goto error;
+    if (!mempool_addr) goto error;
     res = sceGxmMapMemory(mempool_addr, mempool_size, SCE_GXM_MEMORY_ATTRIB_RW);
-    if (res != SCE_OK)
-        goto error;
+    if (res != SCE_OK) goto error;
     s_mspace = sceClibMspaceCreate(mempool_addr, mempool_size);
-    if (!s_mspace)
-        goto error;
+    if (!s_mspace) goto error;
 
     return 0;
 error:
@@ -1010,39 +1009,33 @@ error:
     return 1;
 }
 
-void __attribute__((optimize("no-optimize-sibling-calls"))) *sce_malloc(size_t size) {
-    if (!s_mspace)
-        malloc_init();
+void __attribute__((optimize("no-optimize-sibling-calls"))) * sce_malloc(size_t size) {
+    if (!s_mspace) malloc_init();
     return sceClibMspaceMalloc(s_mspace, size);
 }
 
-void __attribute__((optimize("no-optimize-sibling-calls"))) sce_free(void *ptr) {
-    if (!ptr || !s_mspace)
-        return;
+void __attribute__((optimize("no-optimize-sibling-calls"))) sce_free(void* ptr) {
+    if (!ptr || !s_mspace) return;
     sceClibMspaceFree(s_mspace, ptr);
 }
 
-void __attribute__((optimize("no-optimize-sibling-calls"))) *sce_calloc(size_t nelem, size_t size) {
-    if (!s_mspace)
-        malloc_init();
+void __attribute__((optimize("no-optimize-sibling-calls"))) * sce_calloc(size_t nelem, size_t size) {
+    if (!s_mspace) malloc_init();
     return sceClibMspaceCalloc(s_mspace, nelem, size);
 }
 
-void __attribute__((optimize("no-optimize-sibling-calls"))) *sce_realloc(void *ptr, size_t size) {
-    if (!s_mspace)
-        malloc_init();
+void __attribute__((optimize("no-optimize-sibling-calls"))) * sce_realloc(void* ptr, size_t size) {
+    if (!s_mspace) malloc_init();
     return sceClibMspaceRealloc(s_mspace, ptr, size);
 }
 
-char __attribute__((optimize("no-optimize-sibling-calls"))) *sce_strdup(const char *str) {
+char __attribute__((optimize("no-optimize-sibling-calls"))) * sce_strdup(const char* str) {
     size_t len;
-    char *newstr;
-    if(!str)
-        return (char *)nullptr;
-    len = strlen(str) + 1;
-    newstr = (char *)sce_malloc(len);
-    if(!newstr)
-        return (char *)nullptr;
+    char* newstr;
+    if (!str) return (char*)nullptr;
+    len    = strlen(str) + 1;
+    newstr = (char*)sce_malloc(len);
+    if (!newstr) return (char*)nullptr;
     sceClibMemcpy(newstr, str, len);
     return newstr;
 }
@@ -1070,8 +1063,7 @@ void ProgramConfig::init() {
         int poolId   = sceNetPoolCreate("wiliwili", 32 * 1024, 0);
         int sslId    = sceSslInit(256 * 1024);
         char message[96];
-        std::snprintf(message, sizeof(message),
-                      "wiliwili: net init=%#x pool=%d ssl=%d", netError, poolId, sslId);
+        std::snprintf(message, sizeof(message), "wiliwili: net init=%#x pool=%d ssl=%d", netError, poolId, sslId);
         wiliwili_boot_log(message);
         WILI_BOOT_LOG(message);
     }
@@ -1088,10 +1080,8 @@ void ProgramConfig::init() {
 #if defined(_MSC_VER)
 #elif defined(__PSV__)
     int search_unk[2];
-    if(_vshKernelSearchModuleByName("CapUnlocker", search_unk) >= 0) {
-        brls::sync([]() {
-            brls::Application::notify("CapUnlocker found");
-        });
+    if (_vshKernelSearchModuleByName("CapUnlocker", search_unk) >= 0) {
+        brls::sync([]() { brls::Application::notify("CapUnlocker found"); });
         sceKernelChangeThreadPriority(SCE_KERNEL_THREAD_ID_SELF, 64);
         sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF, SCE_KERNEL_CPU_MASK_SYSTEM);
     }
@@ -1152,15 +1142,13 @@ void ProgramConfig::init() {
 
     // set bilibili cookie and cookie update callback
     Cookie diskCookie = this->getCookie();
-    BILI::init(
-        diskCookie,
-        [](const Cookie& newCookie, const std::string& token) {
-            brls::Logger::info("======== write cookies to disk");
-            ProgramConfig::instance().setCookie(newCookie);
-            ProgramConfig::instance().setRefreshToken(token);
-            // 用户重新登录后，恢复默认清晰度设置
-            VideoDetail::defaultQuality = WILI_VIDEO_QUALITY_DEFAULT;
-        });
+    BILI::init(diskCookie, [](const Cookie& newCookie, const std::string& token) {
+        brls::Logger::info("======== write cookies to disk");
+        ProgramConfig::instance().setCookie(newCookie);
+        ProgramConfig::instance().setRefreshToken(token);
+        // 用户重新登录后，恢复默认清晰度设置
+        VideoDetail::defaultQuality = WILI_VIDEO_QUALITY_DEFAULT;
+    });
     BILI::setProxy(httpProxy, httpsProxy);
     BILI::setTlsVerify(getBoolOption(SettingItem::TLS_VERIFY));
     BILI::setHttpTimeout(getSettingItem(SettingItem::HTTP_TIMEOUT, 5000));
@@ -1312,9 +1300,7 @@ void ProgramConfig::setProxy(const std::string& proxy) {
     BILI::setProxy(httpProxy, httpsProxy);
 }
 
-void ProgramConfig::setTlsVerify(bool verify) {
-    BILI::setTlsVerify(verify);
-}
+void ProgramConfig::setTlsVerify(bool verify) { BILI::setTlsVerify(verify); }
 
 void ProgramConfig::addSeasonCustomSetting(const std::string& key, const SeasonCustomItem& item) {
     this->seasonCustom[key] = item;

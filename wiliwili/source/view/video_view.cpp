@@ -22,14 +22,7 @@
 #include "fragment/player_danmaku_setting.hpp"
 #include "fragment/player_setting.hpp"
 #include "fragment/player_dlna_search.hpp"
-extern "C" void wiliwili_boot_log(const char *);
-#define WILI_BOOT_LOG(m) wiliwili_boot_log(m)
 #include "view/video_view.hpp"
-#ifdef PS5_NATIVE_APP
-/* PS5 自管播放器（scripts/ps5/native/ps5_player.c）：mpv 在原生标题沙箱里不可用。 */
-extern "C" void wiliwili_ps5player_set_rect(float x, float y, float w, float h);
-extern "C" int wiliwili_ps5player_ready(void);
-#endif
 
 #include "utils/shortcut_helper.hpp"
 #include "view/live_core.hpp"
@@ -102,7 +95,7 @@ VideoView::VideoView() {
         "\uE08E", brls::ControllerButton::BUTTON_RB,
         [this](brls::View* view) -> bool {
             CHECK_OSD(true);
-            auto& state  = brls::Application::getControllerState();
+            auto& state = brls::Application::getControllerState();
             bool buttonY =
                 brls::Application::isSwapInputKeys() ? state.buttons[brls::BUTTON_X] : state.buttons[brls::BUTTON_Y];
             if (buttonY) {
@@ -140,7 +133,7 @@ VideoView::VideoView() {
         "volume", brls::ControllerButton::BUTTON_RT,
         [this](brls::View* view) -> bool {
             CHECK_OSD(true);
-            auto &state = brls::Application::getControllerState();
+            auto& state = brls::Application::getControllerState();
             if (state.buttons[brls::BUTTON_NAV_UP]) {
                 // 升高音量
                 this->requestVolume((int)MPVCore::instance().volume + 5, 400);
@@ -368,8 +361,8 @@ VideoView::VideoView() {
         return true;
     };
     this->btnSettingIcon->getParent()->registerClickAction(settingFunc);
-    this->btnSettingIcon->getParent()->
-        addGestureRecognizer(new brls::TapGestureRecognizer(btnSettingIcon->getParent()));
+    this->btnSettingIcon->getParent()->addGestureRecognizer(
+        new brls::TapGestureRecognizer(btnSettingIcon->getParent()));
 
     /// 音量按钮
     this->btnVolumeIcon->getParent()->registerClickAction([this](brls::View* view) {
@@ -493,7 +486,7 @@ VideoView::VideoView() {
         CHECK_OSD(true);
         if (isTvControlMode && !isOSDShown() && isFullscreen()) {
             this->showOSD(true);
-            this->is_osd_shown = true; // 直接标记为显示状态，避免在 onChildFocusGained 焦点又被转移
+            this->is_osd_shown = true;  // 直接标记为显示状态，避免在 onChildFocusGained 焦点又被转移
             brls::Application::giveFocus(this->osdSlider);
             this->osdSlider->setManuallyMode();
         }
@@ -504,6 +497,7 @@ VideoView::VideoView() {
 
     // 自定义的mpv事件
     customEventSubscribeID = APP_E->subscribe([this](const std::string& event, void* data) {
+        if (!registerMPVEvent) return;
         if (event == VideoView::SET_TITLE) {
             this->setTitle((const char*)data);
         } else if (event == VideoView::SET_ONLINE_NUM) {
@@ -601,8 +595,8 @@ void VideoView::requestSeeking(int seek, int delay) {
     if (delay <= 0) {
         this->hideCenterHint();
         this->showThumbnailPreview = false;
-        seeking_range = 0;
-        is_seeking    = false;
+        seeking_range              = 0;
+        is_seeking                 = false;
         if (seek == 0) return;
         mpvCore->seekRelative(seek);
         showOSD(true);
@@ -614,8 +608,8 @@ void VideoView::requestSeeking(int seek, int delay) {
             ASYNC_RELEASE
             this->hideCenterHint();
             this->showThumbnailPreview = false;
-            seeking_range = 0;
-            is_seeking    = false;
+            seeking_range              = 0;
+            is_seeking                 = false;
             if (seek == 0) return;
             mpvCore->seekRelative(seek);
             showOSD(true);
@@ -632,13 +626,6 @@ VideoView::~VideoView() {
 
 void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height, brls::Style style,
                      brls::FrameContext* ctx) {
-#ifdef PS5_NATIVE_APP
-    /* 每帧把播放器矩形告诉自管播放器：它在 UI 之后按这个区域（16:9 letterbox）画视频。 */
-    wiliwili_ps5player_set_rect(x, y, width, height);
-#endif
-#ifdef PS5_NATIVE_APP
-    mpvCore->syncNativePlayerState(); /* 每帧把自管播放器的状态喂给 UI（OSD/转圈/进度条依赖） */
-#endif
     if (!mpvCore->isValid()) return;
     float alpha        = this->getAlpha();
     brls::Time current = brls::getCPUTimeUsec();
@@ -666,9 +653,8 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
 
     // draw danmaku
     if (enableDanmaku) {
-        isLiveMode
-            ? LiveDanmakuCore::instance().draw(vg, x, y, width, height, alpha)
-            : DanmakuCore::instance().draw(vg, x, y, width, height, alpha);
+        isLiveMode ? LiveDanmakuCore::instance().draw(vg, x, y, width, height, alpha)
+                   : DanmakuCore::instance().draw(vg, x, y, width, height, alpha);
     }
 
     // draw osd
@@ -732,9 +718,9 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
         if (a2 > 120) a2 = 240 - a2;
         if (a3 > 120) a3 = 240 - a3;
 
-        float tx                               = frame.getMinX() - 50;
-        float ty                               = frame.getMinY() + 4.5;
-        std::vector<std::pair<int, int> > data = {{0, a3 + 80}, {15, a2 + 80}, {30, a1 + 80}};
+        float tx                              = frame.getMinX() - 50;
+        float ty                              = frame.getMinY() + 4.5;
+        std::vector<std::pair<int, int>> data = {{0, a3 + 80}, {15, a2 + 80}, {30, a1 + 80}};
 
         for (auto& i : data) {
             nvgBeginPath(vg);
@@ -753,14 +739,9 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     // draw thumbnail preview (shown when dragging the progress slider)
     if (showThumbnailPreview) {
         const float previewProgress = osdSlider->getProgress();
-        VideoSnapshotCore::instance().draw(
-            vg,
-            x, y, width, height,
-            previewProgress * getRealDuration(),
-            200.0f,
-            osdSlider->getX() + osdSlider->getWidth() * previewProgress,
-            osdSlider->getY()
-        );
+        VideoSnapshotCore::instance().draw(vg, x, y, width, height, previewProgress * getRealDuration(), 200.0f,
+                                           osdSlider->getX() + osdSlider->getWidth() * previewProgress,
+                                           osdSlider->getY());
     }
 
     // center hint
@@ -778,7 +759,7 @@ void VideoView::drawHighlightProgress(NVGcontext* vg, float x, float y, float wi
     float dX     = width / ((float)highlightData.data.size() - 1);
     float halfDx = dX / 2;
     float pointX = x, lastX = x;
-    float lastY  = baseY;
+    float lastY = baseY;
     nvgMoveTo(vg, lastX, lastY);
     lastY -= 12;
     nvgLineTo(vg, lastX, lastY);
@@ -847,31 +828,8 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
     setUrl(url, start, end, audios);
 }
 
-#ifdef PS5_NATIVE_APP
-/* 原生标题线：mpv 在 app slot 里起不来（MPVCore::init → mpv_initialize 一跳 NULL 崩），
- * 所以 PS5 上改走自管播放器：ffmpeg 解封装 + sceVideodec2 硬解 + NV12 上屏 + sceAudioOut。
- * 播放循环由 borealis 的帧钩子驱动（nvgEndFrame 之后调 wiliwili_ps5player_draw）。 */
-extern "C" void wiliwili_ps5player_open(const char *url, const char *audio_url);
-extern "C" void wiliwili_ps5player_close(void);
-extern "C" void wiliwili_ps5player_pause(int paused);
-extern "C" void wiliwili_ps5player_set_rect(float x, float y, float w, float h);
-#endif
-
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
-#ifdef PS5_NATIVE_APP
-    (void)start;
-    (void)end;
-    /* B 站 DASH 是音视频两条 URL，且每路都有 base + backup：用换行拼成候选列表交给引擎，
-     * 由它逐个尝试（mcdn 这类 CDN 实测会打不开）。 */
-    std::string audio_list;
-    for (auto& a : audios) {
-        if (!audio_list.empty()) audio_list += "\n";
-        audio_list += a;
-    }
-    wiliwili_ps5player_open(url.c_str(), audio_list.empty() ? nullptr : audio_list.c_str());
-#else
     mpvCore->setUrl(url, genExtraUrlParam(start, end, audios));
-#endif
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::string& audio) {
@@ -879,22 +837,7 @@ void VideoView::setBackupUrl(const std::string& url, int start, int end, const s
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
-#ifdef PS5_NATIVE_APP
-    /* B 站会下发多个 CDN（base + backup）：基址没起流就用备用地址重开一次
-     * （音轨候选列表一起带上，由引擎逐个尝试）。 */
-    (void)start;
-    (void)end;
-    if (!wiliwili_ps5player_ready()) {
-        std::string audio_list;
-        for (auto& a : audios) {
-            if (!audio_list.empty()) audio_list += "\n";
-            audio_list += a;
-        }
-        wiliwili_ps5player_open(url.c_str(), audio_list.empty() ? nullptr : audio_list.c_str());
-    }
-#else
     mpvCore->setBackupUrl(url, genExtraUrlParam(start, end, audios));
-#endif
 }
 
 void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) {
@@ -920,36 +863,27 @@ void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) 
 }
 
 void VideoView::resume() {
-#ifdef PS5_NATIVE_APP
-    wiliwili_ps5player_pause(0);
-#else
     mpvCore->resume();
-#endif
 }
 
 void VideoView::pause() {
-#ifdef PS5_NATIVE_APP
-    wiliwili_ps5player_pause(1);
-#else
     mpvCore->pause();
-#endif
 }
 
 void VideoView::stop() {
-#ifdef PS5_NATIVE_APP
-    wiliwili_ps5player_close();
-#else
     mpvCore->stop();
-#endif
+}
+
+void VideoView::setMpvEventActive(bool active) {
+    if (active) {
+        registerMpvEvent();
+    } else {
+        unRegisterMpvEvent();
+    }
 }
 
 void VideoView::togglePlay() {
     if (customToggleAction != nullptr) return customToggleAction();
-#ifdef PS5_NATIVE_APP
-    ps5Paused = !ps5Paused;
-    wiliwili_ps5player_pause(ps5Paused);
-    return;
-#endif
     if (this->mpvCore->isPaused()) {
         if (showReplay) {
             this->mpvCore->seek(0);
@@ -965,11 +899,7 @@ void VideoView::togglePlay() {
 void VideoView::setCustomToggleAction(std::function<void()> action) { this->customToggleAction = action; }
 
 void VideoView::setSpeed(float speed) {
-#ifdef PS5_NATIVE_APP
-    (void)speed; /* 自管播放器暂不支持倍速 */
-#else
     mpvCore->setSpeed(speed);
-#endif
 }
 
 void VideoView::setLastPlayedPosition(int64_t p) { lastPlayedPosition = p; }
@@ -1274,9 +1204,7 @@ void VideoView::setProgress(float value) {
 
 float VideoView::getProgress() { return this->osdSlider->getProgress(); }
 
-void VideoView::setHighlightProgress(const VideoHighlightData& data) {
-    this->highlightData = data;
-}
+void VideoView::setHighlightProgress(const VideoHighlightData& data) { this->highlightData = data; }
 
 void VideoView::showHint(const std::string& value) {
     brls::Logger::debug("Video hint: {}", value);
@@ -1496,9 +1424,7 @@ void VideoView::setFullScreen(bool fs) {
     }
 }
 
-void VideoView::setSeasonAction(brls::ActionListener action) {
-    this->seasonAction = action;
-}
+void VideoView::setSeasonAction(brls::ActionListener action) { this->seasonAction = action; }
 
 brls::View* VideoView::getDefaultFocus() {
     if (isFullscreen() && isOSDShown())
@@ -1623,7 +1549,7 @@ void VideoView::buttonProcessing() {
 
 void VideoView::registerMpvEvent() {
     if (registerMPVEvent) {
-        brls::Logger::error("VideoView already register MPV Event");
+        return;
     }
     eventSubscribeID = mpvCore->getEvent()->subscribe([this](MpvEventEnum event) {
         // brls::Logger::info("mpv event => : {}", event);
@@ -1751,61 +1677,65 @@ void VideoView::onChildFocusGained(View* directChild, View* focusedView) {
 float VideoView::getRealDuration() { return real_duration > 0 ? (float)real_duration : (float)mpvCore->duration; }
 
 void VideoView::registerCommonActions(brls::Activity* activity) {
+    activity->registerAction(ShortcutHelper::getVideoPause(), [this](...) -> bool {
+        CHECK_OSD(true);
+        this->togglePlay();
+        return true;
+    });
     activity->registerAction(
-        ShortcutHelper::getVideoPause(), [this](...) -> bool {
-            CHECK_OSD(true);
-            this->togglePlay();
-            return true;
-        });
-    activity->registerAction(
-        ShortcutHelper::getVolumeUp(), [this](...) -> bool {
+        ShortcutHelper::getVolumeUp(),
+        [this](...) -> bool {
             CHECK_OSD(true);
             this->requestVolume((int)MPVCore::instance().volume + 5, 400);
             return true;
-        }, true);
+        },
+        true);
     activity->registerAction(
-        ShortcutHelper::getVolumeDown(), [this](...) -> bool {
+        ShortcutHelper::getVolumeDown(),
+        [this](...) -> bool {
             CHECK_OSD(true);
             this->requestVolume((int)MPVCore::instance().volume - 5, 400);
             return true;
-        }, true);
+        },
+        true);
     activity->registerAction(
-        ShortcutHelper::getForward(), [this](...) -> bool {
+        ShortcutHelper::getForward(),
+        [this](...) -> bool {
             CHECK_OSD(true);
             seeking_range += getSeekRange(seeking_range);
             this->requestSeeking(seeking_range);
             return true;
-        }, true);
+        },
+        true);
     activity->registerAction(
-        ShortcutHelper::getRewind(), [this](...) -> bool {
+        ShortcutHelper::getRewind(),
+        [this](...) -> bool {
             CHECK_OSD(true);
             seeking_range -= getSeekRange(seeking_range);
             this->requestSeeking(seeking_range);
             return true;
-        }, true);
-    activity->registerAction(
-        ShortcutHelper::getVideoOsd(), [this](...) -> bool {
-            CHECK_OSD(true);
-            this->toggleOSD();
+        },
+        true);
+    activity->registerAction(ShortcutHelper::getVideoOsd(), [this](...) -> bool {
+        CHECK_OSD(true);
+        this->toggleOSD();
+        return true;
+    });
+    activity->registerAction(ShortcutHelper::getDanmaku(), [this](...) -> bool {
+        CHECK_OSD(true);
+        // 如果正在显示提示（提示历史播放进度），则不切换弹幕状态，将这种情况临时绑定成切换历史进度
+        if (this->hintBox->getVisibility() == brls::Visibility::VISIBLE) {
+            APP_E->fire(VideoView::SWITCH_TO_LAST, nullptr);
             return true;
-        });
-    activity->registerAction(
-        ShortcutHelper::getDanmaku(), [this](...) -> bool {
-            CHECK_OSD(true);
-            // 如果正在显示提示（提示历史播放进度），则不切换弹幕状态，将这种情况临时绑定成切换历史进度
-            if (this->hintBox->getVisibility() == brls::Visibility::VISIBLE) {
-                APP_E->fire(VideoView::SWITCH_TO_LAST, nullptr);
-                return true;
-            }
-            this->toggleDanmaku();
-            return true;
-        });
-    activity->registerAction(
-        ShortcutHelper::getVideoQuality(), [this](...) -> bool {
-            CHECK_OSD(true);
-            APP_E->fire(VideoView::QUALITY_CHANGE, nullptr);
-            return true;
-        });
+        }
+        this->toggleDanmaku();
+        return true;
+    });
+    activity->registerAction(ShortcutHelper::getVideoQuality(), [this](...) -> bool {
+        CHECK_OSD(true);
+        APP_E->fire(VideoView::QUALITY_CHANGE, nullptr);
+        return true;
+    });
     activity->registerAction(ShortcutHelper::getVideoSpeed(), [this](...) -> bool {
         CHECK_OSD(true);
         showSpeedList();
@@ -1827,4 +1757,3 @@ void VideoView::registerCommonActions(brls::Activity* activity) {
         return true;
     });
 }
-

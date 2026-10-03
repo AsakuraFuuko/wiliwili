@@ -1,4 +1,6 @@
 # N0 进展：payload 线代码 → 原生标题跑通（2026-09-25 真机）
+> 迁移期文档（已完成）；当前状态见 `notes/03` 与 `notes/06`。
+
 
 ## 结果
 - 新树 `wiliwili-native/` 构建出原生标题 **PPSA99013**（`eboot.bin` 89.2 MB / ffpkg 105.5 MB），安装到 `/data/homebrew/PPSA99013.ffpkg`，经 `launch-native.sh` 启动 ✓，**电视上有画面** ✓。

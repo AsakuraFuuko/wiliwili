@@ -41,6 +41,11 @@ public:
     virtual void onRedirectToEp(const std::string& url) {}
     virtual void onUGCSeasonInfo(const bilibili::UGCSeason& result) {}
 
+protected:
+    virtual bool isRequestActive() const { return true; }
+
+public:
+
     /// 请求视频数据
     void requestData(const bilibili::VideoDetailResult& video);
 

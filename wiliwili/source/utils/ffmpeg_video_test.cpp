@@ -12,6 +12,7 @@
 
 #if defined(PS5_NATIVE_APP)
 #include <SDL2/SDL.h>
+#if !defined(BOREALIS_USE_AGC)
 /* 只为拿到 nvglCreateImageFromHandleGL3 的声明；GL 类型的最小前置定义。 */
 typedef unsigned int GLuint;
 typedef unsigned int GLenum;
@@ -21,6 +22,7 @@ typedef unsigned char GLboolean;
 typedef float GLfloat;
 #define NANOVG_GL3 1
 #include <nanovg_gl.h>
+#endif
 #endif
 
 extern "C" {
@@ -174,6 +176,7 @@ extern "C" void wiliwili_video_test_draw(NVGcontext *vg) {
     if (elapsed >= g_video.frame_seconds && !g_video.eof) decode_next_frame();
 
     /* 对照实验：同一帧分别用 nanovg 与原生 GL 上传，比较耗时。 */
+#if !defined(BOREALIS_USE_AGC)
     if (g_video.upload_mode == 1) {
         typedef void (*TexImageFn)(unsigned int, int, int, int, int, int, unsigned int, unsigned int, const void *);
         typedef void (*TexSubImageFn)(unsigned int, int, int, int, int, unsigned int, unsigned int, const void *);
@@ -205,16 +208,20 @@ extern "C" void wiliwili_video_test_draw(NVGcontext *vg) {
             g_video.upload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
         if (g_video.texture == 0) return;
-    } else if (g_video.texture == 0) {
+    } else
+#endif
+    {
+        if (g_video.texture == 0) {
         g_video.texture = nvgCreateImageRGBA(vg, g_video.width, g_video.height,
                                                         NVG_IMAGE_STREAMING | NVG_IMAGE_COPY_SWAP | NVG_IMAGE_NEAREST,
                                                         g_video.planes[0]);
         if (g_video.texture == 0) return;
-    } else {
+        } else {
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         nvgUpdateImage(vg, g_video.texture, g_video.planes[0]);
         g_video.upload_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
     }
 
     float screen_w = (float)brls::Application::windowWidth;
@@ -243,6 +250,13 @@ extern "C" void wiliwili_video_test_draw(NVGcontext *vg) {
  * 它们不便包含 nanovg 头，就统一走这个 C++ 侧的小助手。 */
 extern "C" void wiliwili_draw_gl_texture(NVGcontext *vg, unsigned int texture, int width, int height) {
     if (vg == nullptr || texture == 0) return;
+#if defined(BOREALIS_USE_AGC)
+    (void)vg;
+    (void)texture;
+    (void)width;
+    (void)height;
+    return;
+#else
     float screen_w = (float)brls::Application::windowWidth;
     float screen_h = (float)brls::Application::windowHeight;
     int image = nvglCreateImageFromHandleGL3(vg, texture, width, height, 0);
@@ -252,4 +266,5 @@ extern "C" void wiliwili_draw_gl_texture(NVGcontext *vg, unsigned int texture, i
     nvgRect(vg, 0, 0, screen_w, screen_h);
     nvgFillPaint(vg, paint);
     nvgFill(vg);
+#endif
 }

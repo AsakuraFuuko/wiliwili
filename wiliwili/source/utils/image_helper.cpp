@@ -2,7 +2,24 @@
 // Created by fang on 2022/7/16.
 //
 
-#include <borealis/core/singleton.hpp>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#if defined(PS5_NATIVE_APP)
+#include <sys/select.h>
+#endif
 #include <borealis/core/application.hpp>
 #include <borealis/core/cache_helper.hpp>
 #include <borealis/core/thread.hpp>
@@ -13,23 +30,19 @@
 #include "api/bilibili/util/http.hpp"
 
 #ifdef USE_WEBP
-#include <mutex>
-#include <thread>
-#include <deque>
-#include <atomic>
-#include <chrono>
-#include <cstdio>
 #include <webp/decode.h>
+#endif
 
+#if defined(PS5_NATIVE_APP)
 extern "C" void wiliwili_boot_log(const char*);
 #endif
 
 #ifdef BOREALIS_USE_GXM
 #ifndef MAX
-#define MAX(a,b) (((a)>(b))?(a):(b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #endif
 #ifndef MIN
-#define MIN(a,b) (((a)<(b))?(a):(b))
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #endif
 #define STB_DXT_IMPLEMENTATION
 #include <borealis/extern/nanovg/stb_dxt.h>
@@ -57,12 +70,12 @@ static inline __attribute__((always_inline)) uint64_t morton_1(uint64_t x) {
     return x;
 }
 
-static inline __attribute__((always_inline)) void d2xy_morton(uint64_t d, uint64_t *x, uint64_t *y) {
+static inline __attribute__((always_inline)) void d2xy_morton(uint64_t d, uint64_t* x, uint64_t* y) {
     *x = morton_1(d);
     *y = morton_1(d >> 1);
 }
 
-static inline __attribute__((always_inline)) void extract_block(const uint8_t *src, uint32_t width, uint8_t *block) {
+static inline __attribute__((always_inline)) void extract_block(const uint8_t* src, uint32_t width, uint8_t* block) {
     for (int j = 0; j < 4; j++) {
         memcpy(&block[j * 4 * 4], src, 16);
         src += width * 4;
@@ -79,48 +92,422 @@ static inline __attribute__((always_inline)) void extract_block(const uint8_t *s
  * @param last_size max block size in pixel of last compression round, default is 64
  * @param isdxt5 false for DXT1, true for DXT5
  */
-static void dxt_compress_ext(uint8_t *dst, uint8_t *src, uint32_t w, uint32_t h, uint32_t stride, uint32_t last_size, bool isdxt5) {
+static void dxt_compress_ext(uint8_t* dst, uint8_t* src, uint32_t w, uint32_t h, uint32_t stride, uint32_t last_size,
+                             bool isdxt5) {
     uint8_t block[64];
-    uint32_t align_w = MAX(nearest_po2(w), last_size);
-    uint32_t align_h = MAX(nearest_po2(h), last_size);
-    uint32_t s = MIN(align_w, align_h);
-    uint32_t num_blocks = s * s / 16;
+    uint32_t align_w          = MAX(nearest_po2(w), last_size);
+    uint32_t align_h          = MAX(nearest_po2(h), last_size);
+    uint32_t s                = MIN(align_w, align_h);
+    uint32_t num_blocks       = s * s / 16;
     const uint32_t block_size = isdxt5 ? 16 : 8;
     uint64_t d, offs_x, offs_y;
 
     for (d = 0; d < num_blocks; d++, dst += block_size) {
         d2xy_morton(d, &offs_x, &offs_y);
-        if (offs_x * 4 >= h || offs_y * 4 >= w)
-            continue;
+        if (offs_x * 4 >= h || offs_y * 4 >= w) continue;
         extract_block(src + offs_y * 16 + offs_x * stride * 16, stride, block);
         stb_compress_dxt_block(dst, block, isdxt5, STB_DXT_NORMAL);
     }
-    if (align_w > align_h)
-        return dxt_compress_ext(dst, src + s * 4, w - s, h, stride, s, isdxt5);
-    if (align_w < align_h)
-        return dxt_compress_ext(dst, src + stride * s * 4, w, h - s, stride, s, isdxt5);
+    if (align_w > align_h) return dxt_compress_ext(dst, src + s * 4, w - s, h, stride, s, isdxt5);
+    if (align_w < align_h) return dxt_compress_ext(dst, src + stride * s * 4, w, h - s, stride, s, isdxt5);
 }
 
-static void dxt_compress(uint8_t *dst, uint8_t *src, uint32_t w, uint32_t h, bool isdxt5) {
+static void dxt_compress(uint8_t* dst, uint8_t* src, uint32_t w, uint32_t h, bool isdxt5) {
     dxt_compress_ext(dst, src, w, h, w, 64, isdxt5);
 }
 #endif
 
+#if defined(PS5_NATIVE_APP)
+static constexpr size_t MAX_IMAGE_REQUEST_THREADS = 4;
+static constexpr unsigned MAX_IMAGE_RETRIES       = 2;
+static constexpr int IMAGE_CONNECTION_TIMEOUT_MS  = 5000;
+#endif
+
+static size_t effectiveImageRequestThreads(size_t configured) {
+#if defined(PS5_NATIVE_APP)
+    return std::min(std::max<size_t>(2, configured), MAX_IMAGE_REQUEST_THREADS);
+#else
+    return configured == 0 ? 1 : configured;
+#endif
+}
+
+// Separate CURLM lanes isolate stalled image transfers; each worker drives socket_action with a bounded select wait so watchdog and cancellation checks stay schedulable.
+#if defined(PS5_NATIVE_APP)
+
+// 真机实测 worker 会在 libcurl 调用内阻塞 57–113 s，watchdog 无法在调用内部运行；先定位阻塞的具体调用。
+static std::atomic<unsigned> imageStallLogs{0};
+static void logImageStall(const char* operation, std::chrono::steady_clock::time_point started, int running,
+                          size_t active) {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    if (elapsed.count() < 1000 || imageStallLogs.fetch_add(1) >= 64) return;
+    char message[160];
+    std::snprintf(message, sizeof(message), "img-stall: op=%s ms=%lld running=%d active=%zu", operation,
+                  static_cast<long long>(elapsed.count()), running, active);
+    wiliwili_boot_log(message);
+}
+class ImageRequestRunner {
+    struct Request {
+        std::string url;
+        std::function<bool()> isCancelled;
+        std::function<void(cpr::Response)> complete;
+        bool priority;
+        std::chrono::steady_clock::time_point queuedAt;
+        unsigned attempt;
+    };
+
+    struct ActiveRequest {
+        Request request;
+        std::shared_ptr<cpr::Session> session;
+        std::chrono::steady_clock::time_point startedAt;
+    };
+
+public:
+    static ImageRequestRunner& instance() {
+        static ImageRequestRunner runner(ImageHelper::REQUEST_THREADS);
+        return runner;
+    }
+
+    explicit ImageRequestRunner(size_t maxInFlight) : maxInFlight(effectiveImageRequestThreads(maxInFlight)) {
+        for (size_t workerIndex = 0; workerIndex < MAX_IMAGE_REQUEST_THREADS; ++workerIndex) {
+            workers.emplace_back([this, workerIndex] { run(workerIndex); });
+        }
+    }
+
+    ~ImageRequestRunner() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        condition.notify_all();
+        for (auto& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+        for (;;) {
+            Request request;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!hasRequests()) break;
+                request = popRequest();
+            }
+            deliver(request, cpr::Response{});
+        }
+    }
+
+    void enqueue(std::string url, std::function<bool()> isCancelled, std::function<void(cpr::Response)> complete) {
+        const bool priority = url.find("!note-comment-multiple") == std::string::npos;
+        bool rejected;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            rejected = stopping;
+            if (!rejected) {
+                pushRequest(Request{std::move(url), std::move(isCancelled), std::move(complete), priority,
+                                    std::chrono::steady_clock::now(), 0});
+            }
+        }
+        if (rejected) {
+            complete(cpr::Response{});
+            return;
+        }
+        condition.notify_all();
+    }
+
+    void setMaxInFlight(size_t value) {
+        maxInFlight = effectiveImageRequestThreads(value);
+        condition.notify_all();
+    }
+
+private:
+    void pushRequest(Request request) {
+        (request.priority ? priorityRequests : normalRequests).push_back(std::move(request));
+    }
+
+    bool hasRequests() const { return !priorityRequests.empty() || !normalRequests.empty(); }
+
+    Request popRequest() {
+        auto& queue     = priorityRequests.empty() ? normalRequests : priorityRequests;
+        Request request = std::move(queue.front());
+        queue.pop_front();
+        return request;
+    }
+    static void deliver(Request& request, cpr::Response response) {
+        try {
+            request.complete(std::move(response));
+        } catch (...) {
+            // The completion callback only schedules decode work; keep exceptions from terminating the network owner.
+        }
+    }
+
+    std::shared_ptr<cpr::Session> createSession(const Request& request) {
+        auto session = std::make_shared<cpr::Session>();
+        CURL* curl   = session->GetCurlHolder()->handle;
+        curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, bilibili::HTTP::DNS_CACHE_TIMEOUT);
+#ifdef PS5
+        curl_easy_setopt(curl, CURLOPT_CAINFO, bilibili::HTTP::CA_BUNDLE);
+#endif
+        session->SetTimeout(cpr::Timeout{bilibili::HTTP::TIMEOUT});
+#if defined(PS5_NATIVE_APP)
+        // Keep both cPR and the easy handle configured; native curl has observed multi-state stalls
+        // where the application watchdog cannot run until curl returns.
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)bilibili::HTTP::TIMEOUT);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)IMAGE_CONNECTION_TIMEOUT_MS);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 10L);
+#else
+        session->SetConnectTimeout(cpr::ConnectTimeout{bilibili::HTTP::CONNECTION_TIMEOUT});
+#endif
+        session->SetVerifySsl(bilibili::HTTP::VERIFY);
+        session->SetProxies(bilibili::HTTP::PROXIES);
+        session->SetUrl(cpr::Url{request.url});
+        session->SetProgressCallback(
+            cpr::ProgressCallback([isCancelled = request.isCancelled](...) { return !isCancelled(); }));
+        session->PrepareGet();
+        return session;
+    }
+
+    void logSlowTransfer(CURL* curl, const Request& request, const cpr::Response& response,
+                         std::chrono::steady_clock::time_point startedAt) {
+        const auto totalMs       = (long long)(response.elapsed * 1000);
+        const bool initialSample = loggedTransfers.fetch_add(1) < 12;
+        const long long queueMs =
+            (long long)std::chrono::duration_cast<std::chrono::milliseconds>(startedAt - request.queuedAt).count();
+
+        double dns = 0, connected = 0, tls = 0, firstByte = 0;
+        long newConnections = 0;
+        curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &dns);
+        curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connected);
+        curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &tls);
+        curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME, &firstByte);
+        curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &newConnections);
+        if (totalMs < 250 && !initialSample) return;
+        char message[256];
+        std::snprintf(
+            message, sizeof(message),
+            "img-net: total=%lldms queue=%lldms dns=%lld tcp=%lld tls=%lld first=%lld newconn=%ld code=%ld bytes=%lld",
+            totalMs, queueMs, (long long)(dns * 1000), (long long)((connected - dns) * 1000),
+            (long long)((tls - connected) * 1000), (long long)(firstByte * 1000), newConnections, response.status_code,
+            (long long)response.downloaded_bytes);
+        wiliwili_boot_log(message);
+    }
+
+    void finish(CURLM* multi, std::unordered_map<CURL*, ActiveRequest>& active, CURL* curl, CURLcode result) {
+        auto it = active.find(curl);
+        if (it == active.end()) return;
+
+        ActiveRequest request = std::move(it->second);
+        active.erase(it);
+        cpr::Response response = request.session->Complete(result);
+        const bool cancelled   = result == CURLE_ABORTED_BY_CALLBACK || request.request.isCancelled();
+        const bool failed      = result != CURLE_OK || response.status_code != 200 || response.downloaded_bytes == 0;
+        if (result == CURLE_OK && !failed) {
+            logSlowTransfer(curl, request.request, response, request.startedAt);
+        } else if (!cancelled) {
+            char message[128];
+            const auto elapsed = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - request.startedAt)
+                                     .count();
+            std::snprintf(message, sizeof(message), "img-net: failed curl=%d code=%ld bytes=%lld elapsed=%lldms try=%u",
+                          result, response.status_code, (long long)response.downloaded_bytes, elapsed,
+                          request.request.attempt + 1);
+            wiliwili_boot_log(message);
+        }
+        curl_multi_remove_handle(multi, curl);
+
+        if (failed && !cancelled && request.request.attempt < MAX_IMAGE_RETRIES) {
+            bool requeued = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!stopping) {
+                    request.request.attempt++;
+                    request.request.queuedAt = std::chrono::steady_clock::now();
+                    pushRequest(std::move(request.request));
+                    requeued = true;
+                }
+            }
+            if (requeued) {
+                condition.notify_one();
+                return;
+            }
+        }
+        deliver(request.request, std::move(response));
+    }
+    void run(size_t workerIndex) {
+        CURLM* multi = curl_multi_init();
+        if (!multi) {
+            for (;;) {
+                Request request;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    condition.wait(lock, [this, workerIndex] {
+                        return stopping || (workerIndex < maxInFlight.load() && hasRequests());
+                    });
+                    if (stopping) return;
+                    request = popRequest();
+                }
+                deliver(request, cpr::Response{});
+            }
+        }
+
+        if (workerIndex == 0) {
+            const curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
+            const bool asyncDns                = info && (info->features & CURL_VERSION_ASYNCHDNS);
+            char startupMessage[112];
+            std::snprintf(startupMessage, sizeof(startupMessage), "img-multi: lanes=%zu max-inflight=%zu async-dns=%d",
+                          MAX_IMAGE_REQUEST_THREADS, maxInFlight.load(), asyncDns ? 1 : 0);
+            wiliwili_boot_log(startupMessage);
+        }
+        curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)MAX_IMAGE_REQUEST_THREADS);
+        curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, (long)(MAX_IMAGE_REQUEST_THREADS * 4));
+        std::unordered_map<CURL*, ActiveRequest> active;
+
+        for (;;) {
+            Request request;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                condition.wait(lock, [this, workerIndex] {
+                    return stopping || (workerIndex < maxInFlight.load() && hasRequests());
+                });
+                if (stopping) break;
+                request = popRequest();
+            }
+            if (request.isCancelled()) {
+                deliver(request, cpr::Response{});
+                continue;
+            }
+
+            auto session          = createSession(request);
+            CURL* curl            = session->GetCurlHolder()->handle;
+            const CURLMcode added = curl_multi_add_handle(multi, curl);
+            if (added != CURLM_OK) {
+                cpr::Response response = session->Complete(CURLE_FAILED_INIT);
+                deliver(request, std::move(response));
+                continue;
+            }
+            active.emplace(curl,
+                           ActiveRequest{std::move(request), std::move(session), std::chrono::steady_clock::now()});
+
+            while (!active.empty()) {
+                bool shouldStop;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    shouldStop = stopping;
+                }
+                if (shouldStop) {
+                    finish(multi, active, active.begin()->first, CURLE_ABORTED_BY_CALLBACK);
+                    break;
+                }
+
+                auto process = [&]() {
+                    int messages = 0;
+                    while (CURLMsg* message = curl_multi_info_read(multi, &messages)) {
+                        if (message->msg == CURLMSG_DONE) {
+                            finish(multi, active, message->easy_handle, message->data.result);
+                        }
+                    }
+                    const auto now      = std::chrono::steady_clock::now();
+                    const auto watchdog = std::chrono::milliseconds(bilibili::HTTP::TIMEOUT) + std::chrono::seconds(5);
+                    for (auto it = active.begin(); it != active.end();) {
+                        CURL* activeCurl     = it->first;
+                        const bool cancelled = it->second.request.isCancelled();
+                        const bool timedOut  = now - it->second.startedAt >= watchdog;
+                        ++it;
+                        if (cancelled) {
+                            finish(multi, active, activeCurl, CURLE_ABORTED_BY_CALLBACK);
+                        } else if (timedOut) {
+                            finish(multi, active, activeCurl, CURLE_OPERATION_TIMEDOUT);
+                        }
+                    }
+                };
+
+                int running              = 0;
+                const auto actionStarted = std::chrono::steady_clock::now();
+                CURLMcode result         = curl_multi_socket_action(multi, CURL_SOCKET_TIMEOUT, 0, &running);
+                logImageStall("socket_action", actionStarted, running, active.size());
+                if (result != CURLM_OK) {
+                    finish(multi, active, active.begin()->first, CURLE_FAILED_INIT);
+                    continue;
+                }
+                process();
+                if (active.empty()) break;
+
+                fd_set readfds;
+                fd_set writefds;
+                fd_set exceptfds;
+                FD_ZERO(&readfds);
+                FD_ZERO(&writefds);
+                FD_ZERO(&exceptfds);
+                int maxfd = -1;
+                if (curl_multi_fdset(multi, &readfds, &writefds, &exceptfds, &maxfd) != CURLM_OK) maxfd = -1;
+
+                long timeoutMs = 20;
+                curl_multi_timeout(multi, &timeoutMs);
+                if (timeoutMs < 0 || timeoutMs > 20) timeoutMs = 20;
+                if (timeoutMs == 0) continue;
+
+                timeval timeout{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+                const auto selectStarted = std::chrono::steady_clock::now();
+                const int ready          = maxfd >= 0 ? select(maxfd + 1, &readfds, &writefds, &exceptfds, &timeout)
+                                                      : select(0, nullptr, nullptr, nullptr, &timeout);
+                logImageStall("select", selectStarted, running, active.size());
+                if (ready <= 0) continue;
+
+                for (int fd = 0; fd <= maxfd && !active.empty(); ++fd) {
+                    int events = 0;
+                    if (FD_ISSET(fd, &readfds)) events |= CURL_CSELECT_IN;
+                    if (FD_ISSET(fd, &writefds)) events |= CURL_CSELECT_OUT;
+                    if (FD_ISSET(fd, &exceptfds)) events |= CURL_CSELECT_ERR;
+                    if (events != 0) {
+                        const auto actionStarted = std::chrono::steady_clock::now();
+                        result                   = curl_multi_socket_action(multi, fd, events, &running);
+                        logImageStall("socket_fd", actionStarted, running, active.size());
+                        if (result != CURLM_OK) {
+                            finish(multi, active, active.begin()->first, CURLE_FAILED_INIT);
+                            break;
+                        }
+                        process();
+                    }
+                }
+            }
+        }
+
+        for (auto it = active.begin(); it != active.end();) {
+            CURL* curl = it->first;
+            ++it;
+            finish(multi, active, curl, CURLE_ABORTED_BY_CALLBACK);
+        }
+        curl_multi_cleanup(multi);
+    }
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    // Dynamic note grids are bursty; keep avatar/card requests ahead of them.
+    std::deque<Request> priorityRequests;
+    std::deque<Request> normalRequests;
+    std::atomic<size_t> maxInFlight;
+    std::atomic<unsigned> loggedTransfers{0};
+    bool stopping = false;
+    std::vector<std::thread> workers;
+};
+#endif
+
 class ImageThreadPool : public cpr::ThreadPool, public brls::Singleton<ImageThreadPool> {
 public:
-    ImageThreadPool() : cpr::ThreadPool(1, ImageHelper::REQUEST_THREADS, std::chrono::milliseconds(5000)) {
-        brls::Logger::info("max_thread_num: {}", this->max_thread_num);
+    ImageThreadPool()
+        : cpr::ThreadPool(1, effectiveImageRequestThreads(ImageHelper::REQUEST_THREADS),
+                          std::chrono::milliseconds(5000)) {
+        brls::Logger::info("image workers: configured={} effective={}", ImageHelper::REQUEST_THREADS,
+                           this->max_thread_num);
         this->Start();
     }
 
     ~ImageThreadPool() override { this->Stop(); }
 
-    CURLSH* getShare() {
-        return share.getShare();
-    }
+#if !defined(PS5_NATIVE_APP)
+    CURL* getShare() { return share.getShare(); }
 
 private:
     bilibili::CurlSharedObject share;
+#endif
 };
 
 ImageHelper::ImageHelper(brls::Image* view) : imageView(view) {}
@@ -157,8 +544,9 @@ std::shared_ptr<ImageHelper> ImageHelper::with(brls::Image* view) {
     return item;
 }
 
-void ImageHelper::load(const std::string &url) {
-    this->imageUrl = bilibili::HTTP::VERIFY.verify ? url :pystring::replace(url, "https", "http", 1);
+void ImageHelper::load(const std::string& url) {
+    this->imageUrl       = bilibili::HTTP::VERIFY.verify ? url : pystring::replace(url, "https", "http", 1);
+    this->decodeAttempts = 0;
 
 #ifdef BOREALIS_USE_GXM
     std::vector<std::string> urls = pystring::rsplit(this->imageUrl, "@", 1);
@@ -185,10 +573,10 @@ void ImageHelper::load(const std::string &url) {
     //todo: 可能会发生同时请求多个重复链接的情况，此种情况下最好合并为一个请求
 
     // 缓存网络图片
-    brls::Logger::verbose("request Image 1: {} {}", this->imageUrl, this->isCancel);
+    brls::Logger::verbose("request Image 1: {} {}", this->imageUrl, this->isCancel.load());
     ImageThreadPool::instance().Submit([this]() {
         brls::Logger::verbose("Submit view: {} {} {} {}", (size_t)this->imageView, (size_t)this, this->imageUrl,
-                              this->isCancel);
+                              this->isCancel.load());
         if (this->isCancel) {
             this->clean();
             return;
@@ -207,30 +595,107 @@ static inline void freeImageData(uint8_t* imageData, bool isWebp) {
         stbi_image_free(imageData);
 }
 
-struct ImageUpload {
-    ImageHelper* helper;
-    uint8_t* data;
-    int width;
-    int height;
-    bool isWebp;
+/* Native image requests may finish on four runner lanes at once, while Borealis
+ * drains every sync callback in one main-loop pass. Keep decoded pixels bounded
+ * and submit at most two render-thread texture uploads per frame so AGC
+ * allocation and view binding cannot turn a burst of completed requests into
+ * one long stall. */
+#if defined(PS5_NATIVE_APP)
+struct DecodedImage {
+    uint8_t* data   = nullptr;
+    int width       = 0;
+    int height      = 0;
+    bool isWebp     = false;
+    bool compressed = false;
+
+    ~DecodedImage() {
+        if (!data) return;
+        if (compressed)
+            free(data);
+        else
+            freeImageData(data, isWebp);
+    }
 };
 
-extern "C" void wiliwili_drain_image_uploads(void) { ImageHelper::drainUploads(); }
+class ImageUploadQueue {
+public:
+    using Task = std::function<void()>;
 
-static std::deque<ImageUpload>& uploadQueue() {
-    static std::deque<ImageUpload> queue;
-    return queue;
-}
+    static ImageUploadQueue& instance() {
+        static ImageUploadQueue queue;
+        return queue;
+    }
 
-static std::mutex& uploadQueueMutex() {
-    static std::mutex mutex;
-    return mutex;
-}
+    bool enqueue(Task task, std::function<bool()> cancelled, bool priority) {
+        bool schedule = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            space.wait(lock, [&] { return stopping || urgent.size() + normal.size() < MAX_PENDING || cancelled(); });
+            if (stopping || cancelled()) return false;
+            (priority ? urgent : normal).emplace_back(std::move(task));
+            if (!scheduled) {
+                scheduled = true;
+                schedule  = true;
+            }
+        }
+        if (schedule) brls::sync([this] { runOne(); });
+        return true;
+    }
+
+    void wake() { space.notify_all(); }
+
+private:
+    static constexpr size_t MAX_PENDING           = 8;
+    static constexpr size_t MAX_UPLOADS_PER_FRAME = 2;
+
+    void runOne() {
+        for (size_t i = 0; i < MAX_UPLOADS_PER_FRAME; ++i) {
+            Task task;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (urgent.empty() && normal.empty()) break;
+                if (!urgent.empty()) {
+                    task = std::move(urgent.front());
+                    urgent.pop_front();
+                } else {
+                    task = std::move(normal.front());
+                    normal.pop_front();
+                }
+                space.notify_one();
+            }
+            task();
+        }
+
+        bool schedule = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (urgent.empty() && normal.empty())
+                scheduled = false;
+            else
+                schedule = true;
+        }
+        if (schedule) brls::sync([this] { runOne(); });
+    }
+
+    std::mutex mutex;
+    std::condition_variable space;
+    std::deque<Task> urgent;
+    std::deque<Task> normal;
+    bool scheduled = false;
+    bool stopping  = false;
+};
+#endif
 
 void ImageHelper::requestImage() {
-    brls::Logger::verbose("request Image 2: {} {}", this->imageUrl, this->isCancel);
-
-    // 请求图片
+    brls::Logger::verbose("request Image 2: {} {}", this->imageUrl, this->isCancel.load());
+#if defined(PS5_NATIVE_APP)
+    ImageRequestRunner::instance().enqueue(
+        this->imageUrl, [this] { return this->isCancel.load(); },
+        [this](cpr::Response response) {
+            ImageThreadPool::instance().Submit(
+                [this, response = std::move(response)]() mutable { this->handleImageResponse(std::move(response)); });
+        });
+#else
     cpr::Session session;
     CURL* curl = session.GetCurlHolder()->handle;
     curl_easy_setopt(curl, CURLOPT_SHARE, ImageThreadPool::instance().getShare());
@@ -244,19 +709,33 @@ void ImageHelper::requestImage() {
     session.SetProxies(bilibili::HTTP::PROXIES);
     session.SetUrl(cpr::Url{this->imageUrl});
     session.SetProgressCallback(cpr::ProgressCallback([this](...) -> bool { return !this->isCancel; }));
-    cpr::Response r = session.Get();
+    this->handleImageResponse(session.Get());
+#endif
+}
 
+void ImageHelper::handleImageResponse(cpr::Response r) {
     // 图片请求失败或取消请求
     if (r.status_code != 200 || r.downloaded_bytes == 0 || this->isCancel) {
-        brls::Logger::verbose("request undone: {} {} {} {}", r.status_code, r.downloaded_bytes, this->isCancel,
+        brls::Logger::verbose("request undone: {} {} {} {}", r.status_code, r.downloaded_bytes, this->isCancel.load(),
                               r.url.str());
-
         this->clean();
         return;
     }
+    const std::string& body     = r.text;
+    const long downloaded_bytes = r.downloaded_bytes;
 
-    brls::Logger::verbose("load pic:{} size:{} bytes by{} to {} {}", r.url.str(), r.downloaded_bytes, (size_t)this,
+    brls::Logger::verbose("load pic:{} size:{} bytes by{} to {} {}", this->imageUrl, downloaded_bytes, (size_t)this,
                           (size_t)this->imageView, this->imageView->describe());
+
+    /* 解码器要的是**我们真正持有的缓冲长度**，不是 curl 统计的 body 字节数：
+     * downloaded_bytes 在压缩/部分传输/重试等情况下与 text 的长度并不一致，
+     * 拿它当长度会读越界——真机播放页 2–4 分钟必崩，三次崩溃点都在
+     * stbi__load_main / stbi__load_and_postprocess_8bit。取两者较小值，
+     * 不一致时记一行（保留原值供排查）。 */
+    const size_t imageBytes = std::min<size_t>(body.size(), (size_t)downloaded_bytes);
+    if (imageBytes != (size_t)downloaded_bytes)
+        brls::Logger::warning("image size mismatch: url={} downloaded={} text={}", this->imageUrl,
+                              (long long)downloaded_bytes, (long long)body.size());
 
     uint8_t* imageData = nullptr;
     int imageW = 0, imageH = 0;
@@ -264,73 +743,117 @@ void ImageHelper::requestImage() {
 
 #ifdef USE_WEBP
     if (imageUrl.size() > 5 && imageUrl.substr(imageUrl.size() - 5, 5) == ".webp") {
-        imageData = WebPDecodeRGBA((const uint8_t*)r.text.c_str(), (size_t)r.downloaded_bytes, &imageW, &imageH);
+        imageData = WebPDecodeRGBA((const uint8_t*)body.c_str(), imageBytes, &imageW, &imageH);
         isWebp    = true;
     } else {
 #endif
         int n;
-        imageData =
-            stbi_load_from_memory((unsigned char*)r.text.c_str(), (int)r.downloaded_bytes, &imageW, &imageH, &n, 4);
+        imageData = stbi_load_from_memory((unsigned char*)body.c_str(), (int)imageBytes, &imageW, &imageH, &n, 4);
 #ifdef USE_WEBP
+    }
+#endif
+
+#if defined(PS5_NATIVE_APP)
+    if (!imageData) {
+        const char* reason = isWebp ? "webp decode failed" : stbi_failure_reason();
+        char message[192];
+        std::snprintf(message, sizeof(message), "img-decode: bytes=%zu size=%dx%d reason=%s try=%u", imageBytes, imageW,
+                      imageH, reason ? reason : "unknown", this->decodeAttempts + 1);
+        wiliwili_boot_log(message);
+        if (!this->isCancel && this->decodeAttempts < MAX_IMAGE_RETRIES) {
+            ++this->decodeAttempts;
+            this->requestImage();
+            return;
+        }
     }
 #endif
 
 #ifdef BOREALIS_USE_GXM
     if (imageData) {
-        bool dxt5 = this->imageFlag & NVG_IMAGE_DXT5;
+        bool dxt5   = this->imageFlag & NVG_IMAGE_DXT5;
         size_t size = nearest_po2(imageW) * nearest_po2(imageH);
-        if (!dxt5)
-            size >> 1;
-        auto *compressed = (uint8_t *)malloc(size);
+        if (!dxt5) size >> 1;
+        auto* compressed = (uint8_t*)malloc(size);
         dxt_compress(compressed, imageData, imageW, imageH, dxt5);
         freeImageData(imageData, isWebp);
         imageData = compressed;
     }
 #endif
 
-    /* Texture creation needs the render thread, but every queued image blocks
-     * the render loop for the duration of its upload. A list of covers would
-     * therefore freeze the interface, so uploads are queued and drained one per
-     * frame by the render loop (see drainImageUploads). */
-    {
-        std::lock_guard<std::mutex> lock(uploadQueueMutex());
-        uploadQueue().push_back(ImageUpload{this, imageData, imageW, imageH, isWebp});
-    }
-}
+#if defined(PS5_NATIVE_APP)
+    auto decoded    = std::make_shared<DecodedImage>();
+    decoded->data   = imageData;
+    decoded->width  = imageW;
+    decoded->height = imageH;
+    decoded->isWebp = isWebp;
+#ifdef BOREALIS_USE_GXM
+    decoded->compressed = true;
+#endif
 
-void ImageHelper::drainUploads() {
-    ImageUpload job;
+    std::shared_ptr<ImageHelper> self;
     {
-        std::lock_guard<std::mutex> lock(uploadQueueMutex());
-        if (uploadQueue().empty()) return;
-        job = uploadQueue().front();
-        uploadQueue().pop_front();
+        std::lock_guard<std::mutex> lock(requestMutex);
+        if (this->currentIter != requestPool.end()) self = *this->currentIter;
+    }
+    if (!self) {
+        this->clean();
+        return;
     }
 
-    ImageHelper* helper = job.helper;
-    int tex = brls::TextureCache::instance().getCache(helper->imageUrl);
-    if (tex > 0) {
-        brls::Logger::verbose("cache hit 2: {}", helper->imageUrl);
-        helper->imageView->innerSetImage(tex);
-    } else {
-        NVGcontext* vg = brls::Application::getNVGContext();
-        if (job.data) {
-            tex = nvgCreateImageRGBA(vg, job.width, job.height, 0, job.data);
-        } else {
-            brls::Logger::error("Failed to load image: {}", helper->imageUrl);
-        }
+    // Note grids are the bursty path; keep avatars and card covers responsive ahead of them.
+    const bool priority = this->imageUrl.find("!note-comment-multiple") == std::string::npos;
+    const bool queued   = ImageUploadQueue::instance().enqueue(
+        [self = std::move(self), decoded = std::move(decoded)] {
+            if (self->isCancel) {
+                self->clean();
+                return;
+            }
+            int tex = brls::TextureCache::instance().getCache(self->imageUrl);
+            if (tex > 0) {
+                if (!self->isCancel && self->imageView) self->imageView->innerSetImage(tex);
+            } else {
+                NVGcontext* vg = brls::Application::getNVGContext();
+                if (decoded->data) {
+                    tex = nvgCreateImageRGBA(vg, decoded->width, decoded->height, 0, decoded->data);
+                } else {
+                    brls::Logger::error("Failed to load image: {}", self->imageUrl);
+                }
+                if (tex > 0) {
+                    brls::TextureCache::instance().addCache(self->imageUrl, tex);
+                    if (!self->isCancel && self->imageView) {
+                        brls::Logger::verbose("load image: {}", self->imageUrl);
+                        self->imageView->innerSetImage(tex);
+                    }
+                }
+            }
+            self->clean();
+        },
+        [this] { return this->isCancel.load(); }, priority);
+    if (!queued) this->clean();
+#else
+    brls::sync([this, imageData, imageW, imageH, isWebp]() {
+        int tex = brls::TextureCache::instance().getCache(this->imageUrl);
         if (tex > 0) {
-            brls::TextureCache::instance().addCache(helper->imageUrl, tex);
-            if (!helper->isCancel) {
-                brls::Logger::verbose("load image: {}", helper->imageUrl);
-                helper->imageView->innerSetImage(tex);
+            if (this->imageView) this->imageView->innerSetImage(tex);
+        } else {
+            NVGcontext* vg = brls::Application::getNVGContext();
+            if (imageData) {
+                tex = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
+            } else {
+                brls::Logger::error("Failed to load image: {}", this->imageUrl);
+            }
+            if (tex > 0) {
+                brls::TextureCache::instance().addCache(this->imageUrl, tex);
+                if (!this->isCancel && this->imageView) {
+                    brls::Logger::verbose("load image: {}", this->imageUrl);
+                    this->imageView->innerSetImage(tex);
+                }
             }
         }
-    }
-    if (job.data) {
-        freeImageData(job.data, job.isWebp);
-    }
-    helper->clean();
+        if (imageData) freeImageData(imageData, isWebp);
+        this->clean();
+    });
+#endif
 }
 
 void ImageHelper::clean() {
@@ -365,12 +888,19 @@ void ImageHelper::clear(brls::Image* view) {
 void ImageHelper::cancel() {
     brls::Logger::verbose("Cancel request: {}", this->imageUrl);
     this->isCancel = true;
+#if defined(PS5_NATIVE_APP)
+    ImageUploadQueue::instance().wake();
+#endif
 }
 
 void ImageHelper::setRequestThreads(size_t num) {
     REQUEST_THREADS                            = num;
+    const size_t effectiveThreads              = effectiveImageRequestThreads(num);
     ImageThreadPool::instance().min_thread_num = 1;
-    ImageThreadPool::instance().max_thread_num = num;
+    ImageThreadPool::instance().max_thread_num = effectiveThreads;
+#if defined(PS5_NATIVE_APP)
+    ImageRequestRunner::instance().setMaxInFlight(effectiveThreads);
+#endif
 }
 
 void ImageHelper::setImageView(brls::Image* view) { this->imageView = view; }

@@ -31,6 +31,17 @@ DROP_EXACT = {
 DROP_PREFIX = ("-DUSE_GL2", "--sysroot=", "-D_GLIBCXX")
 NATIVE_DEFINES = ('-DUSE_GL3', '-DPS5_NATIVE_APP',
                   '-DBRLS_RESOURCES="/app0/assets/"',
+                  # 标题沙箱没有真正的 TLS：线程局部变量走 __emutls_get_address，
+                  # 而它在这个环境里会返回野指针。真机取证（2026-09-27，PPSA99067）：
+                  # stbi__load_and_postprocess_8bit 里 `cmpl $0,(%rax)`，rax 来自
+                  # __emutls_get_address(&stbi__vertically_flip_on_load_set)，读它
+                  # 直接 SIGBUS c=3 / BUS_ADRERR（访问了映射之外的地址）。
+                  # 只关失败字符串（STBI_NO_FAILURE_STRINGS）堵不住：stb 还有
+                  # vertically_flip_on_load_set/local 等多个 TLS 变量。
+                  # STBI_NO_THREAD_LOCALS 让 stb 的所有线程局部变量退化成普通全局——
+                  # 它们本来就只是"每线程开关"，解码线程共享同一个值没有副作用。
+                  '-DSTBI_NO_THREAD_LOCALS',
+                  '-DSTBI_NO_FAILURE_STRINGS',
                   # the payload toolchain wrapper enables these explicitly; the
                   # boilerplate wrapper targets the same ABI without them
                   '-fexceptions', '-frtti')
@@ -46,8 +57,19 @@ if os.environ.get("WILIWILI_NATIVE_PROBE"):
 # runtime.
 if os.environ.get("PS5_NATIVE_OSMESA_DIR"):
     NATIVE_DEFINES += ('-DWILIWILI_OSMESA_PROBE', '-DWILIWILI_SOFTWARE_RENDER')
+# mpv 在原生线**恒走 SW 渲染取帧**：mpv 把帧软件转成 RGBA 写进调用方缓冲，应用再把它当
+# 纹理画进播放器矩形（OSD/弹幕天然画在其上）。这条路径与 UI 用什么 GL 后端无关：
+#   · AGC/GL 变体（不设 PS5_NATIVE_OSMESA_DIR）：UI 走硬件 GL，视频走 mpv SW 帧 ⇒ 无需 OSMesa；
+#   · OSMesa 变体：UI 也是软件渲染，但两边都不依赖对方的符号。
+# 注意 OSMesa 变体**不能**再链 -lPS5OpenGLCore33：SDK 的 G19 核心库自带一份 Mesa
+# （nir_* 等符号与 OSMesa 那套重复，lld 直接报 duplicate symbol），而 SDL 的 ps5-g19
+# 视频驱动又是 EGL/AGC 呈现路径，两者当前无法共存（真机 PPSA99087 链接失败）。
+if os.environ.get("PS5_NATIVE_SKIP_MPV_SW") != "1":
+    NATIVE_DEFINES += ('-DMPV_SW_RENDER',)
 if os.environ.get("WILIWILI_SKIP_HOME_REQUEST") == "1":
     NATIVE_DEFINES += ('-DWILIWILI_SKIP_HOME_REQUEST',)
+if os.environ.get("PS5_NATIVE_AGC") == "1":
+    NATIVE_DEFINES += ('-DPS5_NATIVE_AGC', '-DBOREALIS_USE_AGC', '-DEVO_TARGET_PS5')
 
 # libromfs bundles resources into the payload; the native title reads /app0.
 # libromfs stays enabled: a title sandbox denies directory iteration, so the
@@ -67,6 +89,12 @@ def compile_plan(cdb: Path, root: Path, sdk: Path, sdl2: Path, gl: Path) -> list
     for entry in entries:
         source = entry["file"]
         relative = os.path.relpath(source, root)
+        # AGC presents through EVO directly; compiling SDL's GL video object
+        # would pull its ps5-g19/NIR dependency into the title even though the
+        # AGC platform selects AgcVideoContext instead.
+        if (os.environ.get("PS5_NATIVE_AGC") == "1"
+                and relative == "library/borealis/library/lib/platforms/sdl/sdl_video.cpp"):
+            continue
         if any(marker in relative for marker in SKIP_SOURCES):
             continue
         args = shlex.split(entry["command"])
@@ -104,17 +132,14 @@ def compile_plan(cdb: Path, root: Path, sdk: Path, sdl2: Path, gl: Path) -> list
     return plan
 
 
-def object_is_current(obj: Path) -> bool:
-    """True when the object is newer than the source and every header it used.
-
-    Compilation writes a make-style dependency file next to the object, so a
-    header change (shared defines such as PS5_NATIVE_APP resource paths) also
-    triggers a rebuild instead of leaving stale objects behind.
-    """
+def object_is_current(obj: Path, flags: list[str]) -> bool:
+    """True when dependencies and compile flags still match the cached object."""
     if not obj.exists():
         return False
     dependencies = Path(str(obj) + ".d")
-    if not dependencies.exists():
+    flag_stamp = Path(str(obj) + ".flags")
+    expected_flags = json.dumps(flags, ensure_ascii=False, separators=(",", ":"))
+    if not dependencies.exists() or not flag_stamp.exists() or flag_stamp.read_text() != expected_flags:
         return False
     stamp = obj.stat().st_mtime
     for line in dependencies.read_text().splitlines():
@@ -141,11 +166,14 @@ def compile_sources(plan, env: dict[str, str], wrapper: Path, jobs: int, out: Pa
 
     def build(item):
         source, obj, flags = item
-        if object_is_current(Path(obj)):
+        object_path = Path(obj)
+        if object_is_current(object_path, flags):
             return source, obj, None, True
         argv = (["sh", str(wrapper)] + flags
                 + ["-MMD", "-MF", obj + ".d", "-MT", obj, "-o", obj])
         result = run(argv, env)
+        if result.returncode == 0:
+            Path(obj + ".flags").write_text(json.dumps(flags, ensure_ascii=False, separators=(",", ":")))
         return source, obj, result, False
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -198,14 +226,13 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     # application: the software rendering variant gates its startup probe on one
     # of them.
     feature_defines = tuple(d for d in NATIVE_DEFINES if d.startswith("-DWILIWILI_"))
-    extra_sources = ["native_shims.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c", "audio_probe.c", "audio2_probe.c", "ps5_player.c"]
+    extra_sources = ["native_shims.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c"]
     # native_libc_trace.c reports every string and memory call reached with a
     # NULL argument, which is how the software renderer's crash was identified.
     # It wraps hot libc entry points, so it is a diagnostic aid and stays out of
     # the deliverable image unless PS5_NATIVE_LIBC_TRACE=1 asks for it.
     if os.environ.get("PS5_NATIVE_LIBC_TRACE") == "1":
         extra_sources.append("native_libc_trace.c")
-    # 自管播放器要用 SDK 里的 ffmpeg 头（ps5_player.c 走 ffmpeg 解封装）。
     homebrew_include = sdk / "target" / "user" / "homebrew" / "include"
     probe_defines    = feature_defines + (f"-I{homebrew_include}",)
     for extra in extra_sources:
@@ -227,19 +254,47 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
 
 
 
+def extract_libc_object(sdk: Path, member: str, out: Path) -> Path:
+    """Pull one object out of the payload SDK's libc.
+
+    The payload line's name resolution is the SDK libc's own netdb.o. The native
+    title cannot link that libc (its process bootstrap crashes before main), so
+    only the resolver object is taken. The leaf helpers netdb.o expects from the
+    firmware (sceNetErrnoLoc / __inet_aton / getifaddrs / freeifaddrs) come from
+    native_libc_compat.c, because a title cannot call the firmware's copy.
+    """
+    archive = sdk / "target" / "lib" / "libc.a"
+    if not archive.is_file():
+        raise SystemExit(f"payload libc not found: {archive}")
+    target = out / member
+    scratch = out / "libc-objects"
+    scratch.mkdir(parents=True, exist_ok=True)
+    if not target.is_file() or target.stat().st_mtime < archive.stat().st_mtime:
+        result = run(["ar", "x", str(archive), member], {}, scratch)
+        if result.returncode != 0:
+            raise SystemExit(f"failed to extract {member} from {archive}: {result.stderr}")
+        shutil.copy2(scratch / member, target)
+    return target
+
+
 def link(plan, runtime_objects, root: Path, toolchain: Path, sdk: Path, sdl2: Path,
          gl: Path, native_tool: Path, env: dict[str, str], out: Path) -> Path:
     objects = [obj for _, obj, _ in plan] + runtime_objects
     homebrew = sdk / "target" / "user" / "homebrew" / "lib"
+    curl_archive = Path(os.environ.get("PS5_NATIVE_CURL_ARCHIVE", str(homebrew / "libcurl.a")))
+    if not curl_archive.is_file():
+        raise SystemExit(f"static libcurl archive not found: {curl_archive}")
     payload_libs = [
         "-lmpv", "-lavfilter", "-lswscale", "-lpostproc", "-lavformat", "-lavcodec",
-        "-lSceVideodec2", "-lSceAudioOut", "-lSceAudioOut2", "-lSceUserService",
+        "-lSceVideodec2", "-lSceUserService",
         "-lx264", "-lpthread", "-lswresample", "-lavutil", "-lssl", "-lcrypto",
         "-lass", "-liconv", "-lfontconfig", "-lexpat", "-lharfbuzz", "-lfribidi",
         "-lfreetype", "-lbz2", "-lpng16", "-lwebp", "-lsharpyuv", "-lz", "-lm",
         "-lsamplerate", "-lSceNet", "-lmbedcrypto", "-lmbedtls", "-lmbedx509", "-lpsl",
         "-lSceAgc", "-lSceAgcDriver", "-lSceSysmodule",
     ]
+    if os.environ.get("PS5_NATIVE_AGC") == "1":
+        payload_libs.append("-lSceVideoOut")
     romfs = Path(os.environ.get(
         "PS5_NATIVE_ROMFS_ARCHIVE",
         root / "build-ps5" / "library" / "borealis" / "library" / "lib" /
@@ -255,13 +310,16 @@ def link(plan, runtime_objects, root: Path, toolchain: Path, sdk: Path, sdl2: Pa
         str(sdk / "target" / "lib" / "libunwind.a"),
         str(sdk / "target" / "lib" / "libc++abi.a"),
         str(sdk / "target" / "lib" / "libc++.a"),
-        str(homebrew / "libcurl.a"),
+        str(curl_archive),
     ]
     # Software rendering variant: the sandbox refuses to load code at runtime, so
     # OSMesa is linked in instead of the GL/AGC stack. The static archives come
     # from a Mesa 22.1.7 cross build (see scripts/ps5/native/build-osmesa.sh).
     osmesa = os.environ.get("PS5_NATIVE_OSMESA_DIR")
     if osmesa:
+        # The OSMesa SDL variant presents through the upstream PS5 VideoOut
+        # backend instead of the G19 EGL bridge.
+        payload_libs.extend(["-lSceVideoOut", "-lSceSystemService"])
         osmesa_path = Path(osmesa)
         archives.extend([
             str(osmesa_path / "libosmesa_st.a"),
@@ -282,8 +340,11 @@ def link(plan, runtime_objects, root: Path, toolchain: Path, sdk: Path, sdl2: Pa
             *([str(p) for p in sorted((osmesa_path / "llvm").glob("libLLVM*.a"))]
               if os.environ.get("PS5_NATIVE_OSMESA_LLVM", "1") == "1" else []),
         ])
-    else:
+    elif os.environ.get("PS5_NATIVE_AGC") != "1":
         archives.append("-lPS5OpenGLCore33")
+    # OSMesa and AGC both provide their own non-G19 presentation path; neither
+    # should carry the unrelated ps5-g19/Mesa implementation into the title.
+    # OSMesa also cannot coexist with the SDK's duplicate NIR symbols (PPSA99087).
     compiler_runtime = subprocess.run(
         ["clang-18", "--print-resource-dir"], check=True, text=True,
         capture_output=True).stdout.strip()
@@ -333,6 +394,7 @@ def link(plan, runtime_objects, root: Path, toolchain: Path, sdk: Path, sdl2: Pa
             "--wrap=fflush", "--wrap=memset", "--wrap=strstr", "--wrap=strnlen",
             "--wrap=strlcpy", "--wrap=strlcat", "--wrap=strcpy", "--wrap=strncpy",
             "--wrap=strcat", "--wrap=__srget", "--wrap=__swbuf",
+            "--wrap=printf",
             "--wrap=mprotect", "--wrap=munmap", "--wrap=mmap",
         ]
     argv = [
@@ -494,6 +556,8 @@ def main() -> int:
     print(f"==> compiling {len(plan)} translation units for the native runtime")
     compile_sources(plan, env, wrapper, args.jobs, out / "obj")
     runtime_objects = compile_runtime_objects(root, toolchain, sdk, wrapper, env, out, gl)
+    # 网络解析用 payload 线那份（SDK libc 的 netdb.o）：原生线不再自写 getaddrinfo。
+    runtime_objects.append(str(extract_libc_object(sdk, "netdb.o", out)))
     module = link(plan, runtime_objects, root, toolchain, sdk, sdl2, gl,
                   out / "ps5-native-tool", env, out)
     dist = package(module, root, toolchain, sdk, out, args.title_id)

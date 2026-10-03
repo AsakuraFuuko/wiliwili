@@ -91,6 +91,9 @@ public:
 
     void willAppear(bool resetState = false) override;
 
+    void onPause() override;
+    void onResume() override;
+
     ~BasePlayerActivity() override;
 
     // 分集播放结束后，自动播放推荐视频
@@ -105,6 +108,7 @@ public:
     inline static bool PLAYER_SKIP_OPENING_CREDITS = true;
 
 protected:
+    bool isRequestActive() const override { return activityShown; }
     BRLS_BIND(VideoView, video, "video");
     BRLS_BIND(brls::AppletFrame, appletFrame, "video/detail/frame");
     BRLS_BIND(UserInfoView, videoUserInfo, "video_author");
@@ -135,7 +139,7 @@ protected:
     ChangeIndexEvent changeIndexEvent;
 
 private:
-    bool activityShown = false;
+    bool activityShown = true;
     std::chrono::system_clock::time_point videoDeadline{};
 
     // 重新选择当前清晰度的播放链接播放

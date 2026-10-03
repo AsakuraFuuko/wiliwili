@@ -1,12 +1,10 @@
 //
 // Created by fang on 2023/4/20.
 //
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
-#include <codecvt>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <locale>
+#include <string>
 #include <borealis/core/thread.hpp>
 #include <borealis/core/touch/tap_gesture.hpp>
 
@@ -25,6 +23,97 @@ using namespace brls::literals;
 
 typedef brls::Event<char> KeyboardEvent;
 typedef std::vector<char> KeyboardData;
+
+static void appendUtf8(std::string& output, std::uint32_t codePoint) {
+    if (codePoint <= 0x7F) {
+        output.push_back(static_cast<char>(codePoint));
+    } else if (codePoint <= 0x7FF) {
+        output.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    } else if (codePoint <= 0xFFFF) {
+        output.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    } else {
+        output.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+}
+
+static std::string wstringToUtf8(const std::wstring& value) {
+    std::string output;
+    for (size_t i = 0; i < value.size(); ++i) {
+        std::uint32_t codePoint = static_cast<std::uint32_t>(value[i]);
+        if (codePoint >= 0xD800 && codePoint <= 0xDBFF) {
+            if (i + 1 < value.size()) {
+                const std::uint32_t low = static_cast<std::uint32_t>(value[i + 1]);
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (low - 0xDC00);
+                    ++i;
+                } else {
+                    codePoint = 0xFFFD;
+                }
+            } else {
+                codePoint = 0xFFFD;
+            }
+        } else if ((codePoint >= 0xDC00 && codePoint <= 0xDFFF) || codePoint > 0x10FFFF) {
+            codePoint = 0xFFFD;
+        }
+        appendUtf8(output, codePoint);
+    }
+    return output;
+}
+
+static void appendWchar(std::wstring& output, std::uint32_t codePoint) {
+    if constexpr (sizeof(wchar_t) == 2) {
+        if (codePoint <= 0xFFFF) {
+            output.push_back(static_cast<wchar_t>(codePoint));
+        } else {
+            output.push_back(static_cast<wchar_t>(0xD800 + ((codePoint - 0x10000) >> 10)));
+            output.push_back(static_cast<wchar_t>(0xDC00 + ((codePoint - 0x10000) & 0x3FF)));
+        }
+    } else {
+        output.push_back(static_cast<wchar_t>(codePoint));
+    }
+}
+
+static std::wstring utf8ToWstring(const std::string& value) {
+    std::wstring output;
+    for (size_t i = 0; i < value.size();) {
+        const auto byte           = [&value](size_t index) { return static_cast<unsigned char>(value[index]); };
+        const unsigned char first = byte(i);
+        std::uint32_t codePoint   = 0xFFFD;
+        size_t consumed           = 1;
+        if (first <= 0x7F) {
+            codePoint = first;
+        } else if (first >= 0xC2 && first <= 0xDF && i + 1 < value.size() && (byte(i + 1) & 0xC0) == 0x80) {
+            codePoint = ((first & 0x1F) << 6) | (byte(i + 1) & 0x3F);
+            consumed  = 2;
+        } else if (first >= 0xE0 && first <= 0xEF && i + 2 < value.size() && (byte(i + 1) & 0xC0) == 0x80 &&
+                   (byte(i + 2) & 0xC0) == 0x80) {
+            codePoint = ((first & 0x0F) << 12) | ((byte(i + 1) & 0x3F) << 6) | (byte(i + 2) & 0x3F);
+            if (codePoint < 0x800 || (codePoint >= 0xD800 && codePoint <= 0xDFFF)) {
+                codePoint = 0xFFFD;
+            } else {
+                consumed = 3;
+            }
+        } else if (first >= 0xF0 && first <= 0xF4 && i + 3 < value.size() && (byte(i + 1) & 0xC0) == 0x80 &&
+                   (byte(i + 2) & 0xC0) == 0x80 && (byte(i + 3) & 0xC0) == 0x80) {
+            codePoint = ((first & 0x07) << 18) | ((byte(i + 1) & 0x3F) << 12) | ((byte(i + 2) & 0x3F) << 6) |
+                        (byte(i + 3) & 0x3F);
+            if (codePoint < 0x10000 || codePoint > 0x10FFFF) {
+                codePoint = 0xFFFD;
+            } else {
+                consumed = 4;
+            }
+        }
+        appendWchar(output, codePoint);
+        i += consumed;
+    }
+    return output;
+}
 
 class KeyboardButton : public RecyclingGridItem {
 public:
@@ -226,13 +315,9 @@ void TVSearchActivity::onContentAvailable() {
 
 TVSearchActivity::~TVSearchActivity() { brls::Logger::debug("TVSearchActivity: delete"); }
 
-std::string TVSearchActivity::getCurrentSearch() {
-    return std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(currentSearch);
-}
+std::string TVSearchActivity::getCurrentSearch() { return wstringToUtf8(currentSearch); }
 
-void TVSearchActivity::setCurrentSearch(const std::string& value) {
-    currentSearch = std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(value);
-}
+void TVSearchActivity::setCurrentSearch(const std::string& value) { currentSearch = utf8ToWstring(value); }
 
 void TVSearchActivity::search(const std::string& key) {
     if (key.empty()) return;

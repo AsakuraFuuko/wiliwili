@@ -1,4 +1,6 @@
 # 原生标题线 2.0 — 计划（依据四份调研）
+> 迁移期文档（已完成）；当前状态见 `notes/03` 与 `notes/06`。
+
 
 > 依据：本目录 `01-agc-bringup.md`、`02-hwdecode.md`、`03-native-line-status.md`、`04-ui-renderer.md`，
 > 以及 `../../run-continuation/ps5-port-status.md` 的「硬解参考实现」「GPU 渲染参考实现」「payload 线的能力边界」「主页局部渲染尝试（已回退）」四节。

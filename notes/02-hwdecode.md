@@ -15,11 +15,13 @@
 1. **可行，且已被两个独立项目在真机验证**。`EVO-PLAYER-PS5` 在 `PPSA99039`（fake-signed、ShadowMountPlus、带 `param.json`）里拿到 `VDEC self-test: HARDWARE DECODE OK`（4K H.264 实时播放）；`ProsperoLight` 在 `PPSA99002` 上以生产级用法长跑 Moonlight 流。两个项目的结论一致：**`sceVideodec2Decode` 的 errno 5200 是"进程上下文"门，不是驱动/签名门**，我们原生标题线正是它们所需的那种进程。
 2. **完整 bring-up 序列可以照抄**（§2）。三个项目的字段口径有差异（`prot`、`max_dpb_frames`、`pipeline_depth`、池大小），差异点已在 §2.4 列表说明，均可硬件验证过，按我们的场景选一套即可。
 3. **呈现两条路**（§4）：
-   - **(A) AGC 视频管线**：`sceVideodec2` → NV12 指针 → AGC 管线 `VIDEO_NV12` 直接采样（**零拷贝**）+ `sceAgcDcbSetFlip`。成本极低（EVO 实测 4K 合成 **982 µs/帧**），但**等于接管 VideoOut 与整条渲染链**（现有 nanovg/Mesa 栈要重写或并存），工作量在"重写渲染层"量级。
+   - **(A) AGC 视频管线**：`sceVideodec2` → NV12 Y/UV → AGC `VIDEO_NV12` 管线采样（避免 CPU YUV→RGBA；AGC 仍可能把平面 stage 到 transient GPU ring）→ DCB 提交/栅栏 → `sceVideoOutSubmitFlip`。成本低（EVO 实测 4K 合成 **982 µs/帧**），但**等于接管 VideoOut 与整条渲染链**（现有 nanovg/Mesa 栈要重写或并存），工作量在“重写渲染层”量级。
    - **(B) NV12 → 现有 llvmpipe/nanovg 栈**：两条子路 —— **B1** 上传两张纹理 + GLSL 做 YUV→RGB（改动最小，GPU 代价与今天 mpv 的视频 pass 同量级）；**B2** CPU 把 NV12 转成 ABGR8888 后**直写 SDL 窗口表面**（EVO 实测 1080p 融合转换器 **0.98–2.11 ms/帧**，4K **7.4–11 ms/帧**），**同时省掉解码与渲染**，是当前架构下唯一能真正提速的组合。
    - **推荐先做 (B)**，其中先做 B1（零正确性风险）验证链路，再评估 B2。(A) 作为后续"原生线 2.0 终极形态"，不应与首批接入混做。
 4. **与 wiliwili 播放链的接法很干净**（§5）：B 站 DASH 接口本来就把 **视频轨与音频轨分成两个 URL**（`dash.video[]` / `dash.audio[]`），所以让 **mpv 只做"音频 + 时钟"**（只喂音频 URL），视频完全自建（ffmpeg demux → `h264/hevc_mp4toannexb` → videodec2 → 呈现），弹幕/OSD/进度条一行都不用改（它们只依赖 `MPVCore::playback_time`）。**必须绕开的只有 mpv 的视频解码与视频渲染两条**。
 5. **收益要说实话**：我们当前播放瓶颈是 **llvmpipe 渲染**（`decoder-drops=0`，丢帧在显示端，见 `run-continuation/ps5-port-status.md`）。硬解本身**不会**让 1080p H.264 更流畅；它带来的是 (a) **4K / HEVC / 10-bit 的播放能力**（软解那本账（~450 MB flexible 上限）根本付不起），(b) **释放 CPU**（llvmpipe 与 UI 抢核），(c) 配合 B2 时**顺带砍掉 llvmpipe 的视频 pass（两遍全屏）**——这一条才是帧率收益的来源。
+> **接入状态（2026-10-03 更新）**：硬解**未接入生产链路**；`scripts/ps5/native/videodec2_probe.c` 是诊断探针：**始终编入镜像**（`native_build.py:229` 的运行时对象；帧钩子与 draw 计数常驻），只有 VDEC 自检/帧抽取路径由 options 文件里的 `WILIWILI_TEST_VDEC=1` 触发（`videodec2_probe.c:10`）。当前正式标题 **PPSA99233** 的视频走**静态 libmpv 软解 + SW 出帧**（`MPV_RENDER_API_TYPE_SW`），音频走 `ao=sdl`。本文 §2–§8 的 bring-up 序列与 §10 的实测仍作为后续硬解接入的参考，不代表当前运行路径。
+
 
 ---
 
@@ -270,12 +272,12 @@ ProsperoLight 另有两条工程性校验（`moonlight_stream.cpp:1295-1315`）�
    1080p 的 `pitch=2048`（256 对齐）、槽 16K 对齐 → 条件天然满足。
 2. 为 Y 建 **T# R8**、为 UV 建 **T# RG8**（`evo_agc_build_tsharp_r8/rg8`，各 48 字节描述符 + S# 采样器），指向帧池地址：`evo_agc_runtime.c:2700-2760`。
 3. 选 `EVO_AGC_PIPE_VIDEO_NV12` 管线（10-bit 走 `VIDEO_HDR`/`VIDEO_HLG`），全屏 viewport + scissor，V# 常量传 crop/scale：`evo_agc_runtime.c:2581-2700`。
-4. 画 6 顶点 quad，`sceAgcDcbSetFlip` 由 DCB 自己发（**不用 `sceVideoOutSubmitFlip`**）：`docs/evo-pro/status.md:188-200`。
+4. 画 6 顶点 quad，提交 DCB，等待 GPU fence 后由 `sceVideoOutSubmitFlip` 呈现（不是 `sceAgcDcbSetFlip` 独立接管翻转）：`references/EVO-PLAYER-PS5/projects/evoplayer/media/src/evo_agc_runtime.c:2089-2231`。
 5. 代价：EVO 实测 4K 合成 **982 µs/帧**（见 `run-continuation/ps5-port-status.md` 的 GPU 渲染调研节）。
 
 **可行性要点**：
 - **不需要 amdllpc**：视频管线已作为**预编译 ISA 数组 + 全部寄存器值**随源码发布（`projects/evoplayer/shaders/agc/video_yuv_nv12_pipe.h`，7.3 KB，含 `..._GS_ISA_BYTES 256`、`..._RSRC1/2`、`..._DRAW_MODIFIER`、user-SGPR 布局），由 `tools/build_agc_pipes.py` + 打过 gfx1013 补丁的 amdllpc 生成（`docs/hardware/shader-compilation.md:91-123`）。**复用这些 blob 合法（GPL-3.0）且省掉整条着色器工具链**。
-- **但必须接管 VideoOut 与合成**：AGC 自己发 flip ⇒ 与我们 SDL ps5 驱动（`sceVideoOutOpen` + `RegisterBuffers2` + `SubmitFlip`）**不能同时存在**（`sceVideoOut` 单 owner，第二次 open 会 panic —— `run-continuation/ps5-port-status.md` GPU 调研节）。UI（nanovg/llvmpipe）要么也搬到 AGC（EVO 的 UI 渲染器就是自写的），要么让 AGC 只画视频而 UI 用 CPU 写进同一块扫描缓冲（需要 cache flush + 手写合成，EVO 的 present 里就有 `cache_flush` 计时项，`ProsperoLight:src/native_agc_present.hpp:14-18`）。
+- **但必须接管 VideoOut 与合成**：EVO 的 AGC runtime 自己组织 DCB、fence 和 `sceVideoOutSubmitFlip`，仍与我们 SDL ps5 驱动（`sceVideoOutOpen` + `RegisterBuffers2` + `SubmitFlip`）争用同一 VideoOut owner；UI（nanovg/llvmpipe）要么也搬到 AGC，要么让 AGC 只画视频而 UI 用 CPU 写进同一块扫描缓冲（需要 cache flush + 手写合成，EVO 的 present 里就有 `cache_flush` 计时项，`ProsperoLight:src/native_agc_present.hpp:14-18`）。
 - **`libSceAgc`/`libSceAgcDriver` 必须在 self-unjail 之前初始化**（`docs/hardware/gpu-notes.md`，见状态文档同节）；我们的 native 线**已经有这两个 PRX 桩与 `-lSceAgc -lSceAgcDriver` 链接**（`ps5-native/ps5-opengl/tools/build-native-test-app.sh:209-220` 生成桩；我们的 native 构建已链入并出画面）。
 
 **结论**：(A) 的性能与"视频平面零拷贝"最优，但**它是一整套渲染架构**（AGC runtime 2771 行 + writer 362 行 + transient ring 137 行，再加 flip/呈现所有权），不是"解个码"。**不建议与首批硬解接入同时做。**
@@ -1294,3 +1296,14 @@ clock_ms=36682 pts_ms=37133     ← A/V 锁定在 ±500ms，~40 秒推进 37 秒
    `DecoderConfigInfo` 逐项对比（`max_dpb_frames` 用 -1 就不会错）。
 3. 需要"确定无疑"的字节时用 `read-download0.sh` 取回落盘文件（记得先 kill 标题，
    镜像才写回）。
+
+### ★★★★ 本地 EVO 源码复核：硬解接入边界（2026-09-30）
+
+本次直接核对仓库内 `references/EVO-PLAYER-PS5/`，不再只依赖旧笔记：
+
+- `projects/evoplayer/media/src/evo_vdec_native.c:414-589, 639-693, 1084-1181, 1380-1568`：resident decoder slot、`Query/Allocate/QueryMemory/Create/Reset` bring-up、Annex-B BSF、AU 提交、PTS reorder、EOF flush；seek 必须重建 BSF，普通 `av_bsf_flush()` 不会重新注入 SPS/PPS。
+- `projects/evoplayer/media/src/evo_vdec_ffmpeg.c:161-184, 251-324`：`AUTO` 只在对应探针成功时选硬解，打开失败自动退回 FFmpeg；显式 `NATIVE` 则拒绝静默降级。
+- `projects/evoplayer/media/src/evo_agc_runtime.c:2089-2231, 3547-3796` 与 `shaders/agc/video_yuv_nv12.pipe:30-51`：NV12 的 Y/UV 走 R8/RG8 管线和 YUV shader；平面仍可能 stage 到 transient GPU ring。提交 DCB、等待 fence，最终调用 `sceVideoOutSubmitFlip`，不是独立的 `sceAgcDcbSetFlip` 路径。
+- `projects/evoplayer/media/src/evo_adec_native.c:148-310`、`evo_audio_out.c:142-209, 381-529`、`evo_playback.c:162-182, 320-475`：AAC/MP3 可走 `sceAudiodec`，PCM 经 resample/channel mapping 后 `sceAudioOutOutput`；实际已播放 sample 驱动音频主时钟，视频按 PTS 早等、晚丢。
+
+因此 wiliwili 当前应继续保持 **mpv SW 视频 + SDL 音频**稳定路径。mpv 的 `hwdec` 选项不会自动接上 `sceVideodec2`；若目标是 4K/HEVC/10-bit，推荐后续采用“mpv 只做音频/时钟 + 独立视频线程（FFmpeg demux/BSF → `sceVideodec2` → NV12 两平面纹理）”，只复用 EVO 的 decoder、seek、PTS 和 fallback 机制，不搬整套 EVO AGC/VideoOut owner。

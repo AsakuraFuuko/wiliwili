@@ -170,9 +170,9 @@ void VideoDetail::requestSeasonStatue(uint64_t seasonID) {
 
 /// 获取视频信息：标题、作者、简介、分P等
 void VideoDetail::requestVideoInfo(const std::string& bvid) {
+    if (!isRequestActive()) return;
     // 重置MPV
     MPVCore::instance().reset();
-
     ASYNC_RETAIN
     brls::Logger::debug("请求视频信息: {}", bvid);
     BILI::get_video_detail_all(
@@ -180,6 +180,7 @@ void VideoDetail::requestVideoInfo(const std::string& bvid) {
         [ASYNC_TOKEN](const bilibili::VideoDetailAllResult& result) {
             brls::sync([ASYNC_TOKEN, result]() {
                 ASYNC_RELEASE
+                if (!this->isRequestActive()) return;
                 brls::Logger::debug("BILI::get_video_detail");
                 this->videoDetailResult = result.View;
                 this->userDetailResult  = result.Card;
@@ -263,6 +264,7 @@ void VideoDetail::requestVideoInfo(const std::string& bvid) {
 
 /// 获取视频地址
 void VideoDetail::requestVideoUrl(const std::string& bvid, uint64_t cid, bool requestHistoryInfo) {
+    if (!isRequestActive()) return;
     // 重置MPV
     MPVCore::instance().reset();
     ASYNC_RETAIN
@@ -274,6 +276,7 @@ void VideoDetail::requestVideoUrl(const std::string& bvid, uint64_t cid, bool re
         [ASYNC_TOKEN](const bilibili::VideoUrlResult& result) {
             brls::sync([ASYNC_TOKEN, result]() {
                 ASYNC_RELEASE
+                if (!this->isRequestActive()) return;
                 this->videoUrlResult = result;
                 this->onVideoPlayUrl(result);
             });
@@ -299,6 +302,7 @@ void VideoDetail::requestVideoUrl(const std::string& bvid, uint64_t cid, bool re
 
 /// 获取番剧地址
 void VideoDetail::requestSeasonVideoUrl(const std::string& bvid, uint64_t cid, bool requestHistoryInfo) {
+    if (!isRequestActive()) return;
     // 重置MPV
     MPVCore::instance().reset();
 
@@ -309,6 +313,7 @@ void VideoDetail::requestSeasonVideoUrl(const std::string& bvid, uint64_t cid, b
         [ASYNC_TOKEN](const bilibili::SeasonUrlResult& result) {
             brls::sync([ASYNC_TOKEN, result]() {
                 ASYNC_RELEASE
+                if (!this->isRequestActive()) return;
                 brls::Logger::debug("BILI::get_video_url");
                 this->videoUrlResult = result.video_info;
                 this->onVideoPlayUrl(this->videoUrlResult);

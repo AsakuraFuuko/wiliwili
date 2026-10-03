@@ -197,6 +197,23 @@ int __wrap_fprintf(void *stream, const char *format, ...) {
   return result;
 }
 
+/* 驱动的诊断输出走 printf（`[ps5-driver-cycles]` 相位计数、`[ps5-cpu-flush-summary]`
+ * 等），而标题的 stdout 默认被丢掉（见 native_shims.c 的 freopen）：把这个引用
+ * 接到日志管线上，驱动自己的数字就能在 UDP/文件日志里取到。仅诊断构建
+ * （PS5_NATIVE_LIBC_TRACE=1）启用，正式包不带这个包装。 */
+int __wrap_printf(const char *format, ...) {
+  if (format == NULL)
+    return -1;
+  char message[256];
+  va_list arguments;
+  va_start(arguments, format);
+  int written = vsnprintf(message, sizeof(message), format, arguments);
+  va_end(arguments);
+  if (written > 0 && message[0] != '\0')
+    wiliwili_boot_log(message);
+  return written;
+}
+
 void *__wrap_fopen(const char *path, const char *mode) {
   if (path == NULL || mode == NULL) {
     wiliwili_note_arguments("fopen", path, mode, 0, 1);

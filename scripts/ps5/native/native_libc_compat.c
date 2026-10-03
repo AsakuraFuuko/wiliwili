@@ -36,6 +36,7 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <fnmatch.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <strings.h>
 #include <net/if.h>
@@ -707,40 +708,38 @@ void *__emutls_get_address(struct emutls_control *control) {
   return value;
 }
 
-/* -------------------------------------------------------------------- DNS */
-
-/*
- * The platform's getaddrinfo() faults inside libSceNet for an installed title,
- * so name resolution goes through the resolver service directly - the same
- * approach the payload SDK's networking samples use. Numeric addresses are
- * handled locally; names are resolved by sceNetResolverStartNtoa().
+/* --------------------------------------------------------------- netdb ----
+ * 解析改用 payload 线的实现：直接链接 payload SDK libc 的 `netdb.o`
+ * （getaddrinfo / gethostbyname / getnameinfo / freeaddrinfo / gai_strerror /
+ * getservbyname…，见 native_build.py 的 extract_libc_object()）。自写的 UDP 查询与
+ * resolver 包装（原 wiliwili_dns_server / wiliwili_dns_lookup / wiliwili_resolve /
+ * wiliwili_build_addrinfo 与 getaddrinfo/getnameinfo/freeaddrinfo/gai_strerror/
+ * gethostbyname）随之删除——两条线行为一致。
+ *
+ * 下面只保留 netdb.o 需要、而 payload 线由固件 libSceLibcInternal 提供的叶垫片：
+ * sceNetErrnoLoc / __inet_aton / getifaddrs / freeifaddrs——标题拿不到固件那份，必须自备。
  */
-int sceNetResolverCreate(const char *name, void *pool, int flags);
-int sceNetResolverStartNtoa(int resolver, const char *hostname, void *address,
-                            unsigned int timeout, int retries, int flags);
-int sceNetResolverDestroy(int resolver);
-int sceNetResolverGetError(int resolver, int *error);
-
-long sceNetPoolCreate(const char *name, int size, int flags);
 
 
-/* Dotted-quad parser; the platform's inet_pton is bound to libScePosixForWebKit
- * and is not usable from a title. Returns the address in network order. */
-static unsigned int wiliwili_parse_ipv4(const char *text) {
-  unsigned int octets[4] = {0, 0, 0, 0};
+/* netdb.o 把它的返回值当"网络 errno 的地址"（int*）。 */
+int *sceNetErrnoLoc(void) {
+  static int net_errno;
+  return &net_errno;
+}
+
+/* BSD 风格 inet_aton：netdb.o 用它解析 "a.b.c.d" 字面量。 */
+int __inet_aton(const char *text, struct in_addr *address) {
+  unsigned int parts[4];
   const char *cursor = text;
-
+  if (cursor == NULL)
+    return 0;
   for (int index = 0; index < 4; ++index) {
     if (*cursor < '0' || *cursor > '9')
       return 0;
-    unsigned int value = 0;
-    while (*cursor >= '0' && *cursor <= '9') {
-      value = value * 10 + (unsigned int)(*cursor - '0');
-      if (value > 255)
-        return 0;
-      ++cursor;
-    }
-    octets[index] = value;
+    unsigned long value = strtoul(cursor, (char **)&cursor, 10);
+    if (value > 255)
+      return 0;
+    parts[index] = (unsigned int)value;
     if (index < 3) {
       if (*cursor != '.')
         return 0;
@@ -749,306 +748,55 @@ static unsigned int wiliwili_parse_ipv4(const char *text) {
   }
   if (*cursor != '\0')
     return 0;
-
-  /* Guest is little-endian: emit the address in network byte order. */
-  return (octets[3] << 24) | (octets[2] << 16) | (octets[1] << 8) | octets[0];
+  if (address != NULL)
+    address->s_addr = htonl((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]);
+  return 1;
 }
 
-static struct addrinfo *wiliwili_build_addrinfo(unsigned int address,
-                                               const char *service,
-                                               const struct addrinfo *hints) {
-  struct sockaddr_in *socket_address = calloc(1, sizeof(*socket_address));
-  struct addrinfo *result = calloc(1, sizeof(*result));
-  if (socket_address == NULL || result == NULL) {
-    free(socket_address);
-    free(result);
-    return NULL;
+/* netdb.o 用它判断本机是否配置了 IPv4（AI_ADDRCONFIG）。payload 线由固件
+ * libSceLibcInternal 提供完整实现；标题里给一条回环即可让"IPv4 已配置"成立。 */
+int getifaddrs(struct ifaddrs **list) {
+  if (list == NULL) {
+    errno = EINVAL;
+    return -1;
   }
-
-  socket_address->sin_len = sizeof(*socket_address);
-  socket_address->sin_family = AF_INET;
-  socket_address->sin_addr.s_addr = address;
-  {
-    uint16_t port = (uint16_t)(service != NULL ? atoi(service) : 0);
-    socket_address->sin_port = (uint16_t)((port << 8) | (port >> 8));
+  struct ifaddrs *entry = (struct ifaddrs *)calloc(1, sizeof(*entry));
+  struct sockaddr_in *address = (struct sockaddr_in *)calloc(1, sizeof(*address));
+  struct sockaddr_in *netmask = (struct sockaddr_in *)calloc(1, sizeof(*netmask));
+  char *name = (char *)calloc(1, 4);
+  if (entry == NULL || address == NULL || netmask == NULL || name == NULL) {
+    free(entry);
+    free(address);
+    free(netmask);
+    free(name);
+    errno = ENOMEM;
+    return -1;
   }
-
-  result->ai_family = AF_INET;
-  result->ai_socktype = hints != NULL && hints->ai_socktype != 0
-                            ? hints->ai_socktype
-                            : SOCK_STREAM;
-  result->ai_protocol = hints != NULL ? hints->ai_protocol : 0;
-  result->ai_addrlen = sizeof(*socket_address);
-  result->ai_addr = (struct sockaddr *)socket_address;
-  return result;
-}
-
-
-/* --------------------------------------------------------------- DNS client */
-
-/*
- * Neither the platform getaddrinfo (bound to libScePosixForWebKit) nor its
- * resolver service is usable from an installed title, so A records are looked
- * up with a plain UDP query against the console's configured DNS server.
- */
-int sceNetCtlGetInfo(int code, void *info);
-
-#define WILIWILI_NETCTL_INFO_GET_PRIMARY_DNS 12
-
-static unsigned int wiliwili_dns_server(void) {
-  extern void wiliwili_boot_log(const char *);
-  wiliwili_boot_log("dns: querying netctl");
-  char address[16];
-  int status = sceNetCtlGetInfo(WILIWILI_NETCTL_INFO_GET_PRIMARY_DNS, address);
-  {
-    char message[128];
-    snprintf(message, sizeof(message), "dns: netctl status=%#x addr=%.16s", status,
-             address);
-    wiliwili_boot_log(message);
-  }
-  memset(address, 0, sizeof(address));
-  if (status != 0)
-    return 0;
-  return wiliwili_parse_ipv4(address);
-}
-
-static unsigned int wiliwili_dns_lookup(const char *name) {
-  unsigned int server = wiliwili_dns_server();
-  {
-    extern void wiliwili_boot_log(const char *);
-    char message[128];
-    snprintf(message, sizeof(message), "dns: server=%#x name=%s", server, name);
-    wiliwili_boot_log(message);
-  }
-  if (server == 0)
-    return 0;
-
-  unsigned char query[512];
-  memset(query, 0, sizeof(query));
-  size_t length = 0;
-
-  static unsigned int counter = 0;
-  unsigned short id = (unsigned short)(++counter);
-  query[0] = (unsigned char)(id >> 8);
-  query[1] = (unsigned char)(id & 0xff);
-  query[2] = 0x01; /* recursion desired */
-  query[5] = 0x01; /* one question */
-  length = 12;
-
-  for (const char *label = name; *label != '\0';) {
-    const char *dot = strchr(label, '.');
-    size_t size = dot != NULL ? (size_t)(dot - label) : strlen(label);
-    if (size == 0 || size > 63 || length + size + 5 > sizeof(query))
-      return 0;
-    query[length++] = (unsigned char)size;
-    memcpy(query + length, label, size);
-    length += size;
-    label += size;
-    if (*label == '.')
-      ++label;
-  }
-  query[length++] = 0x00; /* end of name */
-  query[length++] = 0x00;
-  query[length++] = 0x01; /* type A */
-  query[length++] = 0x00;
-  query[length++] = 0x01; /* class IN */
-
-  int socket_descriptor = socket(AF_INET, SOCK_DGRAM, 0);
-  if (socket_descriptor < 0)
-    return 0;
-
-  struct sockaddr_in server_address;
-  memset(&server_address, 0, sizeof(server_address));
-  server_address.sin_len = sizeof(server_address);
-  server_address.sin_family = AF_INET;
-  server_address.sin_addr.s_addr = server;
-  server_address.sin_port = (uint16_t)((53 << 8) | (53 >> 8));
-
-  int sent = (int)sendto(socket_descriptor, query, length, 0,
-                         (struct sockaddr *)&server_address,
-                         sizeof(server_address));
-  if (sent != (int)length) {
-    close(socket_descriptor);
-    return 0;
-  }
-
-  unsigned int result = 0;
-  for (int attempt = 0; attempt < 5 && result == 0; ++attempt) {
-    struct pollfd waiting;
-    waiting.fd = socket_descriptor;
-    waiting.events = POLLIN;
-    waiting.revents = 0;
-    if (poll(&waiting, 1, 1000) <= 0)
-      continue;
-
-    unsigned char response[1024];
-    int received = (int)recvfrom(socket_descriptor, response, sizeof(response), 0,
-                                 NULL, NULL);
-    if (received < 12)
-      continue;
-
-    unsigned short response_id = (unsigned short)((response[0] << 8) | response[1]);
-    if (response_id != id || (response[3] & 0x0f) != 0)
-      continue;
-
-    unsigned short answers = (unsigned short)((response[6] << 8) | response[7]);
-    int offset = 12;
-    while (offset < received && response[offset] != 0) {
-      if ((response[offset] & 0xc0) == 0xc0) { /* compressed name */
-        offset += 2;
-        break;
-      }
-      offset += response[offset] + 1;
-    }
-    if (offset < received && response[offset] == 0)
-      ++offset;
-    offset += 4; /* type and class of the question */
-
-    for (int index = 0; index < answers && offset + 10 <= received; ++index) {
-      if ((response[offset] & 0xc0) == 0xc0)
-        offset += 2;
-      else
-        while (offset < received && response[offset] != 0)
-          offset += response[offset] + 1;
-
-      if (offset + 10 > received)
-        break;
-
-      unsigned short record_type = (unsigned short)((response[offset] << 8) | response[offset + 1]);
-      unsigned short record_length = (unsigned short)((response[offset + 8] << 8) | response[offset + 9]);
-      offset += 10;
-      if (record_type == 1 && record_length == 4 && offset + 4 <= received) {
-        memcpy(&result, response + offset, 4);
-        break;
-      }
-      offset += record_length;
-    }
-  }
-
-  close(socket_descriptor);
-  {
-    extern void wiliwili_boot_log(const char *);
-    char message[128];
-    snprintf(message, sizeof(message), "dns: resolved %s -> %#x", name, result);
-    wiliwili_boot_log(message);
-  }
-  return result;
-}
-
-int sceKernelUsleep(unsigned int microseconds);
-
-/* The resolver service rejects any timeout/retry other than zero on this
- * firmware, so the ABI is pinned to (0, 0, 0) and the resolver handle is kept
- * alive for the lifetime of the process. */
-static int wiliwili_resolver_id(void) {
-  static int resolver = -2;
-  static int lock;
-
-  if (resolver != -2)
-    return resolver;
-
-  while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE) != 0)
-    sceKernelUsleep(1000);
-
-  if (resolver == -2) {
-    long pool = sceNetPoolCreate("wiliwili-dns", 0x4000, 0);
-    resolver = pool >= 0
-                   ? sceNetResolverCreate("wiliwili-dns",
-                                          (void *)(intptr_t)pool, 0)
-                   : -1;
-    {
-      extern void wiliwili_boot_log(const char *);
-      char message[128];
-      snprintf(message, sizeof(message), "dns: pool=%ld resolver=%d", pool,
-               resolver);
-      wiliwili_boot_log(message);
-    }
-  }
-
-  __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
-  return resolver;
-}
-
-static unsigned int wiliwili_resolve(const char *name) {
-  unsigned int address = 0;
-  int resolver = wiliwili_resolver_id();
-
-  if (resolver >= 0) {
-    int status = sceNetResolverStartNtoa(resolver, name, &address, 0, 0, 0);
-    extern void wiliwili_boot_log(const char *);
-    char message[160];
-    snprintf(message, sizeof(message), "dns: resolver status=%#x addr=%#x",
-             status, address);
-    wiliwili_boot_log(message);
-    if (status == 0 && address != 0)
-      return address;
-  }
-
-  return wiliwili_dns_lookup(name);
-}
-
-int getaddrinfo(const char *node, const char *service,
-                const struct addrinfo *hints, struct addrinfo **result) {
-  if (result == NULL)
-    return EAI_FAIL;
-  *result = NULL;
-  if (node == NULL)
-    return EAI_NONAME;
-
-  unsigned int parsed = wiliwili_parse_ipv4(node);
-  if (parsed != 0 || strcmp(node, "0.0.0.0") == 0) {
-    *result = wiliwili_build_addrinfo(parsed, service, hints);
-    return *result != NULL ? 0 : EAI_MEMORY;
-  }
-
-  unsigned int resolved = wiliwili_resolve(node);
-  if (resolved == 0)
-    return EAI_NONAME;
-
-  *result = wiliwili_build_addrinfo(resolved, service, hints);
-  return *result != NULL ? 0 : EAI_MEMORY;
-}
-
-/* Numeric reverse lookup: curl asks for it when logging, and the platform
- * implementation belongs to the WebKit module set. */
-int getnameinfo(const struct sockaddr *address, socklen_t length, char *host,
-                size_t host_length, char *service, size_t service_length,
-                int flags) {
-  (void)length;
-  (void)flags;
-
-  if (address == NULL || address->sa_family != AF_INET)
-    return EAI_FAMILY;
-
-  const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)address;
-  unsigned int value = ipv4->sin_addr.s_addr;
-
-  if (host != NULL && host_length > 0)
-    snprintf(host, host_length, "%u.%u.%u.%u", value & 0xff,
-             (value >> 8) & 0xff, (value >> 16) & 0xff, (value >> 24) & 0xff);
-  if (service != NULL && service_length > 0)
-    snprintf(service, service_length, "%u",
-             (unsigned)((ipv4->sin_port & 0xff) << 8 | (ipv4->sin_port >> 8)));
-
+  address->sin_len = sizeof(*address);
+  address->sin_family = AF_INET;
+  address->sin_addr.s_addr = htonl(0x7f000001u); /* 127.0.0.1 */
+  netmask->sin_len = sizeof(*netmask);
+  netmask->sin_family = AF_INET;
+  netmask->sin_addr.s_addr = htonl(0xff000000u);
+  memcpy(name, "lo", 3);
+  entry->ifa_name = name;
+  entry->ifa_flags = 0x1 /* IFF_UP */ | 0x8 /* IFF_LOOPBACK */ | 0x40 /* IFF_RUNNING */;
+  entry->ifa_addr = (struct sockaddr *)address;
+  entry->ifa_netmask = (struct sockaddr *)netmask;
+  entry->ifa_next = NULL;
+  *list = entry;
   return 0;
 }
 
-void freeaddrinfo(struct addrinfo *result) {
-  while (result != NULL) {
-    struct addrinfo *next = result->ai_next;
-    free(result->ai_addr);
-    free(result);
-    result = next;
-  }
-}
-
-const char *gai_strerror(int error) {
-  switch (error) {
-    case 0: return "success";
-    case EAI_NONAME: return "name or service not known";
-    case EAI_FAIL: return "non-recoverable failure in name resolution";
-    case EAI_MEMORY: return "memory allocation failure";
-    default: return "address resolution error";
+void freeifaddrs(struct ifaddrs *list) {
+  while (list != NULL) {
+    struct ifaddrs *next = list->ifa_next;
+    free(list->ifa_name);
+    free(list->ifa_addr);
+    free(list->ifa_netmask);
+    free(list->ifa_dstaddr);
+    free(list);
+    list = next;
   }
 }
 
@@ -1478,36 +1226,6 @@ int fnmatch(const char *pattern, const char *string, int flags) {
   return *string_at == '\0' ? 0 : FNM_NOMATCH;
 }
 
-/* The classic interface is still used by libraries that predate getaddrinfo;
- * it is served from this image's resolver. */
-struct hostent *gethostbyname(const char *name) {
-  static struct hostent entry;
-  static struct in_addr address;
-  static char *address_list[2];
-
-  struct addrinfo hints;
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-
-  struct addrinfo *result = NULL;
-  if (name == NULL || getaddrinfo(name, NULL, &hints, &result) != 0 ||
-      result == NULL)
-    return NULL;
-
-  struct sockaddr_in *resolved = (struct sockaddr_in *)result->ai_addr;
-  address = resolved->sin_addr;
-  address_list[0] = (char *)&address;
-  address_list[1] = NULL;
-
-  entry.h_name = (char *)name;
-  entry.h_aliases = NULL;
-  entry.h_addrtype = AF_INET;
-  entry.h_length = sizeof(address);
-  entry.h_addr_list = address_list;
-  freeaddrinfo(result);
-  return &entry;
-}
 
 /* ------------------------------------------------------------------ dlopen --
  * A title may not load code at runtime, so the software rendering stack is

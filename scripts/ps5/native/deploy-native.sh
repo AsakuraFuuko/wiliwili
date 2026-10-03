@@ -29,7 +29,7 @@ fi
 root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 out=${PS5_NATIVE_OUT:-$root/build-ps5/native}
 host=$1
-title_id=${2:-PPSA99010}
+title_id=${2:-PPSA99233}
 ftp_port=${WILIWILI_PS5_FTP_PORT:-2120}
 ftp_user=${WILIWILI_PS5_FTP_USER:-anonymous:}
 dist=$out/dist/$title_id

@@ -2,6 +2,7 @@
 
 extern "C" void wiliwili_boot_log(const char *);
 //
+
 // Created by fang on 2022/8/12.
 //
 
@@ -169,9 +170,20 @@ extern std::unique_ptr<brls::D3D11Context> D3D11_CONTEXT;
 #include <GLFW/glfw3native.h>
 #endif
 
+static const char *safeMpvText(const char *text) { return text != nullptr ? text : ""; }
+#if defined(PS5_NATIVE_APP)
+static std::string mpvPropertyText(mpv_handle *handle, const char *name) {
+    char *value = mpvGetPropertyString(handle, name);
+    if (value == nullptr) return {};
+    std::string result(value);
+    mpvFree(value);
+    return result;
+}
+#endif
+
 static inline void check_error(int status) {
     if (status < 0) {
-        brls::Logger::error("MPV ERROR ====> {}", mpvErrorString(status));
+        brls::Logger::error("MPV ERROR ====> {}", safeMpvText(mpvErrorString(status)));
     }
 }
 
@@ -255,96 +267,64 @@ void MPVCore::on_wakeup(void *self) {
 
 #if defined(MPV_BUNDLE_DLL)
 template <typename Module, typename fnGetProcAddress>
-/* ── PS5 原生标题：libmpv 不可用时的安全桩 ────────────────────────────────
- * 原生标题沙箱禁止 dlopen，libmpv 拿不到句柄 ⇒ 这些函数指针保持 NULL，
- * 任何 mpvCore->xxx() 都是"跳到 NULL"；而 MPVCore::init() 在 mpvCreate() 返回
- * NULL 后还会 brls::fatal()，直接把进程终结（用户"点播放"崩在这里）。
- * 修法：先在启动时装上全部安全桩（读返回 0/空、命令忽略、渲染返回失败），
- * 之后若某条路真的加载成功，会被真实符号覆盖；PS5 上则由 init() 直接返回。
- * 播放本身走自管播放器，见 scripts/ps5/native/ps5_player.c。 */
+/* Safety stubs used only by the bundled-dll loader when a module lookup fails. */
 namespace {
-int stub_set_option_string(mpv_handle *, const char *, const char *) { return -1; }
-int stub_observe_property(mpv_handle *, uint64_t, const char *, mpv_format) { return -1; }
-mpv_handle *stub_create() { return nullptr; }
-int stub_initialize(mpv_handle *) { return -1; }
-void stub_terminate_destroy(mpv_handle *) {}
-void stub_set_wakeup_callback(mpv_handle *, void (*)(void *), void *) {}
-int stub_command_string(mpv_handle *, const char *) { return -1; }
-const char *stub_error_string(int) { return "mpv unavailable"; }
-mpv_event *stub_wait_event(mpv_handle *, double) {
-    static mpv_event e{};
-    e.event_id = MPV_EVENT_NONE;
-    return &e;
-}
-int stub_get_property(mpv_handle *, const char *name, mpv_format fmt, void *data) {
-    if (!name || !data) return -1;
-#ifdef PS5_NATIVE_APP
-    auto set_num = [&](double v) {
-        if (fmt == MPV_FORMAT_DOUBLE) *(double *)data = v;
-        else if (fmt == MPV_FORMAT_INT64) *(int64_t *)data = (int64_t)v;
-        else if (fmt == MPV_FORMAT_FLAG) *(int *)data = (int)(v != 0);
-        else return -1;
-        return 0;
-    };
-    if (!strcmp(name, "duration")) return set_num(wiliwili_ps5player_duration_ms() / 1000.0);
-    if (!strcmp(name, "time-pos")) return set_num(wiliwili_ps5player_position_ms() / 1000.0);
-    if (!strcmp(name, "percent-pos")) return set_num(0);
-    if (!strcmp(name, "pause")) return set_num(wiliwili_ps5player_paused());
-    if (!strcmp(name, "eof-reached")) return set_num(0);
-    if (!strcmp(name, "core-idle")) return set_num(0);
-    if (!strcmp(name, "idle-active")) return set_num(0);
-    if (!strcmp(name, "paused-for-cache")) return set_num(0);
-    if (!strcmp(name, "speed")) return set_num(1.0);
-    if (!strcmp(name, "volume")) return set_num(100.0);
-    if (!strcmp(name, "width")) return set_num(1920);
-    if (!strcmp(name, "height")) return set_num(1080);
-    if (!strcmp(name, "playlist-count")) return set_num(1);
-    if (!strcmp(name, "playlist-pos")) return set_num(0);
-#endif
-    return -1;
-}
-int stub_command_async(mpv_handle *, uint64_t, const char **) { return -1; }
-char *stub_get_property_string(mpv_handle *, const char *) {
-    /* 绝不能返回 NULL：调用方会直接 std::string(ptr)，那是空指针构造（实测崩过）。 */
-    static char empty[1] = {0};
-    return empty;
-}
-void stub_free_node_contents(mpv_node *) {}
-int stub_set_option(mpv_handle *, const char *, mpv_format, void *) { return -1; }
-void stub_free(void *) {}
-int stub_rc_create(mpv_render_context **, mpv_handle *, mpv_render_param *) { return -1; }
-void stub_rc_set_update_callback(mpv_render_context *, mpv_render_update_fn, void *) {}
-int stub_rc_render(mpv_render_context *, mpv_render_param *) { return -1; }
-void stub_rc_report_swap(mpv_render_context *) {}
-uint64_t stub_rc_update(mpv_render_context *) { return 0; }
-void stub_rc_free(mpv_render_context *) {}
-unsigned long stub_client_api_version() { return 0; }
+    int stub_set_option_string(mpv_handle *, const char *, const char *) { return -1; }
+    int stub_observe_property(mpv_handle *, uint64_t, const char *, mpv_format) { return -1; }
+    mpv_handle *stub_create() { return nullptr; }
+    int stub_initialize(mpv_handle *) { return -1; }
+    void stub_terminate_destroy(mpv_handle *) {}
+    void stub_set_wakeup_callback(mpv_handle *, void (*)(void *), void *) {}
+    int stub_command_string(mpv_handle *, const char *) { return -1; }
+    const char *stub_error_string(int) { return "mpv unavailable"; }
+    mpv_event *stub_wait_event(mpv_handle *, double) {
+        static mpv_event e{};
+        e.event_id = MPV_EVENT_NONE;
+        return &e;
+    }
+    int stub_get_property(mpv_handle *, const char *, mpv_format, void *) { return -1; }
+    int stub_command_async(mpv_handle *, uint64_t, const char **) { return -1; }
+    char *stub_get_property_string(mpv_handle *, const char *) {
+        /* 绝不能返回 NULL：调用方会直接 std::string(ptr)，那是空指针构造（实测崩过）。 */
+        static char empty[1] = {0};
+        return empty;
+    }
+    void stub_free_node_contents(mpv_node *) {}
+    int stub_set_option(mpv_handle *, const char *, mpv_format, void *) { return -1; }
+    void stub_free(void *) {}
+    int stub_rc_create(mpv_render_context **, mpv_handle *, mpv_render_param *) { return -1; }
+    void stub_rc_set_update_callback(mpv_render_context *, mpv_render_update_fn, void *) {}
+    int stub_rc_render(mpv_render_context *, mpv_render_param *) { return -1; }
+    void stub_rc_report_swap(mpv_render_context *) {}
+    uint64_t stub_rc_update(mpv_render_context *) { return 0; }
+    void stub_rc_free(mpv_render_context *) {}
+    unsigned long stub_client_api_version() { return 0; }
 
-void installMpvStubs() {
-    mpvSetOptionString            = &stub_set_option_string;
-    mpvObserveProperty            = &stub_observe_property;
-    mpvCreate                     = &stub_create;
-    mpvInitialize                 = &stub_initialize;
-    mpvTerminateDestroy           = &stub_terminate_destroy;
-    mpvSetWakeupCallback          = &stub_set_wakeup_callback;
-    mpvCommandString              = &stub_command_string;
-    mpvErrorString                = &stub_error_string;
-    mpvWaitEvent                  = &stub_wait_event;
-    mpvGetProperty                = &stub_get_property;
-    mpvCommandAsync               = &stub_command_async;
-    mpvGetPropertyString          = &stub_get_property_string;
-    mpvFreeNodeContents           = &stub_free_node_contents;
-    mpvSetOption                  = &stub_set_option;
-    mpvFree                       = &stub_free;
-    mpvRenderContextCreate        = &stub_rc_create;
-    mpvRenderContextSetUpdateCallback = &stub_rc_set_update_callback;
-    mpvRenderContextRender        = &stub_rc_render;
-    mpvRenderContextReportSwap    = &stub_rc_report_swap;
-    mpvRenderContextUpdate        = &stub_rc_update;
-    mpvRenderContextFree          = &stub_rc_free;
-    mpvClientApiVersion           = &stub_client_api_version;
-}
-} // namespace
+    void installMpvStubs() {
+        mpvSetOptionString                = &stub_set_option_string;
+        mpvObserveProperty                = &stub_observe_property;
+        mpvCreate                         = &stub_create;
+        mpvInitialize                     = &stub_initialize;
+        mpvTerminateDestroy               = &stub_terminate_destroy;
+        mpvSetWakeupCallback              = &stub_set_wakeup_callback;
+        mpvCommandString                  = &stub_command_string;
+        mpvErrorString                    = &stub_error_string;
+        mpvWaitEvent                      = &stub_wait_event;
+        mpvGetProperty                    = &stub_get_property;
+        mpvCommandAsync                   = &stub_command_async;
+        mpvGetPropertyString              = &stub_get_property_string;
+        mpvFreeNodeContents               = &stub_free_node_contents;
+        mpvSetOption                      = &stub_set_option;
+        mpvFree                           = &stub_free;
+        mpvRenderContextCreate            = &stub_rc_create;
+        mpvRenderContextSetUpdateCallback = &stub_rc_set_update_callback;
+        mpvRenderContextRender            = &stub_rc_render;
+        mpvRenderContextReportSwap        = &stub_rc_report_swap;
+        mpvRenderContextUpdate            = &stub_rc_update;
+        mpvRenderContextFree              = &stub_rc_free;
+        mpvClientApiVersion               = &stub_client_api_version;
+    }
+}  // namespace
 
 void initMpvProc(Module dll, fnGetProcAddress pGetProcAddress) {
     mpvSetOptionString     = (mpvSetOptionStringFunc)pGetProcAddress(dll, "mpv_set_option_string");
@@ -402,31 +382,30 @@ void initMpvProc(Module dll, fnGetProcAddress pGetProcAddress) {
  * 原生标题把 mpv 静态链接进 eboot，而链接脚本是 { local: *; }（PS5 模块转换器只
  * 发布导入、不支持应用导出），所以 dlsym 永远解析不到 mpv_*：按动态库方式取函数
  * 指针只能得到 NULL，调用时跳到地址 0（真机现象：VideoView 构造里 MPVCore 单例
- * 初始化处 SIGSEGV，fault addr = 0）。这里直接取链接进来的符号。
- */
+ * 初始化处 SIGSEGV，fault addr = 0）。这里直接取链接进来的符号。 */
 void initMpvProcLinked() {
-    mpvSetOptionString = &mpv_set_option_string;
-    mpvObserveProperty = &mpv_observe_property;
-    mpvCreate = &mpv_create;
-    mpvInitialize = &mpv_initialize;
-    mpvTerminateDestroy = &mpv_terminate_destroy;
-    mpvSetWakeupCallback = &mpv_set_wakeup_callback;
-    mpvCommandString = &mpv_command_string;
-    mpvErrorString = &mpv_error_string;
-    mpvWaitEvent = &mpv_wait_event;
-    mpvGetProperty = &mpv_get_property;
-    mpvCommandAsync = &mpv_command_async;
-    mpvGetPropertyString = &mpv_get_property_string;
-    mpvFreeNodeContents = &mpv_free_node_contents;
-    mpvSetOption = &mpv_set_option;
-    mpvFree = &mpv_free;
-    mpvRenderContextCreate = &mpv_render_context_create;
-    mpvRenderContextUpdate = &mpv_render_context_update;
-    mpvRenderContextFree = &mpv_render_context_free;
-    mpvRenderContextRender = &mpv_render_context_render;
+    mpvSetOptionString                = &mpv_set_option_string;
+    mpvObserveProperty                = &mpv_observe_property;
+    mpvCreate                         = &mpv_create;
+    mpvInitialize                     = &mpv_initialize;
+    mpvTerminateDestroy               = &mpv_terminate_destroy;
+    mpvSetWakeupCallback              = &mpv_set_wakeup_callback;
+    mpvCommandString                  = &mpv_command_string;
+    mpvErrorString                    = &mpv_error_string;
+    mpvWaitEvent                      = &mpv_wait_event;
+    mpvGetProperty                    = &mpv_get_property;
+    mpvCommandAsync                   = &mpv_command_async;
+    mpvGetPropertyString              = &mpv_get_property_string;
+    mpvFreeNodeContents               = &mpv_free_node_contents;
+    mpvSetOption                      = &mpv_set_option;
+    mpvFree                           = &mpv_free;
+    mpvRenderContextCreate            = &mpv_render_context_create;
+    mpvRenderContextUpdate            = &mpv_render_context_update;
+    mpvRenderContextFree              = &mpv_render_context_free;
+    mpvRenderContextRender            = &mpv_render_context_render;
     mpvRenderContextSetUpdateCallback = &mpv_render_context_set_update_callback;
-    mpvRenderContextReportSwap = &mpv_render_context_report_swap;
-    mpvClientApiVersion = &mpv_client_api_version;
+    mpvRenderContextReportSwap        = &mpv_render_context_report_swap;
+    mpvClientApiVersion               = &mpv_client_api_version;
 }
 #endif
 #endif
@@ -472,19 +451,29 @@ MPVCore::MPVCore() {
 
 void MPVCore::init() {
 #ifdef PS5_NATIVE_APP
-    /* 沙箱禁 dlopen ⇒ libmpv 不可用；装桩后直接返回（详见 installMpvStubs 的注释）。
-     * PS5 上播放走自管播放器（scripts/ps5/native/ps5_player.c），UI 层对 mpv 的读写
-     * 由桩兜底，全部安全。 */
-    installMpvStubs();
-    brls::Logger::info("MPVCore: PS5 native line, mpv disabled (using built-in player)");
-    return;
+    /* 原生标题正式使用静态链接的 libmpv：解复用、解码、A/V 时钟和 SW render
+     * 都由 mpv 提供。之前只在 WILIWILI_TEST_MPV 下进入这里，生产标题因此装上
+     * 空桩却仍走 mpv VideoView，点视频时在空 mpv_context 上崩溃。 */
+    wiliwili_boot_log("mpv: entering real init path");
 #else
+    (void)0;
+#endif /* PS5_NATIVE_APP */
+
     setlocale(LC_NUMERIC, "C");
     this->mpv = mpvCreate();
     if (!mpv) {
+#ifdef PS5_NATIVE_APP
+        /* 探测路径失败：回退到桩，应用继续跑（不 brls::fatal）。 */
+        wiliwili_boot_log("mpv probe: mpv_create returned NULL");
+        installMpvStubs();
+        return;
+#else
         brls::fatal("Error Create mpv Handle");
+#endif
     }
-#endif /* !PS5_NATIVE_APP */
+#if defined(PS5_NATIVE_APP)
+    wiliwili_boot_log("mpv probe: create ok");
+#endif
     std::string confDir = ProgramConfig::instance().getConfigDir();
     // misc
     mpvSetOptionString(mpv, "config", "yes");
@@ -613,15 +602,41 @@ void MPVCore::init() {
 #endif
 
 #if defined(PS5) || defined(PS5_NATIVE_APP)
-    /* 双保险：让 mpv 根本不生成日志事件（本机 libmpv 一旦真的输出日志就跳到 NULL，
-     * 见上面的说明）。 */
+    /* 让 mpv 不生成日志事件：本机 libmpv 没有终端后端，terminal=yes 会让它跳到 NULL 地址。
+     * 排查期要看 mpv 自己的话：加 mpv_request_log_messages(mpv, "v") 并把 msg-level 放开，
+     * 日志会经 eventMainLoop 的 LOG_MESSAGE 分支（做法见 notes/06 §10.9）。 */
     mpvSetOptionString(mpv, "msg-level", "all=no");
 #endif
 
+#if defined(PS5_NATIVE_APP)
+    /* 原生线唯一的音频后端就是 SDL（libmpv 里编进了 audio_out_sdl；真机表现为
+     * 音轨短暂出现后 `a=-`/`ao=` 空 ⇒ 默认 AO 选择没起来）。显式指定，避免 auto 选空。 */
+    mpvSetOptionString(mpv, "ao", "sdl");
+#endif
+
+#if defined(PS5_NATIVE_APP)
+    wiliwili_boot_log("mpv probe: initializing");
+#endif
     if (mpvInitialize(mpv) < 0) {
+#if defined(PS5_NATIVE_APP)
+        wiliwili_boot_log("mpv probe: mpv_initialize FAILED");
+        mpvTerminateDestroy(mpv);
+        installMpvStubs();
+        return;
+#else
         mpvTerminateDestroy(mpv);
         brls::fatal("Could not initialize mpv context");
+#endif
     }
+#if defined(PS5_NATIVE_APP)
+    wiliwili_boot_log("mpv probe: initialize ok");
+#endif
+#if defined(PS5_NATIVE_APP)
+    if (getenv("WILIWILI_MPV_TRACE") != nullptr) {
+        mpvSetOptionString(mpv, "msg-level", "all=v");
+        mpv_request_log_messages(mpv, "v");
+    }
+#endif
 
     // set observe properties
     check_error(mpvObserveProperty(mpv, 1, "core-idle", MPV_FORMAT_FLAG));
@@ -647,7 +662,14 @@ void MPVCore::init() {
     check_error(mpvObserveProperty(mpv, 21, "hue", MPV_FORMAT_DOUBLE));
 
     // init renderer params
-#ifdef MPV_SW_RENDER
+#if defined(PS5_NATIVE_APP)
+    /* 【研究探针】用 SW 渲染 API：mpv 把帧软件转成 RGBA 写进调用方缓冲，**完全不碰
+     * GL/EGL 入口查找**。GL 渲染 API 在标题沙箱里会崩在 mpv_render_context_create
+     * （mpv 自己 dlsym 平台入口拿到 NULL，见 notes/06 §10）。
+     * payload 线的 MPV_SW_RENDER 就是这个形态。默认路径（未开探测）在此早已 return。 */
+    mpv_render_param params[]{{MPV_RENDER_PARAM_API_TYPE, const_cast<char *>(MPV_RENDER_API_TYPE_SW)},
+                              {MPV_RENDER_PARAM_INVALID, nullptr}};
+#elif defined(MPV_SW_RENDER)
     mpv_render_param params[]{{MPV_RENDER_PARAM_API_TYPE, const_cast<char *>(MPV_RENDER_API_TYPE_SW)},
                               {MPV_RENDER_PARAM_INVALID, nullptr}};
 #elif defined(BOREALIS_USE_DEKO3D)
@@ -697,12 +719,12 @@ void MPVCore::init() {
             .display_height       = texture_height,
             .display_stride       = texture_stride,
         };
-        NVGXMframebuffer *fbo = gxmCreateFramebuffer(&framebufferOpts);
-        mpv_fbo.render_target = fbo->gxm_render_target;
-        mpv_fbo.color_surface = &fbo->gxm_color_surfaces[0].surface;
+        NVGXMframebuffer *fbo         = gxmCreateFramebuffer(&framebufferOpts);
+        mpv_fbo.render_target         = fbo->gxm_render_target;
+        mpv_fbo.color_surface         = &fbo->gxm_color_surfaces[0].surface;
         mpv_fbo.depth_stencil_surface = &fbo->gxm_depth_stencil_surface;
-        mpv_fbo.w   = texture_width;
-        mpv_fbo.h   = texture_height;
+        mpv_fbo.w                     = texture_width;
+        mpv_fbo.h                     = texture_height;
     }
 #else
     int advanced_control{1};
@@ -719,15 +741,32 @@ void MPVCore::init() {
                               {MPV_RENDER_PARAM_INVALID, nullptr}};
 #endif
 
+#if defined(PS5_NATIVE_APP)
+    wiliwili_boot_log("mpv probe: render context create");
+#endif
     if (mpvRenderContextCreate(&mpv_context, mpv, params) < 0) {
+#if defined(PS5_NATIVE_APP)
+        wiliwili_boot_log("mpv probe: render context FAILED");
+        mpvTerminateDestroy(mpv);
+        installMpvStubs();
+        return;
+#else
         mpvTerminateDestroy(mpv);
         brls::fatal("failed to initialize mpv GL context");
+#endif
     }
+#if defined(PS5_NATIVE_APP)
+    wiliwili_boot_log("mpv probe: SW render context ok -> mpv core usable");
+    /* 原生线已改为**由 mpv 播放**（见 notes/06 §10.6）：保留 mpv_context 之后**不能早退**——
+     * 后面的 `mpvSetWakeupCallback`（事件）与 `mpvRenderContextSetUpdateCallback`（每帧渲染）
+     * 是播放的入口；漏掉它们会只剩 resize 时渲染一次、且收不到任何事件/日志（真机实测）。
+     * `initializeVideo()` 在 MPV_SW_RENDER 下是空实现（守卫含 `!defined(MPV_SW_RENDER)`）。 */
+#endif
 #ifdef BOREALIS_USE_D3D11
     wiliwili::initCrashDump();
 #endif
-    brls::Logger::info("MPV Version: {}", mpvGetPropertyString(mpv, "mpv-version"));
-    brls::Logger::info("FFMPEG Version: {}", mpvGetPropertyString(mpv, "ffmpeg-version"));
+    brls::Logger::info("MPV Version: {}", safeMpvText(mpvGetPropertyString(mpv, "mpv-version")));
+    brls::Logger::info("FFMPEG Version: {}", safeMpvText(mpvGetPropertyString(mpv, "ffmpeg-version")));
     command_async("set", "audio-client-name", APPVersion::getPackageName());
     setVolume(MPVCore::VIDEO_VOLUME);
 
@@ -914,14 +953,39 @@ void MPVCore::setFrameSize(brls::Rect r) {
     if (std::isnan(rect.getWidth()) || std::isnan(rect.getHeight())) return;
 
 #ifdef MPV_SW_RENDER
+    /* Native SW surfaces follow the player rectangle. The AGC NanoVG rectangle
+     * already uses physical output pixels, so do not scale it a second time.
+     * Recreate buffers only when the rectangle size changes. */
 #ifdef BOREALIS_USE_D3D11
     // 使用 dx11 的拷贝交换，否则视频渲染异常
     const static int mpvImageFlags = NVG_IMAGE_STREAMING | NVG_IMAGE_COPY_SWAP;
 #else
     const static int mpvImageFlags = 0;
 #endif
-    int drawWidth  = rect.getWidth() * brls::Application::windowScale;
-    int drawHeight = rect.getHeight() * brls::Application::windowScale;
+    auto *vg = brls::Application::getNVGContext();
+#ifdef PS5_NATIVE_APP
+    // The native AGC NanoVG rect is already in physical pixels; multiplying by
+    // windowScale would over-allocate (e.g. 1920x1080 becomes 2880x1620).
+    int drawWidth  = (int)std::ceil(rect.getWidth());
+    int drawHeight = (int)std::ceil(rect.getHeight());
+    if (drawWidth <= 0 || drawHeight <= 0) return;
+
+    if (pixels != nullptr && nvg_image != 0 && sw_size[0] == drawWidth && sw_size[1] == drawHeight) return;
+
+    if (nvg_image != 0) {
+        nvgDeleteImage(vg, nvg_image);
+        nvg_image = 0;
+    }
+    free(pixels);
+    pixels             = nullptr;
+    mpv_params[3].data = nullptr;
+    size_t frameSize   = (size_t)drawWidth * (size_t)drawHeight;
+    pixels             = malloc(frameSize * PIXCEL_SIZE);
+    if (pixels == nullptr) return;
+    mpv_params[3].data = pixels;
+#else
+    int drawWidth  = rect.getWidth();
+    int drawHeight = rect.getHeight();
     if (drawWidth == 0 || drawHeight == 0) return;
     int frameSize = drawWidth * drawHeight;
 
@@ -935,10 +999,21 @@ void MPVCore::setFrameSize(brls::Rect r) {
         pixels             = malloc(frameSize * PIXCEL_SIZE);
         mpv_params[3].data = pixels;
     }
+#endif
 
-    if (nvg_image) nvgDeleteImage(brls::Application::getNVGContext(), nvg_image);
-    nvg_image = nvgCreateImageRGBA(brls::Application::getNVGContext(), drawWidth, drawHeight, mpvImageFlags,
-                                   (const unsigned char *)pixels);
+#ifndef PS5_NATIVE_APP
+    if (nvg_image) nvgDeleteImage(vg, nvg_image);
+#endif
+    /* 创建时不带数据：数据每帧由 nvgUpdateImage 上传，避免把未初始化缓冲交给驱动。 */
+    nvg_image = nvgCreateImageRGBA(vg, drawWidth, drawHeight, mpvImageFlags, nullptr);
+    /* 检查点：SW 视频面与渲染上下文就绪。ctx 为 NULL 时后面 mpv 渲染会在 mpv 内部
+     * 对 NULL+0x70 取字段后跳 0（真机 addr=0x70/rip=0x0，见 notes/06 §10.8）。 */
+    {
+        char dline[160];
+        snprintf(dline, sizeof(dline), "mpv-sw: surface=%d ctx=%p %dx%d display=%dx%d", nvg_image, (void *)mpv_context,
+                 drawWidth, drawHeight, (int)rect.getWidth(), (int)rect.getHeight());
+        wiliwili_boot_log(dline);
+    }
 
     sw_size[0] = drawWidth;
     sw_size[1] = drawHeight;
@@ -947,8 +1022,9 @@ void MPVCore::setFrameSize(brls::Rect r) {
     // 在视频暂停时调整纹理尺寸，视频画面会被清空为黑色，强制重新绘制一次，避免这个问题
     mpvRenderContextRender(mpv_context, mpv_params);
     mpvRenderContextReportSwap(mpv_context);
+    this->redraw = true; /* 新面已渲染一次 ⇒ 让 draw() 上传这一帧 */
 #elif !defined(MPV_USE_FB)
-        // Using default framebuffer
+    // Using default framebuffer
 #if defined(BOREALIS_USE_GXM)
     // This line will be called between beginFrame() and endFrame() in Application::frame(),
     // but mpvRenderContextRender(...) will call functions similar to beginFrame() and endFrame() to draw content to FBO,
@@ -1006,32 +1082,7 @@ void MPVCore::setFrameSize(brls::Rect r) {
 #endif
 }
 
-#ifdef PS5_NATIVE_APP
-extern "C" int wiliwili_ps5player_ready(void);
-extern "C" int wiliwili_ps5player_paused(void);
-extern "C" long wiliwili_ps5player_position_ms(void);
-extern "C" long wiliwili_ps5player_duration_ms(void);
-
-void MPVCore::syncNativePlayerState() {
-    bool ready          = wiliwili_ps5player_ready() != 0;
-    bool paused         = wiliwili_ps5player_paused() != 0;
-    this->video_stopped = !ready;
-    this->video_playing = ready && !paused;
-    this->video_paused  = paused;
-    this->playback_time = (double)wiliwili_ps5player_position_ms() / 1000.0;
-    this->duration      = (double)wiliwili_ps5player_duration_ms() / 1000.0;
-}
-#endif
-
-bool MPVCore::isValid() {
-#ifdef PS5_NATIVE_APP
-    /* mpv 不可用（沙箱问题），但播放由自管播放器负责：这里必须返回 true，
-     * 否则 VideoView::draw 一进门就 return，OSD/弹幕/进度条全都不画。 */
-    return true;
-#else
-    return mpv_context != nullptr;
-#endif
-}
+bool MPVCore::isValid() { return mpv_context != nullptr; }
 
 void MPVCore::draw(brls::Rect area, float alpha) {
     if (mpv_context == nullptr) return;
@@ -1041,7 +1092,12 @@ void MPVCore::draw(brls::Rect area, float alpha) {
     if (!pixels) return;
 
     auto *vg = brls::Application::getNVGContext();
-    nvgUpdateImage(vg, nvg_image, (const unsigned char *)pixels);
+    /* 只在 mpv 产出新帧时上传；SW 面尺寸随播放器区域变化，避免暂停时重复上传整张
+     * RGBA 纹理。全屏时为当前物理窗口尺寸，通常是 1920x1080。 */
+    if (this->redraw) {
+        this->redraw = false;
+        nvgUpdateImage(vg, nvg_image, (const unsigned char *)pixels);
+    }
 
     // draw black background
     nvgBeginPath(vg);
@@ -1054,7 +1110,10 @@ void MPVCore::draw(brls::Rect area, float alpha) {
     // draw video
     nvgBeginPath(vg);
     nvgRect(vg, rect.getMinX(), rect.getMinY(), rect.getWidth(), rect.getHeight());
-    nvgFillPaint(vg, nvgImagePattern(vg, 0, 0, rect.getWidth(), rect.getHeight(), 0, nvg_image, alpha));
+    // Pattern coordinates are absolute; an origin of (0, 0) shifts offset VideoViews.
+    // That shift exposes/clips the right and bottom edges of the small player.
+    nvgFillPaint(vg, nvgImagePattern(vg, rect.getMinX(), rect.getMinY(), rect.getWidth(), rect.getHeight(), 0,
+                                     nvg_image, alpha));
     nvgFill(vg);
 #elif defined(BOREALIS_USE_GXM)
     auto *vg = brls::Application::getNVGContext();
@@ -1164,26 +1223,40 @@ void MPVCore::eventMainLoop() {
             case MPV_EVENT_LOG_MESSAGE: {
                 auto log = (mpv_event_log_message *)event->data;
                 if (log->log_level <= MPV_LOG_LEVEL_ERROR) {
-                    brls::Logger::error("{}: {}", log->prefix, log->text);
+                    brls::Logger::error("{}: {}", safeMpvText(log->prefix), safeMpvText(log->text));
                 } else if (log->log_level <= MPV_LOG_LEVEL_WARN) {
-                    brls::Logger::warning("{}: {}", log->prefix, log->text);
+                    brls::Logger::warning("{}: {}", safeMpvText(log->prefix), safeMpvText(log->text));
                 } else if (log->log_level <= MPV_LOG_LEVEL_INFO) {
-                    brls::Logger::info("{}: {}", log->prefix, log->text);
+                    brls::Logger::info("{}: {}", safeMpvText(log->prefix), safeMpvText(log->text));
                 } else if (log->log_level <= MPV_LOG_LEVEL_V) {
-                    brls::Logger::debug("{}: {}", log->prefix, log->text);
+                    brls::Logger::debug("{}: {}", safeMpvText(log->prefix), safeMpvText(log->text));
                 } else {
-                    brls::Logger::verbose("{}: {}", log->prefix, log->text);
+                    brls::Logger::verbose("{}: {}", safeMpvText(log->prefix), safeMpvText(log->text));
                 }
             } break;
-            case MPV_EVENT_FILE_LOADED:
+            case MPV_EVENT_FILE_LOADED: {
                 brls::Logger::info("========> MPV_EVENT_FILE_LOADED");
+                /* 启动/健康检查点（原生线专用）：mpv 的日志在本平台被关闭，播放状态只能靠
+                 * 这两条事件落到启动日志里判断"流到底有没有加载、有没有真的开播"。 */
+                wiliwili_boot_log("mpv: file loaded");
+#if defined(PS5_NATIVE_APP)
+                int64_t aid = -1;
+                mpvGetProperty(this->mpv, "aid", MPV_FORMAT_INT64, &aid);
+                auto codec = mpvPropertyText(this->mpv, "audio-codec");
+                auto ao    = mpvPropertyText(this->mpv, "current-ao");
+                auto device = mpvPropertyText(this->mpv, "audio-device");
+                char audio_line[256];
+                snprintf(audio_line, sizeof(audio_line), "mpv: audio aid=%lld codec=%s ao=%s device=%s",
+                         (long long)aid, codec.c_str(), ao.c_str(), device.c_str());
+                wiliwili_boot_log(audio_line);
+#endif
                 // event 8: 文件预加载结束，准备解码
                 mpvCoreEvent.fire(MpvEventEnum::MPV_LOADED);
                 // 发布一次进度更新事件，避免进度条在0秒时没有进度更新
                 video_progress = 0;
                 mpvCoreEvent.fire(MpvEventEnum::UPDATE_PROGRESS);
-                // 移除其他备用链接
-                command_async("playlist-clear");
+                // `loadfile replace` already discards the previous playlist. Sending
+                // `playlist-clear` here races the next replacement during video switches.
 
                 if (AUTO_PLAY) {
                     mpvCoreEvent.fire(MpvEventEnum::MPV_RESUME);
@@ -1193,6 +1266,7 @@ void MPVCore::eventMainLoop() {
                     this->pause();
                 }
                 break;
+            }
             case MPV_EVENT_START_FILE:
                 // event 6: 开始加载文件
                 brls::Logger::info("========> MPV_EVENT_START_FILE");
@@ -1205,24 +1279,47 @@ void MPVCore::eventMainLoop() {
             case MPV_EVENT_PLAYBACK_RESTART:
                 // event 21: 开始播放文件（一般是播放或调整进度结束之后触发）
                 brls::Logger::info("========> MPV_EVENT_PLAYBACK_RESTART");
+                wiliwili_boot_log("mpv: playback restart");
+#if defined(PS5_NATIVE_APP)
+                {
+                    int64_t aid = -1;
+                    int64_t tracks = -1;
+                    int aid_rc = mpvGetProperty(this->mpv, "aid", MPV_FORMAT_INT64, &aid);
+                    int tracks_rc = mpvGetProperty(this->mpv, "track-list/count", MPV_FORMAT_INT64, &tracks);
+                    auto codec = mpvPropertyText(this->mpv, "audio-codec");
+                    auto ao    = mpvPropertyText(this->mpv, "current-ao");
+                    char audio_line[224];
+                    snprintf(audio_line, sizeof(audio_line),
+                             "mpv: audio active aid=%lld(rc=%d) tracks=%lld(rc=%d) codec=%s ao=%s",
+                             (long long)aid, aid_rc, (long long)tracks, tracks_rc, codec.c_str(), ao.c_str());
+                    wiliwili_boot_log(audio_line);
+                }
+#endif
                 video_stopped = false;
                 mpvCoreEvent.fire(MpvEventEnum::LOADING_END);
                 break;
             case MPV_EVENT_END_FILE: {
                 // event 7: 文件播放结束
                 brls::Logger::info("========> MPV_STOP");
+                /* 带上结束原因：加载失败（reason=error）与正常播完在排查时意义完全不同。 */
+                {
+                    auto *end = (mpv_event_end_file *)event->data;
+                    char line[160];
+                    snprintf(line, sizeof(line), "mpv: end file reason=%d error=%d", end ? end->reason : -1,
+                             end ? end->error : 0);
+                    wiliwili_boot_log(line);
+                }
                 mpvCoreEvent.fire(MpvEventEnum::MPV_STOP);
                 video_stopped = true;
                 auto node     = (mpv_event_end_file *)event->data;
                 if (node->reason == MPV_END_FILE_REASON_ERROR) {
                     mpv_error_code = node->error;
-                    brls::Logger::error("========> MPV ERROR: {}", mpvErrorString(node->error));
+                    brls::Logger::error("========> MPV ERROR: {}", safeMpvText(mpvErrorString(node->error)));
                     mpvCoreEvent.fire(MpvEventEnum::MPV_FILE_ERROR);
                 }
 #ifdef BOREALIS_USE_GXM
-                else
-                {
-                    setFrameSize(rect); // 清空残留画面
+                else {
+                    setFrameSize(rect);  // 清空残留画面
                 }
 #endif
 
@@ -1315,7 +1412,7 @@ void MPVCore::eventMainLoop() {
                             std::unordered_map<std::string, mpv_node> node_map;
                             for (int i = 0; i < node->u.list->num; i++) {
                                 node_map.insert(
-                                    std::make_pair(std::string(node->u.list->keys[i]), node->u.list->values[i]));
+                                    std::make_pair(safeMpvText(node->u.list->keys[i]), node->u.list->values[i]));
                             }
                             brls::Logger::debug(
                                 "total-bytes: {:.2f}MB; cache-duration: "
@@ -1372,13 +1469,17 @@ void MPVCore::eventMainLoop() {
                         break;
                     case 15:
                         if (data) {
-                            hwCurrent = *(char **)data;
+                            const char *value = *(char **)data;
+                            hwCurrent         = value != nullptr ? value : "";
                             brls::Logger::info("========> HW: {}", hwCurrent);
                             GA("hwdec", {{"hwdec", hwCurrent}})
                         }
                         break;
                     case 16:
-                        if (data) filepath = *(char **)data;
+                        if (data) {
+                            const char *value = *(char **)data;
+                            filepath          = value != nullptr ? value : "";
+                        }
                         break;
                     case 17:
                         if (data) video_brightness = *(double *)data;

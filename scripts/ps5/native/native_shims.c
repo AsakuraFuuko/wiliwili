@@ -369,22 +369,6 @@ static void wiliwili_osmesa_probe(void) {
   done = 1;
   wiliwili_boot_log("osmesa: probe enter");
 
-  /* Mesa's software screen needs its winsys and driver entry points; reporting
-   * each step tells apart a missing screen from a rejected context. */
-  extern void *null_sw_create(void);
-  extern void *softpipe_create_screen(void *winsys);
-  void *winsys = null_sw_create();
-  {
-    char line[128];
-    snprintf(line, sizeof(line), "osmesa: winsys=%p", winsys);
-    wiliwili_boot_log(line);
-  }
-  if (winsys != 0) {
-    void *screen = softpipe_create_screen(winsys);
-    char line[128];
-    snprintf(line, sizeof(line), "osmesa: softpipe screen=%p", screen);
-    wiliwili_boot_log(line);
-  }
 
   static unsigned int framebuffer[1920 * 1080];
   char line[192];
@@ -478,6 +462,14 @@ void wiliwili_boot_log(const char *message) {
    * 实测一分钟 1.6 万行，等于每秒近 300 次 fsync，足以吃掉整个帧预算。驱动噪音
    * 默认丢弃；要看驱动级调试就用 trace 开关（assets/wiliwili-options.txt）。 */
   if (message && strncmp(message, "[ps5-", 5) == 0 && !wiliwili_trace_enabled())
+    return;
+  /* libcurl 的详细回调（http.hpp 里无条件装的 cpr::DebugCallback）与 DNS 解析
+   * 打印都是每请求 20+ 行，而这里每行一次 open/write/fsync/close 外加一个 UDP
+   * 数据报：播放页每拉一次评论/封面就要付一次。它们只在查 TLS/DNS 时需要，
+   * 因此与驱动噪音同样关到 trace 后面（`http:`/`dns:` 的结论行不受影响，走
+   * 各自的上层日志）。 */
+  if (message && (strncmp(message, "curl: ", 6) == 0 || strncmp(message, "dns: ", 5) == 0) &&
+      !wiliwili_trace_enabled())
     return;
 
   /* The datagram is sent first: if the download mount is unavailable (a mount
@@ -613,6 +605,7 @@ static char *wiliwili_append_hex(char *cursor, unsigned long long value) {
   return cursor;
 }
 
+
 static void wiliwili_crash_handler(int signal_number, siginfo_t *info,
                                    void *context) {
   ucontext_t *ucontext = (ucontext_t *)context;
@@ -639,6 +632,34 @@ static void wiliwili_crash_handler(int signal_number, siginfo_t *info,
   const char *prefix = "crash: ";
   while (*prefix && length < (int)sizeof(message) - 1)
     message[length++] = *prefix++;
+  /* 信号号：SIGSEGV/SIGBUS/SIGILL/SIGFPE 的处理是同一个，但它们的含义完全不同
+   * （段错误 vs 非法指令），之前只记地址无法分辨。 */
+  if (signal_number >= 0 && signal_number <= 99) {
+    if (signal_number >= 10)
+      message[length++] = (char)('0' + signal_number / 10);
+    message[length++] = (char)('0' + signal_number % 10);
+    message[length++] = ' ';
+  }
+  /* si_code：SIGBUS 的 BUS_ADRALN/BUS_ADRERR/BUS_OBJERR 指向不同的根因
+   * （对齐 / 映射之外 / 对象错误），没有它只能猜。 */
+  {
+    long long code = info != NULL ? (long long)info->si_code : 0;
+    message[length++] = 'c';
+    message[length++] = '=';
+    if (code < 0) {
+      message[length++] = '-';
+      code = -code;
+    }
+    char reversed[12];
+    int digits = 0;
+    do {
+      reversed[digits++] = (char)('0' + (int)(code % 10));
+      code /= 10;
+    } while (code != 0 && digits < 11);
+    while (digits > 0)
+      message[length++] = reversed[--digits];
+    message[length++] = ' ';
+  }
   static const char digits[] = "0123456789abcdef";
   extern void *malloc(size_t);
   extern int pthread_create(void *, const void *, void *(*)(void *), void *);
@@ -721,6 +742,7 @@ __attribute__((constructor(102))) static void wiliwili_install_crash_handler(voi
   sigaction(SIGBUS, &action, NULL);
   sigaction(SIGILL, &action, NULL);
   sigaction(SIGFPE, &action, NULL);
+  sigaction(SIGABRT, &action, NULL);
 }
 
 /* Runs from .preinit_array, i.e. before every static constructor: it separates
@@ -769,9 +791,19 @@ static void wiliwili_early_marker(void) {
    * （例如 ps5_screen.c 的 "[ps5-gallium] first-vertex"、"[ps5-multidraw-batch]"），
    * 每个 draw batch 都写一次 stdout，直接把帧率拖垮。正式日志走
    * wiliwili_boot_log（/download0/wiliwili-boot.log + UDP:9999），所以默认把
-   * stdout 丢掉；需要驱动级调试时用 trace 开关把 stdout 留在原处。 */
-  if (!wiliwili_trace_enabled())
-    freopen("/dev/null", "w", stdout);
+   * stdout 丢掉。
+   *
+   * 但驱动自己的诊断计数只走 stdout（`[ps5-driver-cycles]` 相位周期、
+   * `[ps5-cpu-flush-summary]` 的 flush 字节数），标题的 stdout 默认无处可去，
+   * 所以要取证就只能先落盘：WILIWILI_CAPTURE_STDOUT=1（或 trace）时写进
+   * /download0/wiliwili-stdout.log，标题停止后镜像写回、用 read-download0.sh 取回。 */
+  if (wiliwili_trace_enabled() || getenv("WILIWILI_CAPTURE_STDOUT") != 0) {
+    /* 行缓冲：标题崩溃时块缓冲里的内容会全部丢掉（第一次取回来是空文件）。 */
+    if (freopen("/download0/wiliwili-stdout.log", "w", stdout) != 0)
+      setvbuf(stdout, NULL, _IOLBF, 0);
+  } else {
+    (void)freopen("/dev/null", "w", stdout);
+  }
   /* Capability probes describe the sandbox, not the application: they are
    * diagnostics and stay behind the trace switch, the executable-memory one
    * especially (executing generated code is a hard failure where the sandbox

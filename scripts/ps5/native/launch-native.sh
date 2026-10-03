@@ -20,7 +20,7 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 
 host=$1
-title_id=${2:-PPSA99010}
+title_id=${2:-PPSA99233}
 websrv_port=${PS5_WEBSRV_PORT:-8080}
 pldmgr_port=${PSLDMGR_PORT:-8084}
 wait_seconds=${WILIWILI_LAUNCH_WAIT:-20}
