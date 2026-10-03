@@ -118,9 +118,13 @@ static void dxt_compress(uint8_t* dst, uint8_t* src, uint32_t w, uint32_t h, boo
 #endif
 
 #if defined(PS5_NATIVE_APP)
-static constexpr size_t MAX_IMAGE_REQUEST_THREADS = 4;
+static constexpr size_t MAX_IMAGE_REQUEST_THREADS = 8;
 static constexpr unsigned MAX_IMAGE_RETRIES       = 2;
-static constexpr int IMAGE_CONNECTION_TIMEOUT_MS  = 5000;
+static constexpr int IMAGE_CONNECTION_TIMEOUT_MS  = 3000;
+/* 无进度请求（尚未收到任何响应字节）的硬期限：真机实测新建连接的 TLS 握手会在
+ * curl_multi_socket_action 内同步阻塞 1.4–2.1 s，watchdog 在调用内部无法运行；
+ * 超过这里就主动释放 lane 并交给重试，避免一个卡死连接把队列拖到超时上限。 */
+static constexpr int IMAGE_NO_PROGRESS_DEADLINE_MS = 6000;
 #endif
 
 static size_t effectiveImageRequestThreads(size_t configured) {
@@ -252,7 +256,10 @@ private:
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)bilibili::HTTP::TIMEOUT);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)IMAGE_CONNECTION_TIMEOUT_MS);
         curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 10L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 6L);
+        /* 让连接池里的 CDN 连接活得更久，减少重复握手（TLS 是当前最贵的一段）。 */
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
 #else
         session->SetConnectTimeout(cpr::ConnectTimeout{bilibili::HTTP::CONNECTION_TIMEOUT});
 #endif
@@ -406,10 +413,16 @@ private:
                     }
                     const auto now      = std::chrono::steady_clock::now();
                     const auto watchdog = std::chrono::milliseconds(bilibili::HTTP::TIMEOUT) + std::chrono::seconds(5);
+                    const auto noProgressDeadline = std::chrono::milliseconds(IMAGE_NO_PROGRESS_DEADLINE_MS);
                     for (auto it = active.begin(); it != active.end();) {
                         CURL* activeCurl     = it->first;
                         const bool cancelled = it->second.request.isCancelled();
-                        const bool timedOut  = now - it->second.startedAt >= watchdog;
+                        /* 有进度（收到过字节）的请求沿用完整 watchdog；完全没有响应的请求
+                         * 更早释放 lane，避免排队被单个卡死连接拖住。 */
+                        curl_off_t downloaded = 0;
+                        curl_easy_getinfo(activeCurl, CURLINFO_SIZE_DOWNLOAD_T, &downloaded);
+                        const auto deadline = downloaded > 0 ? watchdog : noProgressDeadline;
+                        const bool timedOut = now - it->second.startedAt >= deadline;
                         ++it;
                         if (cancelled) {
                             finish(multi, active, activeCurl, CURLE_ABORTED_BY_CALLBACK);

@@ -278,9 +278,9 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::IMAGE_REQUEST_THREADS,
      {"image_request_threads",
 #if defined(PS5_NATIVE_APP)
-      {"2", "3", "4"},
-      {2, 3, 4},
-      2}},
+      {"4", "6", "8"},
+      {4, 6, 8},
+      1}},
 #elif defined(__SWITCH__) || defined(__PSV__)
       {"1", "2", "3", "4"},
       {1, 2, 3, 4},

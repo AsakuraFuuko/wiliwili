@@ -1077,3 +1077,14 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
   - 直播页 + 动态页：20+ 张图片全 200，`img-net: failed=0`、`img-decode=0`；`img-stall` 命中 10 次，**全部 `op=socket_action`、`running=0 active=1`、1.4–2.1 s**，与 `img-net: total` 的 `tls≈1.4–2.1s / newconn=1` 逐条对应 ⇒ 阻塞 = **新连接的 TLS 握手在 `curl_multi_socket_action` 内同步完成**；旧的 57–113 s 极端值未复现。
 - 未覆盖：动态尺寸长测（全屏↔小窗反复切换）；trace 模式 `fps:` 行的相位字段仍是旧记录（只有 slot 1 被置位），不可信，默认运行不受影响。
 - 提交：borealis `39f2da9d`；应用层 + notes `f3c7f21`、`228ff02`（未 push）。
+
+**网络队列修复（2026-10-04，构建 `Oct 4 2026 03:26:12`）**：
+
+- 症状：4 条 lane 每条被"新建连接的 TLS 握手"占用 1.4–3.2 s（`img-stall op=socket_action`），无进度请求最长占满 curl 超时（10 s）/watchdog（15 s）⇒ 图片队列排到 2 s 级别。
+- 改动（`wiliwili/source/utils/image_helper.cpp`、`config_helper.cpp`）：
+  - lane 上限 4 → **8**；PS5 图片线程选项 {4,6,8}、默认 **6**（`img-multi: lanes=8 max-inflight=6`）；
+  - 新增**无进度硬期限**：未收到任何响应字节的请求 6 s 就 `finish(...TIMEDOUT)` 释放 lane 并重试（有进度的仍走 `TIMEOUT+5s`）；
+  - `CONNECTTIMEOUT` 5 s → 3 s；`LOW_SPEED_TIME` 10 s → 6 s；
+  - 连接池 KeepAlive 参数（idle 30 s / 间隔 15 s），减少重复握手。
+- 同一直播页复测：队列等待峰值 **2146 ms → 180 ms**；18 条图片请求 `img-net: failed=0`、`crash=0`；`img-stall` 仍有 4 次（1.9–3.2 s，均为 TLS 握手，属控制台 CPU 成本），但不再堵队列；进入真实直播间播放正常（`ring_fail/tex_fail/timeouts=0`，direct_mem 17.8/128 MiB）。
+- 未做（后续可选）：HTTP/2 多路复用（需要 curl 带 nghttp2）或连接预热，进一步压缩每新连接 ~2 s 的握手成本。
