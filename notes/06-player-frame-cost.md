@@ -1088,3 +1088,23 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
   - 连接池 KeepAlive 参数（idle 30 s / 间隔 15 s），减少重复握手。
 - 同一直播页复测：队列等待峰值 **2146 ms → 180 ms**；18 条图片请求 `img-net: failed=0`、`crash=0`；`img-stall` 仍有 4 次（1.9–3.2 s，均为 TLS 握手，属控制台 CPU 成本），但不再堵队列；进入真实直播间播放正常（`ring_fail/tex_fail/timeouts=0`，direct_mem 17.8/128 MiB）。
 - 未做（后续可选）：HTTP/2 多路复用（需要 curl 带 nghttp2）或连接预热，进一步压缩每新连接 ~2 s 的握手成本。
+
+### 10.29 网络慢握手深挖：payload 模型对比与排除项（2026-10-04）
+
+**问题**：图片新连接偶发 `tls≈1.4–2.8 s`（`img-stall op=socket_action`），6 条 lane 被占住时队列等待可达数秒。
+
+**payload 线的做法（对照）**：`ImageThreadPool`（`cpr::ThreadPool`，min 1 / max `REQUEST_THREADS`，PS5 默认索引 3=4 线程）+ 每张图一个任务、线程内**阻塞 `session.Get()`**（独立 easy handle）；**没有 lane/watchdog/重试/队列重启**，只共享 DNS（SSL session/连接共享在 payload 里同样是注释掉的 TODO）。curl 同为 8.18.0。
+
+**本批已提交的缓解（`3396572`）**：lane 4→8、默认并发 4→6、无进度 6 s 硬释放、`CONNECTTIMEOUT` 5→3 s、`LOW_SPEED_TIME` 10→6 s、KeepAlive idle 30 s。首轮复测队列等待峰值 2146→180 ms，但慢握手本身仍在。
+
+**排除项（全部有真机/PC 证据）**：
+1. 网络与 CDN：PC 到 `i0/i1.hdslb.com`、`album.biliimg.com`、`api.bilibili.com` 的 TLS 17–47 ms；PC 8 并发同样 23–37 ms。
+2. 标题内**裸** `SSL_connect`（阻塞 socket，TLSv1.3）= **6 ms**；加 `SSL_VERIFY_PEER` + 载入 185 KB ca-bundle 仍 6 ms；`RAND_bytes` 1 ms、CA 加载 13 ms、`/dev/urandom` 可打开（`fd=13`）⇒ 熵/CA/校验/CPU 全排除。
+3. `CURLOPT_IPRESOLVE_V4` 后 stall 依旧（`img-stall … peer=v4:106.225.x`）⇒ 双栈/Happy Eyeballs 排除。
+4. stall 点 `ph=dns/conn/app` 显示耗时在 TLS 段；socket 标志 `fl=0x4`（O_NONBLOCK=4 on this libc）⇒ 非阻塞标志正常。
+5. in-process `curl_easy_perform` 变体（minimal / +low-speed+KeepAlive / +进度回调 / +CERTINFO）在 preinit 全部 **28–55 ms** ⇒ 这些 session 选项无罪。
+6. 把图片 runner 换成 payload 同款（每请求一线程 + 阻塞 easy，启动行 `img-threads: workers=8`）后**慢握手照旧（1.4–2.7 s）**；同期 API 路径也出现 `http: slow 10989ms dns=3 tcp=3 tls=2813 first=7487 code=200 err=8` ⇒ **与 HTTP 客户端模型无关**；而同一时刻后台探针的裸握手仍是 5–7 ms（同一进程）。
+
+**结论/未解**：慢的是"curl 传输在标题运行时里"这一路径，而裸握手不慢；原因仍未定位（线程亲和、sandbox 网络栈在 curl 路径上的某些调用、或 curl 内部 poll 行为都还是候选）。实验用的"阻塞 runner"与 curl 变体探针已回滚，正式线保持已提交的 multi runner；只保留一次性探针：`WILIWILI_CRYPTO_PROBE=1`（options 文件）→ `crypto:` / `tls:` 行（`native_shims.c`）。
+
+**下一步建议**：① 给 `img-net` / `http: slow` 日志加 URL/host 维度，确认是否与特定主机相关；② 在 payload 环境用同一探针做 A/B（需一次 payload 构建）验证"payload 不慢"这一前提。
