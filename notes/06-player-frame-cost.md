@@ -1068,9 +1068,12 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 
 > 区分：以上"已观察"项均有原始日志行或源码 file:line 支撑；`frame:` 根因已由代码与日志数值确认；`to_bytes` 的具体触发输入仍是推测，待 F2 真机复测确认。
 
-**验证结果（2026-10-03 21:52:22 构建，PPSA99233，已 ffpkg 安装运行 PID 210）**：
+**验证结果（2026-10-03 21:52:22 构建，PPSA99233，已 ffpkg 安装运行）**：
 
 - 默认运行：`img-multi: lanes=4 max-inflight=4 async-dns=1`；12 张图片请求全部 `code=200`（10–162 ms，queue ≤180 ms）；`img-net: failed=0`、`img-stall=0`、`terminate:0`、`crash:0`；`frame:` 行 **0**（门控生效）；`agc health` 至 `frame=15600`，`dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`，`direct_mem=7,794,432/134,217,728`。
 - trace 运行（`WILIWILI_TRACE=1` 打包）：`frame: clear=0ms ui=0ms submit=0ms video=0ms swap=15ms calls=0/30` —— 钩子生效，clear/ui 不再是垃圾值；验证后已恢复干净包部署。
-- 未覆盖：F1 的直播/动态长浏览场景（无自动入口）、F2 的搜索页触发路径（无手柄输入通道）；trace 模式 `fps:` 行的相位字段仍是旧记录（只有 slot 1 被置位），不可信，默认运行不受影响。
-- 提交：borealis `39f2da9d`、应用层+notes `f3c7f21`（未 push）。
+- **交互复测（2026-10-04 凌晨，PeaSyo 手柄）**：
+  - 搜索链路：Y 键 → TV 搜索页 → 选热词 → 搜索结果页正常；`terminate/crash=0`，搜索接口 200（`search_activity_tv` 的转换路径真机走通）。
+  - 直播页 + 动态页：20+ 张图片全 200，`img-net: failed=0`、`img-decode=0`；`img-stall` 命中 10 次，**全部 `op=socket_action`、`running=0 active=1`、1.4–2.1 s**，与 `img-net: total` 的 `tls≈1.4–2.1s / newconn=1` 逐条对应 ⇒ 阻塞 = **新连接的 TLS 握手在 `curl_multi_socket_action` 内同步完成**；旧的 57–113 s 极端值未复现。
+- 未覆盖：动态尺寸长测（全屏↔小窗反复切换）；trace 模式 `fps:` 行的相位字段仍是旧记录（只有 slot 1 被置位），不可信，默认运行不受影响。
+- 提交：borealis `39f2da9d`；应用层 + notes `f3c7f21`、`228ff02`（未 push）。
