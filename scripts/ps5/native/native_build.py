@@ -99,6 +99,12 @@ def compile_plan(cdb: Path, root: Path, sdk: Path, sdl2: Path, gl: Path) -> list
             continue
         if any(marker in relative for marker in SKIP_SOURCES):
             continue
+        # 资源只保留一份：跳过 libromfs 生成的 12.8 MB 字节表，改由
+        # native_romfs_empty.cpp 提供空表（见该文件与 notes/06 §10.29）。
+        # PS5_NATIVE_ROMFS_EMBED=1 恢复内嵌回退。
+        if (os.environ.get("PS5_NATIVE_ROMFS_EMBED") != "1"
+                and relative.endswith("extern/libromfs/lib/libromfs_resources.cpp")):
+            continue
         args = shlex.split(entry["command"])
         keep: list[str] = []
         skip_value = False
@@ -240,6 +246,17 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     for extra in extra_sources:
         sources.append((Path(__file__).with_name(extra), "-std=gnu11",
                         probe_defines))
+
+    # 资源只保留一份：用空表顶掉 libromfs 的 12.8 MB 生成字节表（见
+    # native_romfs_empty.cpp）。设 PS5_NATIVE_ROMFS_EMBED=1 可恢复内嵌回退。
+    if os.environ.get("PS5_NATIVE_ROMFS_EMBED") != "1":
+        libromfs_include = (root / "library" / "borealis" / "library" / "lib" /
+                            "extern" / "libromfs" / "lib" / "include")
+        if not libromfs_include.is_dir():
+            raise SystemExit(f"libromfs headers not found: {libromfs_include}")
+        sources.append((Path(__file__).with_name("native_romfs_empty.cpp"), "-std=c++20",
+                        (f"-I{libromfs_include}", "-DLIBROMFS_PROJECT_NAME=wiliwili",
+                         "-DPS5", "-D__PS5__", "-DPROSPERO")))
 
     objects = []
     for source, standard, extra in sources:

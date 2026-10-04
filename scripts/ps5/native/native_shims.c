@@ -1151,15 +1151,15 @@ static void wiliwili_crypto_probe(void) {
     const int resource_count = wiliwili_list_dir("/app0/assets", resource_names, 5);
     char first[5 * 256 + 1];
     size_t first_length = 0;
-    first[0] = '\0';
-    int shown = resource_count;
+    first[0]            = '\0';
+    int shown           = resource_count;
     if (shown < 0) shown = 0;
     if (shown > 5) shown = 5;
     for (int i = 0; i < shown; ++i) {
         if (i != 0 && first_length + 1 < sizeof(first)) first[first_length++] = ',';
         const size_t name_length = strlen(resource_names[i]);
-        const size_t available = sizeof(first) - first_length - 1;
-        const size_t copied = name_length < available ? name_length : available;
+        const size_t available   = sizeof(first) - first_length - 1;
+        const size_t copied      = name_length < available ? name_length : available;
         memcpy(first + first_length, resource_names[i], copied);
         first_length += copied;
         first[first_length] = '\0';
@@ -1181,6 +1181,22 @@ static void wiliwili_crypto_probe(void) {
     wiliwili_curl_probe_start();
     /* CA 探针（caprobe/capar/casubset）在 2026-10-04 根因收敛后已删除：
      * 每连接重解析 CA 文件、并发被串行化；修复＝裁剪 bundle（notes/06 §10.29）。 */
+}
+
+/* 启动检查点（永久保留）：资源 overlay 是否生效 + 内嵌 romfs 的状态。
+ * 空表构建（native_romfs_empty.cpp）下 wiliwili_romfs_state = "empty"，
+ * 内嵌构建里没有这个符号，按 weak 引用回落到 "embedded"。 */
+extern const char *wiliwili_romfs_state __attribute__((weak));
+
+static void wiliwili_resources_marker(void) {
+    static char names[8][256];
+    const char *root = getenv("WILIWILI_RES_DIR");
+    if (root == 0 || root[0] == 0) root = "/app0/assets";
+    const int count = wiliwili_list_dir(root, names, 8);
+    char line[192];
+    snprintf(line, sizeof(line), "res: overlay=%s entries=%d romfs=%s", root, count,
+             wiliwili_romfs_state != 0 ? wiliwili_romfs_state : "embedded");
+    wiliwili_boot_log(line);
 }
 
 static void wiliwili_early_marker(void) {
@@ -1227,6 +1243,7 @@ static void wiliwili_early_marker(void) {
         }
     }
     wiliwili_boot_log("wiliwili: preinit");
+    wiliwili_resources_marker();
     if (getenv("WILIWILI_CRYPTO_PROBE") != 0) wiliwili_crypto_probe();
 }
 

@@ -1217,3 +1217,14 @@ ninja -C build-ps5 libromfs-wiliwili      # 重建含 overlay 的归档
 env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重新链接标题
 ```
 验证断言：`strings build-ps5/native/dist/PPSA99233/eboot.bin | grep WILIWILI_RES_DIR` 必须命中。
+
+### 资源只保留一份：空 romfs 表（2026-10-04，已真机验收）
+
+既然资源已以松散文件发布（`/app0/assets/`），内嵌的 12.8 MB 字节表就是纯冗余。做法：新增 `scripts/ps5/native/native_romfs_empty.cpp` 定义 `RomFs_wiliwili_get_resources/_get_paths/_get_name` 三个空表符号，`native_build.py` 把它编进 runtime 对象，并**跳过** CMake 里生成的 `extern/libromfs/lib/libromfs_resources.cpp`（290→289 TU）。链接后生成对象不再进镜像：
+
+- eboot **63.0 MB → 53.3 MB**；`strings eboot.bin | grep 喴哩喴哩` = 0（资源字节确实不再进 eboot）。
+- 语义不变：`romfs::get` 未命中时仍抛 `std::invalid_argument("Invalid romfs resource path …")`（overlay 为唯一来源，松散树必须完整——验收脚本已确认 312/312 文件齐全、运行期无该异常）。
+- 启动检查点（永久保留）：`res: overlay=/app0/assets entries=N romfs=empty|embedded`（`wiliwili_romfs_state` 由空表 TU 定义，weak 引用；内嵌构建回落 "embedded"）。
+- **回退开关**：构建时 `PS5_NATIVE_ROMFS_EMBED=1` 恢复内嵌回退（跳过空表 TU 与跳过规则）。
+- 真机验收（构建 `Oct 4 2026 11:29:35`）：验证脚本 PASS；UI 完整（中文标签无豆腐块、卡片封面/文字、侧栏图标齐全）。
+- 镜像体积：dist ≈66 MB（eboot 53.3 + assets 13.1）。装到主机的 `.ffpkg` 默认 `newfs -D` 约 **75 MB**（313 个小文件在 64 KB 块上有开销；改动前约 66 MB）。实测 `-b 8192 -f 1024 -g 16384 -h 64` 可到 **70 MB**，但属非默认 fs 参数、有挂载兼容风险，未采用；如要压体积再评估。
