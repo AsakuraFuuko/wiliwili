@@ -182,6 +182,17 @@ static std::string mpvPropertyText(mpv_handle *handle, const char *name) {
     return result;
 }
 #endif
+#if defined(PS5_NATIVE_APP)
+/* The SW renderer's normal swscale flags add full chroma interpolation and
+ * accurate rounding on top of the default scaler. `sws-fast` removes only
+ * those expensive flags; it leaves the default scaler selection and output
+ * surface unchanged. This is the smallest measured quality/performance tradeoff
+ * between the default path and the all-in `sw-fast` profile. */
+static void configureNativeMpvSw(mpv_handle *mpv) {
+    mpvSetOptionString(mpv, "sws-fast", "yes");
+}
+#endif
+
 
 static inline void check_error(int status) {
     if (status < 0) {
@@ -540,11 +551,7 @@ void MPVCore::init() {
     }
 
 #if defined(PS5_NATIVE_APP)
-    /* MPV_RENDER_API_TYPE_SW otherwise selects the general-quality scaler. On the
-     * PS5 title that path costs about 26 ms for a 1920x1080 RGBA frame. The
-     * built-in sw-fast profile keeps the same 1920x1080 output surface but uses
-     * the fast CPU conversion path; measured render cost is about 1 ms. */
-    mpvSetOptionString(mpv, "profile", "sw-fast");
+    configureNativeMpvSw(mpv);
 #endif
 
     if (MPVCore::INMEMORY_CACHE) {
