@@ -473,11 +473,17 @@ private:
                 deliver(request, std::move(response));
                 continue;
             }
-            auto trace   = std::make_shared<TransferTrace>();
-            trace->start = std::chrono::steady_clock::now();
-            curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-            curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, imageDebugCallback);
-            curl_easy_setopt(curl, CURLOPT_DEBUGDATA, trace.get());
+            /* 逐事件跟踪默认关闭（curl VERBOSE 对每个传输都有开销）；需要时用
+             * WILIWILI_IMG_TRACE=1 打开，慢传输（≥1 s）才会 dump。 */
+            static const bool traceEnabled = std::getenv("WILIWILI_IMG_TRACE") != nullptr;
+            std::shared_ptr<TransferTrace> trace;
+            if (traceEnabled) {
+                trace        = std::make_shared<TransferTrace>();
+                trace->start = std::chrono::steady_clock::now();
+                curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+                curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, imageDebugCallback);
+                curl_easy_setopt(curl, CURLOPT_DEBUGDATA, trace.get());
+            }
             active.emplace(curl, ActiveRequest{std::move(request), std::move(session), std::chrono::steady_clock::now(),
                                                std::move(trace)});
 
