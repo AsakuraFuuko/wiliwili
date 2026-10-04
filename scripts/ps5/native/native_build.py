@@ -228,7 +228,7 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     # application: the software rendering variant gates its startup probe on one
     # of them.
     feature_defines = tuple(d for d in NATIVE_DEFINES if d.startswith("-DWILIWILI_"))
-    extra_sources = ["native_shims.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c"]
+    extra_sources = ["native_shims.c", "native_fs.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c"]
     # native_libc_trace.c reports every string and memory call reached with a
     # NULL argument, which is how the software renderer's crash was identified.
     # It wraps hot libc entry points, so it is a diagnostic aid and stays out of
@@ -471,23 +471,30 @@ def package(module: Path, root: Path, toolchain: Path, sdk: Path, out: Path,
     (dist / "sce_module").mkdir(parents=True, exist_ok=True)
     shutil.copy2(toolchain / "runtime" / "libc.prx", dist / "sce_module" / "libc.prx")
 
-    # Resources are embedded (libromfs); only the trust store stays on disk,
-    # because libcurl needs a real file for CURLOPT_CAINFO.
+    # 资源同时以松散文件和 libromfs 内嵌归档发布：前者用于覆盖，后者作为回退。
+    # 先复制完整 resources/，再写入优先级更高的 CA 文件，避免资源树里的旧 bundle
+    # 覆盖裁剪版；相对 resources/ 的路径因此原样对应 /app0/assets/ 下的路径。
+    resources = root / "resources"
+    assets = dist / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    if resources.is_dir():
+        shutil.copytree(resources, assets, dirs_exist_ok=True)
+    else:
+        print(f"warning: {resources} not found; external asset overlay empty", file=sys.stderr)
 
-    # HTTPS requests point at /app0/assets/ca-bundle.crt in an installed title.
-    (dist / "assets").mkdir(parents=True, exist_ok=True)
-    # 裁剪过的 bundle 优先：libcurl 每条新建连接都会重解析整个 CA 文件，而该调用在
-    # 标题运行时里并发时会被串行化（140 张 → 5 并发各 2.2 s；7 张 → ~0.2 s，见
-    # notes/06 §10.29）。裁剪只去掉用不到的根，SSL_VERIFY_PEER 保持不变；
-    # 重新生成用 scripts/ps5/native/make-ca-bundle.sh。
+    # HTTPS 请求固定从 /app0/assets/ca-bundle.crt 读取；裁剪过的 bundle 优先，因为
+    # libcurl 并发新建连接会重复解析 CA 文件。SSL_VERIFY_PEER 保持开启；重新生成用
+    # scripts/ps5/native/make-ca-bundle.sh。
     trimmed = Path(__file__).with_name("ca-bundle-trimmed.crt")
     ca_bundle = trimmed if trimmed.is_file() else sdk / "target" / "user" / "homebrew" / "etc" / "ca-bundle.crt"
+    ca_target = assets / "ca-bundle.crt"
     if ca_bundle.is_file():
-        shutil.copy2(ca_bundle, dist / "assets" / "ca-bundle.crt")
-    else:
-        print(f"warning: {ca_bundle} not found; HTTPS trust store missing",
-              file=sys.stderr)
+        shutil.copy2(ca_bundle, ca_target)
+    elif not ca_target.is_file():
+        print(f"warning: {ca_bundle} not found; HTTPS trust store missing", file=sys.stderr)
 
+    # 内嵌 romfs 暂时保留：松散覆盖层是过渡方案，先不裁剪 eboot，待真机验证稳定
+    # 后再收缩镜像。刻意不用 /download0（用户明确排除；实测 zftpd 也写不进）。
     # The shell expects a 512x512 launcher icon (PLATFORM_NOTES). wiliwili ships
     # smaller artwork, so scale it onto a square canvas when Pillow is present.
     icon = root / "resources" / "icon" / "icon.png"

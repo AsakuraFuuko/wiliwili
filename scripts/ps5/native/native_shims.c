@@ -50,6 +50,8 @@
 
 int wiliwili_trace_enabled(void);
 void wiliwili_note_frame(void);
+/* native_fs.c 绕过标题沙箱被禁用的 opendir()；crypto 探针用它确认包内资源可枚举。 */
+int wiliwili_list_dir(const char *path, char names[][256], int maxNames);
 
 void *sceLibcMspaceCreate(const char *name, void *base, size_t size, unsigned flags);
 void *sceLibcMspaceMalloc(void *mspace, size_t size);
@@ -1142,6 +1144,30 @@ static void wiliwili_crypto_probe(void) {
         wiliwili_boot_log(line);
         SSL_CTX_free(ctx);
     }
+
+    /* 用同一套 getdents 包装枚举最终包内的资源目录；这里故意只保留前 5 个名字，
+     * 诊断需要确认路径和接口可用，不应为打印整棵资源树增加启动日志负担。 */
+    char resource_names[5][256];
+    const int resource_count = wiliwili_list_dir("/app0/assets", resource_names, 5);
+    char first[5 * 256 + 1];
+    size_t first_length = 0;
+    first[0] = '\0';
+    int shown = resource_count;
+    if (shown < 0) shown = 0;
+    if (shown > 5) shown = 5;
+    for (int i = 0; i < shown; ++i) {
+        if (i != 0 && first_length + 1 < sizeof(first)) first[first_length++] = ',';
+        const size_t name_length = strlen(resource_names[i]);
+        const size_t available = sizeof(first) - first_length - 1;
+        const size_t copied = name_length < available ? name_length : available;
+        memcpy(first + first_length, resource_names[i], copied);
+        first_length += copied;
+        first[first_length] = '\0';
+    }
+    char resource_line[5 * 256 + 96];
+    snprintf(resource_line, sizeof(resource_line), "res-dir: path=/app0/assets count=%d first=%s", resource_count,
+             first_length != 0 ? first : "-");
+    wiliwili_boot_log(resource_line);
 
     t0 = wiliwili_probe_ms();
     RAND_bytes(buf, (int)sizeof(buf));

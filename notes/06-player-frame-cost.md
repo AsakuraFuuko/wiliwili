@@ -1198,3 +1198,22 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 | `/data` | — | open ENOENT | 命名空间不可见 |
 
 ⇒ **目录遍历在我们的标题里完全可行**（含镜像挂载 `/app0`；EvoPlayer 的 `.ffpfsc` 上 getdents 被拦，我们是 UFS 镜像所以能列）。注意 FreeBSD `getdents` 要求缓冲区 ≥ 文件系统块大小（EvoPlayer 用 64 KB 常量，否则 EINVAL）。另外 `/download0` 可写的前提是 `param.json` 的 `downloadDataSize` 为正（我们已是 256）。结论：资源/CA **可以**以松散文件放在 `/download0`（可写、可枚举、可按名字读），镜像内 `/app0` 也可枚举与按名字读。
+
+### 镜像内资源外置（松散文件优先）+ getdents 目录遍历（2026-10-04，已真机验收）
+
+**机制**：
+- 资源树以**松散文件**随包发布到镜像内 `dist/<TITLE_ID>/assets/`（运行期 `/app0/assets/`），与 romfs 的 name 严格一一对应（生成器用 `fs::relative` 生成 key）。CA 也在这个目录（`/app0/assets/ca-bundle.crt`，裁剪版）。**刻意不用 `/download0`**（用户排除；zftpd 也写不进去，550）。
+- `library/borealis/library/lib/extern/libromfs/lib/source/romfs.cpp`：`romfs::get`/`romfs::list` 改为**文件优先、内嵌 romfs 回退**（overlay 目录：`WILIWILI_RES_DIR` > PS5 默认 `/app0/assets/`；文件内容缓存进静态 map，空文件按未命中回退；`list` 走 `wiliwili_list_dir` 合并去重——唯一使用者 `i18n.cpp:51`）。
+- `scripts/ps5/native/native_fs.c`：`wiliwili_list_dir()` = `open(O_RDONLY|O_DIRECTORY)` + `getdents`（64 KB 缓冲），因为标题沙箱里 `opendir()` 全 EPERM（见上文实测表）。参考 `references/EVO-PLAYER-PS5/projects/evoplayer/src/evo_readdir.c`。
+
+**真机验收（2026-10-04 10:0x，构建 `Oct 4 2026 10:05:16`）**：
+1. `res-dir: path=/app0/assets count=5 first=svg,.gitignore,pictures,ca-bundle.crt,xml`（探针只记前 5 个）⇒ getdents 遍历生效。
+2. `code=200` ×40、`img-net: failed`/`crash`/`terminate` 全 0 ⇒ 松散资源不影响网络与稳定性。
+3. **外置决定性验收**：把 `dist/.../assets/i18n/zh-Hans/wiliwili.json` 的 `home.rcmd.tab` 改成 `推荐★外置`（eboot 内嵌 romfs 仍是原文），**只重装镜像、不重链接**，启动后顶部第二个标签显示 `推荐★外置` ⇒ 松散文件确实覆盖了内嵌资源。
+
+**构建注意（踩过）**：改 `romfs.cpp` 后必须先重建归档再链接，否则 `native_build.py` 链的还是旧 `libromfs-wiliwili.a`：
+```
+ninja -C build-ps5 libromfs-wiliwili      # 重建含 overlay 的归档
+env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重新链接标题
+```
+验证断言：`strings build-ps5/native/dist/PPSA99233/eboot.bin | grep WILIWILI_RES_DIR` 必须命中。
