@@ -741,6 +741,9 @@ int SSL_set_alpn_protos(SSL *ssl, const unsigned char *protos, unsigned int prot
 const char *SSL_get_version(const SSL *ssl);
 void SSL_free(SSL *ssl);
 
+/* FreeBSD 的薄封装（libc 直接转 getdents 系统调用）；SDK 头文件在 _WANT_ 宏下才声明。 */
+int getdents(int fd, char *buf, int nbytes);
+
 static long long wiliwili_probe_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -1071,6 +1074,38 @@ static void wiliwili_dirent_probe(void) {
         snprintf(line, sizeof(line), "dirprobe: path=%s opendir_ok=%d errno=%d entries=%d first=%s", paths[i], dir != 0,
                  e, entries, first);
         wiliwili_boot_log(line);
+    }
+    /* EvoPlayer 的结论：libc opendir 走 _fstatfs 被 EPERM，但 open(O_DIRECTORY)
+     * + getdents() 可用（缓冲区要 >= 文件系统块大小，UFS/APFS 上是 64 KB）。 */
+    static const char *gpaths[] = {"/download0", "/app0", "/app0/assets", "/mnt/usb0", "/data"};
+    for (size_t gi = 0; gi < sizeof(gpaths) / sizeof(gpaths[0]); ++gi) {
+        int gfd = open(gpaths[gi], 0 /* O_RDONLY */);
+        if (gfd >= 0) {
+            static char dirbuf[65536];
+            errno           = 0;
+            int got         = getdents(gfd, dirbuf, (int)sizeof(dirbuf));
+            const int ge    = errno;
+            char names[128] = "-";
+            if (got > 0) {
+                names[0]                = 0;
+                const struct dirent *de = (const struct dirent *)dirbuf;
+                const char *end         = dirbuf + got;
+                int count               = 0;
+                while ((const char *)de < end && count < 3) {
+                    strncat(names, de->d_name, 40);
+                    strncat(names, " ", 2);
+                    de = (const struct dirent *)((const char *)de + de->d_reclen);
+                    ++count;
+                }
+            }
+            snprintf(line, sizeof(line), "dirprobe: getdents(%s) fd=%d bytes=%d errno=%d first3=%s", gpaths[gi], gfd,
+                     got, ge, names);
+            wiliwili_boot_log(line);
+            close(gfd);
+        } else {
+            snprintf(line, sizeof(line), "dirprobe: open(%s) failed errno=%d", gpaths[gi], errno);
+            wiliwili_boot_log(line);
+        }
     }
     for (const char *file = "/app0/assets/ca-bundle.crt";; file = 0) {
         int probe = open(file, O_RDONLY);

@@ -1186,3 +1186,15 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 | `open("/app0/assets/ca-bundle.crt")` | 成功（fd=13） | — | 按已知名字打开文件正常 |
 
 ⇒ 之前 `native_build.py` 里"沙箱禁止目录遍历"只是注释断言，现已有实测依据；**外置资源/CA 只能"按清单逐个按名字打开"，不能遍历目录**；且外置文件只能放 `/download0`（可写且在命名空间内），`/data` 不可见。payload 线不受此限（桌面式环境，`fetch_payload.c` 里 opendir 正常）。
+
+**更正 + 补充（2026-10-04，与 EvoPlayer 参考实现对照）**：上一条"沙箱禁止目录遍历"的说法**过强**——被禁的只是 libc 的 `opendir()`（FreeBSD 版内部走 `_fstatfs` → EPERM）。按 EvoPlayer 的招法（`references/EVO-PLAYER-PS5`：`projects/evoplayer/src/evo_readdir.c`、`docs/evo-pro/phase-1b-app-module.md` §5）用 `open()`+`getdents()` 实测我们自己的标题：
+
+| 路径 | `opendir` | `getdents`（64 KB 缓冲） | 内容 |
+|---|---|---|---|
+| `/download0` | EPERM | ✅ 148 B | `.` `..` `wiliwili-boot.log` |
+| `/app0` | EPERM | ✅ 96 B | `.` `..` `sce_module` |
+| `/app0/assets` | EPERM | ✅ 80 B | `.` `..` `ca-bundle.crt` |
+| `/mnt/usb0` | — | open ENOENT | 未插 USB |
+| `/data` | — | open ENOENT | 命名空间不可见 |
+
+⇒ **目录遍历在我们的标题里完全可行**（含镜像挂载 `/app0`；EvoPlayer 的 `.ffpfsc` 上 getdents 被拦，我们是 UFS 镜像所以能列）。注意 FreeBSD `getdents` 要求缓冲区 ≥ 文件系统块大小（EvoPlayer 用 64 KB 常量，否则 EINVAL）。另外 `/download0` 可写的前提是 `param.json` 的 `downloadDataSize` 为正（我们已是 256）。结论：资源/CA **可以**以松散文件放在 `/download0`（可写、可枚举、可按名字读），镜像内 `/app0` 也可枚举与按名字读。
