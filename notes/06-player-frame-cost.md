@@ -1230,3 +1230,9 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
 - 镜像体积：dist ≈66 MB（eboot 53.3 + assets 13.1）。装到主机的 `.ffpkg` 默认 `newfs -D` 约 **75 MB**（313 个小文件在 64 KB 块上有开销；改动前约 66 MB）。实测 `-b 8192 -f 1024 -g 16384 -h 64` 可到 **70 MB**，但属非默认 fs 参数、有挂载兼容风险，未采用；如要压体积再评估。
 
 **镜像体积调参（真机验证 2026-10-04）**：`install-ffpkg.sh` 现在默认用 `newfs -b 8192 -f 1024 -g 16384 -h 64`（原为工具默认值）。理由：资源以 313 个松散文件发布后，64 KB 块上的开销明显。实测逻辑大小 **91 MiB → 83 MiB**；真机（固件 12.00）挂载正常、标题正常启动、资源全部可读（`res: overlay=/app0/assets entries=8 romfs=empty`、`code=200`×27、UI 截图中文/图标无缺字）。回退：`PS5_FFPKG_NEWFS_ARGS=" "` 或用别的参数覆盖。（更激进的 `-b 4096 -f 512 -i 4096` 实测 82.4 MiB，收益仅 0.6 MiB，未采用。）
+
+### 镜像块参数与主机挂载（2026-10-04 真机教训）
+
+- `newfs -b 8192 -f 1024 -g 16384 -h 64`（为省体积）生成的 `.ffpkg` **在主机上挂载失败**：ShadowMountPlus 日志 `image chain mount failed: title=… layer=0 … status=5 (Input/output error)`，系统弹 `CE-105773-3 无法开始此游戏或应用程序`。工具默认参数（block 32768 / frag 4096）正常。
+- 更坑的是：失败挂载之后，**换回默认参数的镜像也一直 EIO**——删文件重传、校验 md5（与本地逐字节一致）、`df`（/data 551G 空闲）、清 SMP 索引（`image_index.bin`/`manual.*`）都无效 ⇒ 挂载状态被卡在内核/SMP 侧，**需要重启主机**才能恢复。`install-ffpkg.sh` 因此把覆盖口保留但默认留空，并在注释里写明这条结论。
+- 长测同时抓到一个真 bug：首页第一个卡片（视频流程）必崩，`view.cpp` 的 `View::createFromXMLString` 报 tinyxml2 `error 8`（XML_ERROR_PARSING_TEXT）后 SIGABRT，复现 3/3；崩溃寄存器现场已抓（`crash: 6 c=0 addr=0x8000ba422 rip=0x200837b80`）。定位用的诊断（borealis 里打印"哪个 XML、多少字节、内容头 160 字符"）**已 stash 在 `library/borealis` 子模块**（`git -C library/borealis stash list`），等主机恢复后重打一次即可拿到现场。
