@@ -25,6 +25,7 @@
  */
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <netinet/in.h>
@@ -1045,6 +1046,41 @@ static void wiliwili_curl_probe_start(void) {
     pthread_t thread;
     if (pthread_create(&thread, 0, wiliwili_curl_probe_thread, 0) == 0) pthread_detach(thread);
 }
+/* 目录遍历探针（`WILIWILI_CRYPTO_PROBE=1`）：核实"标题沙箱禁止目录遍历"这条
+ * 只在 native_build.py 注释里出现过的断言。分别测 opendir/readdir 与裸 getdents64。 */
+static void wiliwili_dirent_probe(void) {
+    static const char *paths[] = {"/app0", "/app0/assets", "/download0", "/data/homebrew/wiliwili", "/"};
+    char line[256];
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        errno          = 0;
+        DIR *dir       = opendir(paths[i]);
+        const int e    = errno;
+        int entries    = 0;
+        char first[64] = "-";
+        if (dir != 0) {
+            struct dirent *entry = 0;
+            while ((entry = readdir(dir)) != 0 && entries < 16) {
+                if (entries == 0 && entry->d_name[0] != 0) {
+                    strncpy(first, entry->d_name, sizeof(first) - 1);
+                    first[sizeof(first) - 1] = 0;
+                }
+                ++entries;
+            }
+            closedir(dir);
+        }
+        snprintf(line, sizeof(line), "dirprobe: path=%s opendir_ok=%d errno=%d entries=%d first=%s", paths[i], dir != 0,
+                 e, entries, first);
+        wiliwili_boot_log(line);
+    }
+    for (const char *file = "/app0/assets/ca-bundle.crt";; file = 0) {
+        int probe = open(file, O_RDONLY);
+        snprintf(line, sizeof(line), "dirprobe: open(file)=%d errno=%d", probe, errno);
+        wiliwili_boot_log(line);
+        if (probe >= 0) close(probe);
+        break;
+    }
+}
+
 static void wiliwili_crypto_probe(void) {
     char line[192];
     unsigned char buf[32];
@@ -1079,6 +1115,7 @@ static void wiliwili_crypto_probe(void) {
 
     wiliwili_tls_probe("i0.hdslb.com");
     wiliwili_tls_parallel_probe();
+    wiliwili_dirent_probe();
     wiliwili_select_probe();
     wiliwili_curl_probe_start();
     /* CA 探针（caprobe/capar/casubset）在 2026-10-04 根因收敛后已删除：

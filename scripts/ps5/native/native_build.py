@@ -73,6 +73,8 @@ if os.environ.get("PS5_NATIVE_AGC") == "1":
 
 # libromfs bundles resources into the payload; the native title reads /app0.
 # libromfs stays enabled: a title sandbox denies directory iteration, so the
+# (2026-10-04 实测：opendir 对 /app0、/download0、/ 全部 EPERM；/data 不可见（ENOENT）；
+#  按名字 open 文件正常 —— 所以外置资源只能"按清单逐个打开"，不能"遍历目录"。)
 # embedded resource image is what the loaders can enumerate.
 SKIP_SOURCES = ()
 
