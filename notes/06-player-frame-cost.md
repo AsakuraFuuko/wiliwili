@@ -1168,3 +1168,9 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 | `probe-ca-5.crt` | 7211 B | 5 | 1 ms | **111–113 ms** |
 
 ⇒ 并发代价与证书数量近似线性；把 bundle 裁到 ~5–10 张（B 站实际用到的 GlobalSign 等）可把每连接开销从 ~2.2 s 降到 ~0.1–0.2 s，`SSL_VERIFY_PEER` 保持不变。另一个方向是找到并消除这个进程内串行化（顺序 5 次只要 55 ms，说明不是 CPU 而是锁/等待；嫌疑：curl 用的 stdio/allocator 在 clean-room 运行时里的全局锁）。
+
+### 修复：裁剪 CA bundle（2026-10-04 08:4x）
+
+- 新增 `scripts/ps5/native/ca-bundle-trimmed.crt`（7 张证书 / 10291 B：GlobalSign R46/E46/R3 交叉签、DigiCert G2、ISRG X1、Sectigo R46、Amazon R1），生成方式写在 `scripts/ps5/native/make-ca-bundle.sh`；`native_build.py` 优先取它，缺省回落到 SDK 全量 bundle。`SSL_VERIFY_PEER` 保持开启，用 `openssl s_client -CAfile` 对 i0/i1/api/passport/grpc/bilivideo 全部验证 `code 0 (ok)`。
+- **真机验证（同一键位驱动）**：新建连接的 `tls` 从 **2155–2173 ms（5 并发）→ 238 ms**；≥1 s 的慢样本从 4–5 条降到 2 条，且剩下的两条是 `newconn=0 tls=0 first=total`（复用连接上的**响应体下载**慢，属另一类问题，非握手）。
+- 队列层缓解（8 lane、无进度 6 s 释放、短超时）继续保留：修复前它是唯一止血手段，修复后仍是对 CDN 侧抖动的防御。

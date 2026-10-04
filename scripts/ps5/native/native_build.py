@@ -474,7 +474,12 @@ def package(module: Path, root: Path, toolchain: Path, sdk: Path, out: Path,
 
     # HTTPS requests point at /app0/assets/ca-bundle.crt in an installed title.
     (dist / "assets").mkdir(parents=True, exist_ok=True)
-    ca_bundle = sdk / "target" / "user" / "homebrew" / "etc" / "ca-bundle.crt"
+    # 裁剪过的 bundle 优先：libcurl 每条新建连接都会重解析整个 CA 文件，而该调用在
+    # 标题运行时里并发时会被串行化（140 张 → 5 并发各 2.2 s；7 张 → ~0.2 s，见
+    # notes/06 §10.29）。裁剪只去掉用不到的根，SSL_VERIFY_PEER 保持不变；
+    # 重新生成用 scripts/ps5/native/make-ca-bundle.sh。
+    trimmed = Path(__file__).with_name("ca-bundle-trimmed.crt")
+    ca_bundle = trimmed if trimmed.is_file() else sdk / "target" / "user" / "homebrew" / "etc" / "ca-bundle.crt"
     if ca_bundle.is_file():
         shutil.copy2(ca_bundle, dist / "assets" / "ca-bundle.crt")
     else:
