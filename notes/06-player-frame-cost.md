@@ -1240,11 +1240,11 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
 ### 崩溃追查收尾：那个 XML error 8 是"坏挂载"的产物（2026-10-04）
 
 - 现象：首页开视频流程 3/3 崩（`view.cpp` 报 tinyxml2 `error 8` = PARSING_TEXT → SIGABRT），当时主机侧正处于"镜像挂载被卡死"的状态（SMP 日志 `image chain mount failed … status=5 EIO`）。
-- **恢复手段（可省一次重启）**：杀掉卡死的 ShadowMountPlus 再用 websrv 重新拉起它即可：
+- **恢复手段（可省一次重启，用 Payload Manager 管理）**：影子挂载由 pldmgr(8084) 负责拉起——先杀掉卡死的实例，再用它的运行接口重新加载（`/loadpayload:<绝对路径>`；路径从 `/list_payloads` 拿）：
   ```
-  curl "http://<host>:8084/process_kill?pid=<smp pid>"
-  curl --get --data-urlencode "path=/data/pldmgr/payloads/ShadowMountPlus/ShadowMountPlus_1.7beta2.elf" \
-       --data-urlencode "cwd=/data/pldmgr/payloads/ShadowMountPlus" "http://<host>:8080/hbldr"
+  SMP=$(curl -s "http://<host>:8084/processes_list" | python3 -c "import sys,json;print(next(p['pid'] for p in json.load(sys.stdin)['processes'] if 'shadowmount' in p['name'].lower()))")
+  curl "http://<host>:8084/process_kill?pid=$SMP"
+  curl "http://<host>:8084/loadpayload:/data/pldmgr/payloads/ShadowMountPlus/ShadowMountPlus_1.7beta2.elf"
   ```
   之后 SMP 日志恢复 `Mounting image … Mounted (ufs) … launch mount ready`，标题正常启动。
 - 挂载恢复后同一流程复测：**0 崩溃、0 解析失败**，`code=200`×38，`img-net: failed=0`，mpv 初始化成功（`SW render context ok -> mpv core usable`），截图确认视频+弹幕+评论面板、60 FPS。⇒ 该崩溃与资源外置/CA 裁剪无关，是坏挂载供出不一致数据导致的解析失败。
