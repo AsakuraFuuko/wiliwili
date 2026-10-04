@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <ucontext.h>
@@ -38,6 +39,9 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <curl/curl.h>
+#include <fcntl.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include <sys/time.h>
 #include <stdlib.h>
@@ -742,6 +746,62 @@ static long long wiliwili_probe_ms(void) {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+/* 单条裸握手（SNI + ALPN + 校验，对齐 curl 的 ClientHello）：返回 handshake ms。
+ * 由 `WILIWILI_CRYPTO_PROBE=1` 的常驻对照轮使用。 */
+static long long wiliwili_raw_handshake_ms(long long *dnsMs, long long *tcpMs) {
+    struct addrinfo hints;
+    struct addrinfo *res = 0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    long long t0      = wiliwili_probe_ms();
+    if (getaddrinfo("i0.hdslb.com", "443", &hints, &res) != 0 || res == 0) return -1;
+    *dnsMs = wiliwili_probe_ms() - t0;
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    struct timeval tv;
+    tv.tv_sec  = 8;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    long long t1 = wiliwili_probe_ms();
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd);
+        freeaddrinfo(res);
+        return -1;
+    }
+    *tcpMs = wiliwili_probe_ms() - t1;
+
+    long long hs = -1;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx != 0) {
+        SSL *ssl = SSL_new(ctx);
+        if (ssl != 0) {
+            SSL_set_fd(ssl, fd);
+            SSL_set_verify(ssl, 1 /* SSL_VERIFY_PEER */, 0);
+            SSL_ctrl(ssl, 55 /* SSL_CTRL_SET_TLSEXT_HOSTNAME */, 0 /* TLSEXT_NAMETYPE_host_name */,
+                     (void *)"i0.hdslb.com");
+            static const unsigned char alpn[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+            SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+            int one = 1;
+            setsockopt(fd, 6 /* IPPROTO_TCP */, 1 /* TCP_NODELAY */, &one, sizeof(one));
+            long long h0 = wiliwili_probe_ms();
+            int rc       = SSL_connect(ssl);
+            hs           = wiliwili_probe_ms() - h0;
+            if (rc != 1) hs = -hs;
+            SSL_free(ssl);
+        }
+        SSL_CTX_free(ctx);
+    }
+    close(fd);
+    freeaddrinfo(res);
+    return hs;
+}
+
 static void wiliwili_tls_probe(const char *host) {
     char line[192];
     struct addrinfo hints;
@@ -851,8 +911,9 @@ static void *wiliwili_par_probe_thread(void *arg) {
     return 0;
 }
 
-/* select 延迟对照：同一条 TCP 连接（:80）分别用
- * ① select 等待可读后 read  ② 直接阻塞 read，比较首字节耗时。 */
+/* 等待方式对照：同一条 TCP 连接（:80）分别用
+ * ① select 等待可读  ② poll 等待可读  ③ 直接阻塞 read，比较首字节耗时。
+ * curl 的连接/握手等待走 poll，所以 ② 是"只有 curl 慢"时的第一嫌疑。 */
 static void wiliwili_select_probe(void) {
     char line[192];
     struct addrinfo hints;
@@ -862,7 +923,7 @@ static void wiliwili_select_probe(void) {
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo("i0.hdslb.com", "80", &hints, &res) != 0 || res == 0) return;
 
-    for (int mode = 0; mode < 2; ++mode) {
+    for (int mode = 0; mode < 3; ++mode) {
         int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) continue;
         struct timeval tv;
@@ -878,7 +939,7 @@ static void wiliwili_select_probe(void) {
         ssize_t sent     = write(fd, req, sizeof(req) - 1);
         char buf[256];
         long long firstByte = -1;
-        const char *how     = mode == 0 ? "select" : "blocking";
+        const char *how     = mode == 0 ? "select" : (mode == 1 ? "poll" : "blocking");
         if (sent > 0) {
             if (mode == 0) {
                 fd_set rf;
@@ -890,11 +951,23 @@ static void wiliwili_select_probe(void) {
                 if (select(fd + 1, &rf, 0, 0, &wt) > 0) {
                     if (read(fd, buf, sizeof(buf)) > 0) firstByte = wiliwili_probe_ms() - t0;
                 }
+            } else if (mode == 1) {
+                struct pollfd pfd;
+                pfd.fd           = fd;
+                pfd.events       = 1 /* POLLIN */;
+                pfd.revents      = 0;
+                long long p0     = wiliwili_probe_ms();
+                int ready        = poll(&pfd, 1, 5000);
+                long long waitMs = wiliwili_probe_ms() - p0;
+                if (ready > 0 && read(fd, buf, sizeof(buf)) > 0) firstByte = wiliwili_probe_ms() - t0;
+                snprintf(line, sizeof(line), "pollprobe: fd=%d wait=%lldms rc=%d revents=%d", fd, waitMs, ready,
+                         (int)pfd.revents);
+                wiliwili_boot_log(line);
             } else {
                 if (read(fd, buf, sizeof(buf)) > 0) firstByte = wiliwili_probe_ms() - t0;
             }
         }
-        snprintf(line, sizeof(line), "select-probe: mode=%s first_byte=%lldms", how, firstByte);
+        snprintf(line, sizeof(line), "select-probe: mode=%s fd=%d first_byte=%lldms", how, fd, firstByte);
         wiliwili_boot_log(line);
         close(fd);
     }
@@ -910,6 +983,68 @@ static void wiliwili_tls_parallel_probe(void) {
     for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
 }
 
+/* curl 对照轮（`WILIWILI_CRYPTO_PROBE=1`）：与同一时刻的裸握手成对出现，
+ * 用来判断"慢"到底发生在 curl 里还是沙箱的网络栈里。payload 环境同代码实测
+ * 24–103 ms（见 notes/06 §10.29），所以这里只看趋势与成对差值。 */
+static size_t wiliwili_curl_probe_discard(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    (void)ptr;
+    (void)userdata;
+    return size * nmemb;
+}
+
+static void wiliwili_curl_probe_once(int round, int idx) {
+    CURL *handle = curl_easy_init();
+    if (handle == 0) {
+        wiliwili_boot_log("curlprobe: init failed");
+        return;
+    }
+    curl_easy_setopt(handle, CURLOPT_URL, "https://i0.hdslb.com/robots.txt");
+    curl_easy_setopt(handle, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(handle, CURLOPT_USERAGENT, "wiliwili-curl-probe");
+    curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, wiliwili_curl_probe_discard);
+    curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(handle, CURLOPT_CAINFO, "/app0/assets/ca-bundle.crt");
+    long long t0       = wiliwili_probe_ms();
+    int rc             = (int)curl_easy_perform(handle);
+    long long total_ms = wiliwili_probe_ms() - t0;
+    double tls = 0, first = 0;
+    long code = 0;
+    curl_easy_getinfo(handle, CURLINFO_APPCONNECT_TIME, &tls);
+    curl_easy_getinfo(handle, CURLINFO_STARTTRANSFER_TIME, &first);
+    curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &code);
+    char line[192];
+    snprintf(line, sizeof(line), "curlprobe: r=%d i=%d total=%lldms tls=%.0fms first=%.0fms code=%ld rc=%d", round, idx,
+             total_ms, tls * 1000, first * 1000, code, rc);
+    wiliwili_boot_log(line);
+    curl_easy_cleanup(handle);
+}
+
+/* 常驻诊断线程：每 5 s 一轮「裸握手 + 4 条 curl（各新建连接）」。只在
+ * WILIWILI_CRYPTO_PROBE=1 时启动；创建一次、循环复用，不逐轮新建线程
+ * （2026-10-04 实测：在 preinit 里逐轮新建线程会把启动卡住）。 */
+static void *wiliwili_curl_probe_thread(void *arg) {
+    (void)arg;
+    struct timespec pause;
+    pause.tv_sec  = 5;
+    pause.tv_nsec = 0;
+    for (int round = 0; round < 240; ++round) {
+        long long dns = 0, tcp = 0;
+        long long hs = wiliwili_raw_handshake_ms(&dns, &tcp);
+        char line[160];
+        snprintf(line, sizeof(line), "curlprobe: r=%d raw dns=%lld tcp=%lld hs=%lld", round, dns, tcp, hs);
+        wiliwili_boot_log(line);
+        for (int i = 0; i < 4; ++i) wiliwili_curl_probe_once(round, i);
+        nanosleep(&pause, 0);
+    }
+    return 0;
+}
+
+static void wiliwili_curl_probe_start(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, wiliwili_curl_probe_thread, 0) == 0) pthread_detach(thread);
+}
 static void wiliwili_crypto_probe(void) {
     char line[192];
     unsigned char buf[32];
@@ -945,6 +1080,7 @@ static void wiliwili_crypto_probe(void) {
     wiliwili_tls_probe("i0.hdslb.com");
     wiliwili_tls_parallel_probe();
     wiliwili_select_probe();
+    wiliwili_curl_probe_start();
 }
 
 static void wiliwili_early_marker(void) {

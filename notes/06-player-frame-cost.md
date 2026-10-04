@@ -1117,3 +1117,16 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 - 结论：标题内**所有裸层路径都正常**（6–57 ms），唯一能复现 1.4–2.8 s 的只有 "curl 传输" 本身（multi 与 blocking-easy 两种驱动都一样）。
 
 **新增日志维度（本批代码）**：`img-net: total=...`、`img-net: failed ...`、`http: slow ...` 现在都带 `host=` 与 `up=`（进程内 uptime ms），便于与 UDP 时间戳对齐。首份样本（2026-10-04 07:14，直播页加载）：4 条**同时**新建连接（`up≈43.1s`）到 `i0.hdslb.com`，各自 `tls=1722/1734/1736/1736 ms`、全 200；而同一次启动的首屏（`up=0–368 ms`）i0/i1/i2 请求只有 7–348 ms ⇒ 慢事件与"某次页面加载时刻的批量新连接"相关。
+
+**payload 环境 A/B（2026-10-04 07:4x–07:5x，`ps5_net_probe.cpp` 一次性探针，A/B 后已删除）**：
+
+- payload 线（同一主机 `i0.hdslb.com`、同一个 curl、CA 显式 `CURLOPT_CAINFO`）：裸握手（SNI+ALPN+校验）**8–9 ms**、4 并发裸握手 **8–15 ms**、curl 单条 **24–103 ms（tls 19–50 ms）**、curl×4 并发新建连接 **116–303 ms（tls 111–178 ms）**，全部 `code=200`。
+- native 标题线同代码：同一页面加载时刻 5 条并发新建连接各自 `tls≈2.15 s`。⇒ **"payload 不慢" 的前提成立**，差异在标题的运行环境侧。
+- 注意：payload 环境没有默认 CA 路径，探针里必须显式 `CURLOPT_CAINFO=/data/homebrew/wiliwili/ca-bundle.crt`（否则 curl `rc=77`、裸握手失败）。
+
+**native 标题侧对照补齐（2026-10-04 08:0x，同一次进程）**：
+
+- 裸握手 3 变体 7–11 ms；4 并发裸握手 32–64 ms；`select` 等待 6 ms；`poll` 等待 6 ms（`rc=1 revents=1`）；阻塞 `read` 7 ms。
+- **探针 curl（easy、新建连接、同一个 CA）61–203 ms**；关键对照：app 的 5 条并发图片请求 `tls=2155–2173 ms`（`up≈31 s`，全部同刻完成）**期间**，探针 curl 仍为 61 ms。
+- 慢样本的 socket fd = 71–81（快样本 44–59），fd 上限 13952 ⇒ `FD_SETSIZE`（1024）假设排除。
+- 结论：慢只出现在"**app 自身、多条并发新建连接的 curl 传输**"这一组合；单条 curl、裸并发握手、等待原语（select/poll/阻塞读）、fd 编号都不是原因。`img-net` 行现在带 `fd=` 便于继续观察。

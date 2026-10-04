@@ -299,6 +299,11 @@ private:
 
         double dns = 0, connected = 0, tls = 0, firstByte = 0;
         long newConnections = 0;
+        /* 传输实际用的 socket fd：标题的 fd 上限是 13952（远高于 FD_SETSIZE=1024），
+         * 如果慢样本的 fd 全在 1024 以上，就能解释"只有 curl 传输慢"（curl 的
+         * 多路复用等待走 select 时 fd>=FD_SETSIZE 是未定义行为）。 */
+        long lastSocket = -1;
+        curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, &lastSocket);
         curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &dns);
         curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connected);
         curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &tls);
@@ -310,10 +315,10 @@ private:
         std::snprintf(
             message, sizeof(message),
             "img-net: total=%lldms queue=%lldms dns=%lld tcp=%lld tls=%lld first=%lld newconn=%ld code=%ld bytes=%lld "
-            "host=%s up=%lldms",
+            "host=%s fd=%ld up=%lldms",
             totalMs, queueMs, (long long)(dns * 1000), (long long)((connected - dns) * 1000),
             (long long)((tls - connected) * 1000), (long long)(firstByte * 1000), newConnections, response.status_code,
-            (long long)response.downloaded_bytes, host.c_str(), imageUptimeMs());
+            (long long)response.downloaded_bytes, host.c_str(), lastSocket, imageUptimeMs());
         wiliwili_boot_log(message);
     }
 
