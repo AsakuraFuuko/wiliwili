@@ -1118,6 +1118,190 @@ static void wiliwili_dirent_probe(void) {
     }
 }
 
+/* 分配器争用探针（`WILIWILI_CRYPTO_PROBE=1`）：原生应用的 malloc 全走
+ * app_heap.c 的 __wrap_malloc → sceLibcMspaceMalloc（单个 128 MB mspace，且每次
+ * 分配/释放还会额外查 usable size）。2026-10-04 实测 CA 解析并发被放大约 40×，
+ * 这个探针用来判定"并发分配本身是否就是瓶颈"：单线程基线 vs 顺序 5 次 vs 并发 5 次。 */
+static void *wiliwili_alloc_churn_thread(void *arg) {
+    const long idx = (long)arg;
+    long long t0   = wiliwili_probe_ms();
+    for (int i = 0; i < 2000; ++i) {
+        void *block = malloc(96);
+        if (block != 0) {
+            memset(block, i & 0xff, 96);
+            free(block);
+        }
+    }
+    char line[160];
+    snprintf(line, sizeof(line), "alloc-probe: idx=%ld churn2000=%lldms", idx, wiliwili_probe_ms() - t0);
+    wiliwili_boot_log(line);
+    return 0;
+}
+
+static void wiliwili_alloc_probe(void) {
+    wiliwili_alloc_churn_thread(0);                                              /* 单线程基线 */
+    for (long i = 0; i < 5; ++i) wiliwili_alloc_churn_thread((void *)(100 + i)); /* 顺序 5 次 */
+    pthread_t threads[5];
+    int started = 0;
+    for (long i = 0; i < 5; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_alloc_churn_thread, (void *)(200 + i)) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
+/* 文件读争用探针（同 `WILIWILI_CRYPTO_PROBE=1`）：OpenSSL 加载 CA 时用 BIO 分块读
+ * 整个 bundle（185 KB / ~23 次 fread），如果沙箱的文件层在并发下串行化，就能解释
+ * "单条 11 ms、并发 2.2 s" 的放大。这里用 open/read 循环（8 KB 块）做同样的对照。 */
+static long long wiliwili_read_pass_ms(const char *path) {
+    long long t0 = wiliwili_probe_ms();
+    int fd       = open(path, 0 /* O_RDONLY */);
+    if (fd < 0) return -1;
+    static char buffer[8192];
+    long long total = 0;
+    for (;;) {
+        ssize_t got = read(fd, buffer, sizeof(buffer));
+        if (got <= 0) break;
+        total += got;
+    }
+    close(fd);
+    char line[160];
+    snprintf(line, sizeof(line), "read-probe: path=%s bytes=%lld ms=%lld", path, total, wiliwili_probe_ms() - t0);
+    wiliwili_boot_log(line);
+    return wiliwili_probe_ms() - t0;
+}
+
+static void *wiliwili_read_churn_thread(void *arg) {
+    wiliwili_read_pass_ms((const char *)arg);
+    return 0;
+}
+
+static void wiliwili_read_probe(void) {
+    const char *ca = "/app0/assets/ca-bundle.crt";
+    wiliwili_read_pass_ms(ca);                             /* 单条基线 */
+    for (int i = 0; i < 5; ++i) wiliwili_read_pass_ms(ca); /* 顺序 5 次 */
+    pthread_t threads[5];
+    int started = 0;
+    for (long i = 0; i < 5; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_read_churn_thread, (void *)ca) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
+/* CA 加载的 CPU/墙钟对照（同 `WILIWILI_CRYPTO_PROBE=1`）：并发时若 CPU 远小于墙钟，
+ * 说明是在等锁/等 I/O；若 CPU ≈ 墙钟，说明是计算本身变慢（缓存/SMT 争用）。 */
+static void wiliwili_ca_load_probe_once(int idx) {
+    struct timespec wall0, wall1, cpu0, cpu1;
+    clock_gettime(CLOCK_MONOTONIC, &wall0);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    int rc       = -1;
+    if (ctx != 0) {
+        rc = SSL_CTX_load_verify_locations(ctx, "/app0/assets/ca-bundle.crt", 0);
+        SSL_CTX_free(ctx);
+    }
+
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+    clock_gettime(CLOCK_MONOTONIC, &wall1);
+    long long wall_ms = (wall1.tv_sec - wall0.tv_sec) * 1000 + (wall1.tv_nsec - wall0.tv_nsec) / 1000000;
+    long long cpu_ms  = (cpu1.tv_sec - cpu0.tv_sec) * 1000 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000000;
+    char line[192];
+    snprintf(line, sizeof(line), "ca-probe: idx=%d wall=%lldms cpu=%lldms rc=%d", idx, wall_ms, cpu_ms, rc);
+    wiliwili_boot_log(line);
+}
+
+static void *wiliwili_ca_load_thread(void *arg) {
+    wiliwili_ca_load_probe_once((int)(long)arg);
+    return 0;
+}
+
+static void wiliwili_ca_load_probe(void) {
+    wiliwili_ca_load_probe_once(0);                                           /* 单条基线 */
+    for (long i = 0; i < 5; ++i) wiliwili_ca_load_probe_once((int)(100 + i)); /* 顺序 5 次 */
+    pthread_t threads[5];
+    int started = 0;
+    for (long i = 0; i < 5; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_ca_load_thread, (void *)(200 + i)) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
+/* stdio 读争用探针：OpenSSL 用 BIO→fopen/fread 读 CA；如果固件 libc 的 stdio 有全局
+ * 锁（FILE 表锁），并发加载就会在这里排队——这正是裸 open/read 探针看不到的那一层。 */
+static long long wiliwili_stdio_read_pass_ms(const char *path) {
+    struct timespec wall0, wall1, cpu0, cpu1;
+    clock_gettime(CLOCK_MONOTONIC, &wall0);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
+    long long bytes = 0;
+    FILE *file      = fopen(path, "rb");
+    if (file != 0) {
+        static char buffer[8192];
+        for (;;) {
+            size_t got = fread(buffer, 1, sizeof(buffer), file);
+            if (got == 0) break;
+            bytes += (long long)got;
+        }
+        fclose(file);
+    }
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+    clock_gettime(CLOCK_MONOTONIC, &wall1);
+    long long wall_ms = (wall1.tv_sec - wall0.tv_sec) * 1000 + (wall1.tv_nsec - wall0.tv_nsec) / 1000000;
+    long long cpu_ms  = (cpu1.tv_sec - cpu0.tv_sec) * 1000 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000000;
+    char line[192];
+    snprintf(line, sizeof(line), "stdio-probe: path=%s bytes=%lld wall=%lldms cpu=%lldms", path, bytes, wall_ms,
+             cpu_ms);
+    wiliwili_boot_log(line);
+    return wall_ms;
+}
+
+static void *wiliwili_stdio_thread(void *arg) {
+    wiliwili_stdio_read_pass_ms((const char *)arg);
+    return 0;
+}
+
+static void wiliwili_stdio_probe(void) {
+    const char *path = "/app0/assets/ca-bundle.crt";
+    wiliwili_stdio_read_pass_ms(path);
+    for (int i = 0; i < 5; ++i) wiliwili_stdio_read_pass_ms(path);
+    pthread_t threads[5];
+    int started = 0;
+    for (long i = 0; i < 5; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_stdio_thread, (void *)path) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
+/* 互斥锁争用探针（同 `WILIWILI_CRYPTO_PROBE=1`）：标题里 pthread_mutex 在争用下的
+ * 代价决定了 OpenSSL 内部锁被放大多少。单线程 vs 顺序 vs 并发 5 线程对照。 */
+static pthread_mutex_t wiliwili_lock_probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void *wiliwili_lock_churn_thread(void *arg) {
+    const long idx        = (long)arg;
+    const long iterations = 20000;
+    long long t0          = wiliwili_probe_ms();
+    for (long i = 0; i < iterations; ++i) {
+        pthread_mutex_lock(&wiliwili_lock_probe_mutex);
+        pthread_mutex_unlock(&wiliwili_lock_probe_mutex);
+    }
+    const long long ms = wiliwili_probe_ms() - t0;
+    char line[192];
+    snprintf(line, sizeof(line), "lock-probe: idx=%ld ops=%ld ms=%lld (%.2fus/op)", idx, iterations, ms,
+             ms * 1000.0 / (double)iterations);
+    wiliwili_boot_log(line);
+    return 0;
+}
+
+static void wiliwili_lock_probe(void) {
+    wiliwili_lock_churn_thread(0);
+    for (long i = 0; i < 5; ++i) wiliwili_lock_churn_thread((void *)(100 + i));
+    pthread_t threads[5];
+    int started = 0;
+    for (long i = 0; i < 5; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_lock_churn_thread, (void *)(200 + i)) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
 static void wiliwili_crypto_probe(void) {
     char line[192];
     unsigned char buf[32];
@@ -1178,6 +1362,11 @@ static void wiliwili_crypto_probe(void) {
     wiliwili_tls_parallel_probe();
     wiliwili_dirent_probe();
     wiliwili_select_probe();
+    wiliwili_alloc_probe();
+    wiliwili_read_probe();
+    wiliwili_ca_load_probe();
+    wiliwili_stdio_probe();
+    wiliwili_lock_probe();
     wiliwili_curl_probe_start();
     /* CA 探针（caprobe/capar/casubset）在 2026-10-04 根因收敛后已删除：
      * 每连接重解析 CA 文件、并发被串行化；修复＝裁剪 bundle（notes/06 §10.29）。 */
@@ -1196,6 +1385,31 @@ static void wiliwili_resources_marker(void) {
     char line[192];
     snprintf(line, sizeof(line), "res: overlay=%s entries=%d romfs=%s", root, count,
              wiliwili_romfs_state != 0 ? wiliwili_romfs_state : "embedded");
+    wiliwili_boot_log(line);
+
+    /* 完整性自检：内嵌 romfs 回退已移除（空表构建），缺文件会直接抛
+     * "Invalid romfs resource path" 并且很难一眼看出是打包问题——启动时先按名字打开
+     * 一小组"没有就必然起不来"的资源，缺哪个就明确报出来。 */
+    static const char *critical[] = {
+        "xml/activity/main.xml",    "xml/activity/player_activity.xml",   "xml/activity/live_player_activity.xml",
+        "xml/views/video_card.xml", "i18n/zh-Hans/wiliwili.json",         "i18n/en-US/wiliwili.json",
+        "font/switch_font.ttf",     "material/MaterialIcons-Regular.ttf", "ca-bundle.crt",
+    };
+    int missing = 0;
+    for (size_t i = 0; i < sizeof(critical) / sizeof(critical[0]); ++i) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", root, critical[i]);
+        int fd = open(path, 0 /* O_RDONLY */);
+        if (fd < 0) {
+            ++missing;
+            snprintf(line, sizeof(line), "res-check: MISSING %s (open errno=%d)", critical[i], errno);
+        } else {
+            close(fd);
+            continue;
+        }
+        wiliwili_boot_log(line);
+    }
+    snprintf(line, sizeof(line), "res-check: critical=%zu missing=%d", sizeof(critical) / sizeof(critical[0]), missing);
     wiliwili_boot_log(line);
 }
 

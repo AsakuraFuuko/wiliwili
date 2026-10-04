@@ -1254,3 +1254,22 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
 
 - **3.3 小时 soak**（含 80 次播放结束）：0 崩溃 / 0 `xml-parse-fail` / 0 `img-net: failed` / 0 健康异常（全部三零）；`direct_mem` 分段稳定（空闲平台期 81 分钟恒 29.53 MB，播放期 82–87 MB 区间波动，末 10 样本恒 87.49 MB）⇒ 无泄漏迹象。
 - **弱网降级**（PC 侧代理注入延迟/丢包，方法见 handoff）：30 ms/10 ms 延迟时 48 请求 0 失败、队列峰值 750 ms；150 ms/50 ms + 3% 丢包时 92 请求 1 失败（重试成功）、最慢传输 987 ms、队列峰值 2424 ms、17 次 ≤2.25 s 的握手内阻塞、0 崩溃，UI 封面全出 FPS 60。⇒ 队列缓解与重置策略在弱网下不雪崩。
+
+### CA 并发串行化根因（2026-10-04，探针闭环）
+
+链条：**libcurl 每条新连接都会新建 SSL_CTX 并重新构建 X509 store** → OpenSSL 内部有大量锁操作（by_file 缓存/store 操作）→ 而**标题沙箱里的争用互斥锁极贵**，于是并发被放大。
+
+实测数据（`WILIWILI_CRYPTO_PROBE=1`，`ca-probe`/`alloc-probe`/`read-probe`/`stdio-probe`/`lock-probe`）：
+| 探针 | 单条 | 顺序 5 | **并发 5** |
+|---|---|---|---|
+| `SSL_CTX_load_verify_locations`（7 张裁剪 bundle） | wall 1 ms / cpu 1 ms | 0 ms | **wall 138–141 ms / cpu 31–32 ms**（wall≫cpu ⇒ 在等锁） |
+| malloc(96)+free ×2000 | 0 ms | 0 ms | 0 ms（分配器不是瓶颈） |
+| 裸 `open/read` 10 KB | 0 ms | 0 ms | 0 ms（文件层不是瓶颈） |
+| stdio `fopen/fread` 10 KB | 0 ms | 0 ms | 0 ms（stdio 层不是瓶颈） |
+| **无争用互斥锁 ×20000** | **0.00–0.05 µs/op** | — | **14–17 µs/op**（300× 变慢） |
+
+⇒ 根因是"**每连接重建 CA store × 沙箱里昂贵的争用锁**"。可行的缓解都试过：裁剪 bundle（140→7 张，握手 2.2 s → 0.24 s ✓ 已落地）；`CURL_LOCK_DATA_CA_CACHE` 共享已解析 CA 的路线**不可用**（SDK 的 curl 8.18 枚举里没有该项）；因此维持裁剪方案。整条探针链保留在 `native_shims.c` 的 `WILIWILI_CRYPTO_PROBE` 块里，便于以后复查。
+
+### 资源完整性自检（常开，2026-10-04）
+
+`res-check: critical=9 missing=N` + 缺哪个就逐条 `res-check: MISSING <name> (open errno=E)`。检查清单：`xml/activity/{main,player_activity,live_player_activity}.xml`、`xml/views/video_card.xml`、`i18n/{zh-Hans,en-US}/wiliwili.json`、`font/switch_font.ttf`、`material/MaterialIcons-Regular.ttf`、`ca-bundle.crt`。负路径已验证（移走 `player_activity.xml` → `MISSING … errno=2`，恢复后 `missing=0`）。存在意义：内嵌 romfs 回退已移除，缺资源会直接抛 `Invalid romfs resource path`，这条自检让"打包漏文件"一眼可见。
