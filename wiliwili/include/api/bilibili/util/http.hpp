@@ -112,6 +112,10 @@ public:
         curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, HTTP::DNS_CACHE_TIMEOUT);
 #ifdef PS5
         curl_easy_setopt(curl, CURLOPT_CAINFO, HTTP::CA_BUNDLE);
+#if defined(PS5_NATIVE_APP)
+        /* 同 image_helper：缓存解析好的 CA store，避免每次传输重建（标题里很贵）。 */
+        curl_easy_setopt(curl, CURLOPT_CA_CACHE_TIMEOUT, 3600L);
+#endif
 #endif
         session->SetTimeout(cpr::Timeout{bilibili::HTTP::TIMEOUT});
         session->SetConnectTimeout(cpr::ConnectTimeout{bilibili::HTTP::CONNECTION_TIMEOUT});

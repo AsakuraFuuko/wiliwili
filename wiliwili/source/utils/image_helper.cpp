@@ -296,6 +296,14 @@ private:
         curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, bilibili::HTTP::DNS_CACHE_TIMEOUT);
 #ifdef PS5
         curl_easy_setopt(curl, CURLOPT_CAINFO, bilibili::HTTP::CA_BUNDLE);
+#if defined(PS5_NATIVE_APP)
+        /* CA store 的构建是重活（解析 PEM + 建 X509_STORE，OpenSSL 内部锁很多，
+         * 而标题沙箱里争用锁 14-17us/次，见 notes/06 §10.29）。curl 默认
+         * ca_cache_timeout=0 等于**每条新连接重建一次**；开了之后解析好的 store 挂在
+         * 本 worker 的 multi handle 上（multi->proto_hash + X509_STORE_up_ref），
+         * 该 multi 下所有 easy handle 共用。*/
+        curl_easy_setopt(curl, CURLOPT_CA_CACHE_TIMEOUT, 3600L);
+#endif
 #endif
         session->SetTimeout(cpr::Timeout{bilibili::HTTP::TIMEOUT});
 #if defined(PS5_NATIVE_APP)

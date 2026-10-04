@@ -1273,3 +1273,17 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
 ### 资源完整性自检（常开，2026-10-04）
 
 `res-check: critical=9 missing=N` + 缺哪个就逐条 `res-check: MISSING <name> (open errno=E)`。检查清单：`xml/activity/{main,player_activity,live_player_activity}.xml`、`xml/views/video_card.xml`、`i18n/{zh-Hans,en-US}/wiliwili.json`、`font/switch_font.ttf`、`material/MaterialIcons-Regular.ttf`、`ca-bundle.crt`。负路径已验证（移走 `player_activity.xml` → `MISSING … errno=2`，恢复后 `missing=0`）。存在意义：内嵌 romfs 回退已移除，缺资源会直接抛 `Invalid romfs resource path`，这条自检让"打包漏文件"一眼可见。
+
+### 真正的解法：`CURLOPT_CA_CACHE_TIMEOUT`（2026-10-04，已落地）
+
+根因给出的正解不是继续裁 bundle，而是**别每条连接都重建 CA store**：
+- curl 8.18 的 OpenSSL 后端里，`CURLOPT_CA_CACHE_TIMEOUT`（默认 **0 = 关闭**）控制"解析好的 X509_STORE 缓存"：`cache_criteria_met = ca_cache_timeout != 0 && verifypeer && !CApath && !ca_info_blob && …`（**`CAfile` 不影响缓存资格**），缓存挂在 **`data->multi` 的 `proto_hash`** 上，命中时只做 `X509_STORE_up_ref`（原子操作）⇒ **同一 multi 下的所有 easy handle 共用一个已解析的 store**（`lib/vtls/openssl.c:3179-3345`）。
+- 我们的图片 runner 是"每 worker 一个 multi + 每请求一个 easy handle" ⇒ 每个 worker 只解析一次，而不是每条连接一次。API 路径（cpr 的 easy 接口，每个 handle 一个内部 multi）至少也能在重连间复用。
+
+实测（同驱动，7 张裁剪 bundle）：
+| | 打开前 | 打开后 |
+|---|---|---|
+| 新建连接 `tls` | 每条 ~238 ms | **每 worker 第一条 ~231 ms，其余 ≈0 ms**（14 条新连接只有 3 条付费） |
+| 传输 `total` | p50 200 ms+ | **p50 139 ms**，0 失败 |
+
+落地：`image_helper.cpp:305` 与 `http.hpp:117` 各加一行 `curl_easy_setopt(curl, CURLOPT_CA_CACHE_TIMEOUT, 3600L)`（仅 `PS5_NATIVE_APP`）。结论：**无需更换 curl 版本**；bundle 仍保留裁剪版（全量 140 张的首次解析在多个 worker 同时首连时仍会触发一次秒级等待，覆盖已够用）。
