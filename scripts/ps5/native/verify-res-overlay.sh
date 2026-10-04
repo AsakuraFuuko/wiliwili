@@ -137,18 +137,19 @@ for d in "${res_dirs[@]}"; do
 done
 [[ $missing == 0 ]] || die "产物缺少资源目录（overlay 未生效）"
 
-# 只统计资源目录内的松散文件，忽略 ca-bundle.crt / wiliwili-options.txt 等根文件，
-# 这样两边口径一致，比较才有意义。
+# 全套递归对比：dist 里必须**不缺** resources/ 的任何文件。dist 额外允许
+# ca-bundle.crt（裁剪 CA）与 wiliwili-options.txt（test-cycle 写入的探针开关）。
 res_count=$(find "$res_dir" -type f | wc -l)
-out_count=0
-for d in "${res_dirs[@]}"; do
-    n=$(find "$dist_assets/$d" -type f | wc -l)
-    out_count=$((out_count + n))
-done
-echo "    松散文件计数：resources/=$res_count  dist/assets/=$out_count"
-if [[ "$res_count" != "$out_count" ]]; then
-    echo "    警告：两边文件数不一致（dist 少 $((res_count - out_count)) 个）。"
-    echo "          可能构建脚本过滤了部分资源；请人工确认是否影响 i18n/xml/font 等。"
+mapfile -t missing_files < <(
+    while IFS= read -r rel; do
+        [[ -f "$dist_assets/$rel" ]] || printf '%s\n' "$rel"
+    done < <(cd "$res_dir" && find . -type f | sed 's|^\./||')
+)
+out_count=$(find "$dist_assets" -type f | wc -l)
+echo "    松散文件计数：resources/=$res_count  dist/assets/=$out_count（后者含 CA 与 options）"
+if ((${#missing_files[@]} > 0)); then
+    echo "    警告：dist 缺少 ${#missing_files[@]} 个资源文件（前 10 个）："
+    printf '          %s\n' "${missing_files[@]:0:10}"
 fi
 
 # ---------- 3) 部署并抓日志 ----------
@@ -186,8 +187,10 @@ fail=0
 if grep -q 'res-dir:' "$applog"; then
     echo "    [OK] 出现 res-dir:"
     grep 'res-dir:' "$applog" | sed 's/^/        /'
-    res_count_field=$(grep -m1 -oE 'count=[0-9]+' "$applog" || true)
-    res_first_field=$(grep -m1 -oE 'first=[^ ]+' "$applog" || true)
+    # 只在 res-dir: 行内取值——日志里 img-net: 行也有 first=，混着取会读错。
+    res_line=$(grep -m1 'res-dir:' "$applog" || true)
+    res_count_field=$(printf '%s\n' "$res_line" | grep -oE 'count=[0-9]+' || true)
+    res_first_field=$(printf '%s\n' "$res_line" | grep -oE 'first=[^ ]+' || true)
     echo "        -> ${res_count_field:-count=<未找到>}  ${res_first_field:-first=<未找到>}"
 else
     echo "    [FAIL] 未出现 res-dir:（目录遍历未实现、未触发，或日志被截断）" >&2
@@ -221,11 +224,11 @@ if [[ $SKIP_BUILD == 1 ]]; then
 else
     echo "  构建:       本次已执行"
 fi
-echo "  松散文件:   resources=$res_count  dist=$out_count"
-if [[ "$res_count" == "$out_count" ]]; then
-    echo "  计数一致:   是"
+echo "  松散文件:   resources=$res_count  dist=$out_count（dist 含 CA 与 options）"
+if ((${#missing_files[@]} == 0)); then
+    echo "  资源齐全:   是（dist 覆盖 resources 全部文件）"
 else
-    echo "  计数一致:   否（见上方告警）"
+    echo "  资源齐全:   否（缺 ${#missing_files[@]} 个，见上方告警）"
 fi
 if [[ $fail == 0 ]]; then
     echo "  判定:       PASS"
