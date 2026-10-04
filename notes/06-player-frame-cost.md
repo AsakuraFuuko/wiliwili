@@ -1228,3 +1228,5 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
 - **回退开关**：构建时 `PS5_NATIVE_ROMFS_EMBED=1` 恢复内嵌回退（跳过空表 TU 与跳过规则）。
 - 真机验收（构建 `Oct 4 2026 11:29:35`）：验证脚本 PASS；UI 完整（中文标签无豆腐块、卡片封面/文字、侧栏图标齐全）。
 - 镜像体积：dist ≈66 MB（eboot 53.3 + assets 13.1）。装到主机的 `.ffpkg` 默认 `newfs -D` 约 **75 MB**（313 个小文件在 64 KB 块上有开销；改动前约 66 MB）。实测 `-b 8192 -f 1024 -g 16384 -h 64` 可到 **70 MB**，但属非默认 fs 参数、有挂载兼容风险，未采用；如要压体积再评估。
+
+**镜像体积调参（真机验证 2026-10-04）**：`install-ffpkg.sh` 现在默认用 `newfs -b 8192 -f 1024 -g 16384 -h 64`（原为工具默认值）。理由：资源以 313 个松散文件发布后，64 KB 块上的开销明显。实测逻辑大小 **91 MiB → 83 MiB**；真机（固件 12.00）挂载正常、标题正常启动、资源全部可读（`res: overlay=/app0/assets entries=8 romfs=empty`、`code=200`×27、UI 截图中文/图标无缺字）。回退：`PS5_FFPKG_NEWFS_ARGS=" "` 或用别的参数覆盖。（更激进的 `-b 4096 -f 512 -i 4096` 实测 82.4 MiB，收益仅 0.6 MiB，未采用。）

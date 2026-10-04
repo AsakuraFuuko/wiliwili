@@ -37,10 +37,18 @@ if [[ ! -d $dist ]]; then
     exit 1
 fi
 
-echo "==> building $image from $dist"
+# 资源以松散文件随包发布后，镜像里是 313 个小文件，64 KB 块上的开销可观。
+# 可用 PS5_FFPKG_NEWFS_ARGS 覆盖块参数（例：-b 8192 -f 1024 -g 16384 -h 64，
+# 实测 75 MB → 70 MB）；默认保持工具默认值，避免非默认 fs 参数带来挂载风险。
+# 2026-10-04 真机实测（主机 + 固件 12.00）：这组参数能正常挂载、标题正常启动且
+# 资源全部可读（res: overlay=/app0/assets entries=8 romfs=empty、code=200、UI 完整），
+# 镜像 91 MiB → 83 MiB。要回默认值：PS5_FFPKG_NEWFS_ARGS=" "（或自行覆盖参数）。
+newfs_args=${PS5_FFPKG_NEWFS_ARGS:--b 8192 -f 1024 -g 16384 -h 64}
+echo "==> building $image from $dist ${newfs_args:+(newfs $newfs_args)}"
 rm -f "$image"
+# shellcheck disable=SC2086  # 有意按空白拆分参数
 DOTNET_ROOT=${DOTNET_ROOT:-/opt/dotnet} PATH=/opt/dotnet:$PATH \
-    "$ufs2tool" newfs -D "$dist" "$image" wiliwili >/dev/null
+    "$ufs2tool" newfs -D "$dist" $newfs_args "$image" wiliwili >/dev/null
 ls -la "$image" | awk '{ printf "    image: %.1f MB\n", $5 / 1048576 }'
 
 echo "==> uploading to $remote_dir/$title_id.ffpkg"
