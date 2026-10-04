@@ -1236,3 +1236,16 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
 - `newfs -b 8192 -f 1024 -g 16384 -h 64`（为省体积）生成的 `.ffpkg` **在主机上挂载失败**：ShadowMountPlus 日志 `image chain mount failed: title=… layer=0 … status=5 (Input/output error)`，系统弹 `CE-105773-3 无法开始此游戏或应用程序`。工具默认参数（block 32768 / frag 4096）正常。
 - 更坑的是：失败挂载之后，**换回默认参数的镜像也一直 EIO**——删文件重传、校验 md5（与本地逐字节一致）、`df`（/data 551G 空闲）、清 SMP 索引（`image_index.bin`/`manual.*`）都无效 ⇒ 挂载状态被卡在内核/SMP 侧，**需要重启主机**才能恢复。`install-ffpkg.sh` 因此把覆盖口保留但默认留空，并在注释里写明这条结论。
 - 长测同时抓到一个真 bug：首页第一个卡片（视频流程）必崩，`view.cpp` 的 `View::createFromXMLString` 报 tinyxml2 `error 8`（XML_ERROR_PARSING_TEXT）后 SIGABRT，复现 3/3；崩溃寄存器现场已抓（`crash: 6 c=0 addr=0x8000ba422 rip=0x200837b80`）。定位用的诊断（borealis 里打印"哪个 XML、多少字节、内容头 160 字符"）**已 stash 在 `library/borealis` 子模块**（`git -C library/borealis stash list`），等主机恢复后重打一次即可拿到现场。
+
+### 崩溃追查收尾：那个 XML error 8 是"坏挂载"的产物（2026-10-04）
+
+- 现象：首页开视频流程 3/3 崩（`view.cpp` 报 tinyxml2 `error 8` = PARSING_TEXT → SIGABRT），当时主机侧正处于"镜像挂载被卡死"的状态（SMP 日志 `image chain mount failed … status=5 EIO`）。
+- **恢复手段（可省一次重启）**：杀掉卡死的 ShadowMountPlus 再用 websrv 重新拉起它即可：
+  ```
+  curl "http://<host>:8084/process_kill?pid=<smp pid>"
+  curl --get --data-urlencode "path=/data/pldmgr/payloads/ShadowMountPlus/ShadowMountPlus_1.7beta2.elf" \
+       --data-urlencode "cwd=/data/pldmgr/payloads/ShadowMountPlus" "http://<host>:8080/hbldr"
+  ```
+  之后 SMP 日志恢复 `Mounting image … Mounted (ufs) … launch mount ready`，标题正常启动。
+- 挂载恢复后同一流程复测：**0 崩溃、0 解析失败**，`code=200`×38，`img-net: failed=0`，mpv 初始化成功（`SW render context ok -> mpv core usable`），截图确认视频+弹幕+评论面板、60 FPS。⇒ 该崩溃与资源外置/CA 裁剪无关，是坏挂载供出不一致数据导致的解析失败。
+- 留下的诊断（borealis）：`xml-parse-fail: name=… err=… line=…`（**总是**输出，真问题时有用）；`xml-load:`/`xml-parse:` 快照只在 `WILIWILI_XML_TRACE=1` 时输出。
