@@ -1249,3 +1249,8 @@ env -u ... PS5_NATIVE_AGC=1 ... bash scripts/ps5/native/build-native.sh   # 重�
   之后 SMP 日志恢复 `Mounting image … Mounted (ufs) … launch mount ready`，标题正常启动。
 - 挂载恢复后同一流程复测：**0 崩溃、0 解析失败**，`code=200`×38，`img-net: failed=0`，mpv 初始化成功（`SW render context ok -> mpv core usable`），截图确认视频+弹幕+评论面板、60 FPS。⇒ 该崩溃与资源外置/CA 裁剪无关，是坏挂载供出不一致数据导致的解析失败。
 - 留下的诊断（borealis）：`xml-parse-fail: name=… err=… line=…`（**总是**输出，真问题时有用）；`xml-load:`/`xml-parse:` 快照只在 `WILIWILI_XML_TRACE=1` 时输出。
+
+### 弱网降级与长时 soak（2026-10-04）
+
+- **3.3 小时 soak**（含 80 次播放结束）：0 崩溃 / 0 `xml-parse-fail` / 0 `img-net: failed` / 0 健康异常（全部三零）；`direct_mem` 分段稳定（空闲平台期 81 分钟恒 29.53 MB，播放期 82–87 MB 区间波动，末 10 样本恒 87.49 MB）⇒ 无泄漏迹象。
+- **弱网降级**（PC 侧代理注入延迟/丢包，方法见 handoff）：30 ms/10 ms 延迟时 48 请求 0 失败、队列峰值 750 ms；150 ms/50 ms + 3% 丢包时 92 请求 1 失败（重试成功）、最慢传输 987 ms、队列峰值 2424 ms、17 次 ≤2.25 s 的握手内阻塞、0 崩溃，UI 封面全出 FPS 60。⇒ 队列缓解与重置策略在弱网下不雪崩。
