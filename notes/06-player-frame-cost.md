@@ -1130,3 +1130,5 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 - **探针 curl（easy、新建连接、同一个 CA）61–203 ms**；关键对照：app 的 5 条并发图片请求 `tls=2155–2173 ms`（`up≈31 s`，全部同刻完成）**期间**，探针 curl 仍为 61 ms。
 - 慢样本的 socket fd = 71–81（快样本 44–59），fd 上限 13952 ⇒ `FD_SETSIZE`（1024）假设排除。
 - 结论：慢只出现在"**app 自身、多条并发新建连接的 curl 传输**"这一组合；单条 curl、裸并发握手、等待原语（select/poll/阻塞读）、fd 编号都不是原因。`img-net` 行现在带 `fd=` 便于继续观察。
+
+**单变量 A/B：HTTP/1.1（2026-10-04 08:14）**：图片 runner 强制 `CURLOPT_HTTP_VERSION = CURL_HTTP_VERSION_1_1` 后，同页面驱动仍出现 4 条 `tls=1592–1631 ms`（`i0.hdslb.com`、`newconn=1`、同刻完成），与基线 2155–2173 ms 同形态 ⇒ **h2 不是原因**（实验已回滚）。
