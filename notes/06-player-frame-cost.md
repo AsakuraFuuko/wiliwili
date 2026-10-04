@@ -1132,3 +1132,39 @@ frame=22200, ring_fail=0, tex_fail=0, timeouts=0, direct_mem=13,831,424/134,217,
 - 结论：慢只出现在"**app 自身、多条并发新建连接的 curl 传输**"这一组合；单条 curl、裸并发握手、等待原语（select/poll/阻塞读）、fd 编号都不是原因。`img-net` 行现在带 `fd=` 便于继续观察。
 
 **单变量 A/B：HTTP/1.1（2026-10-04 08:14）**：图片 runner 强制 `CURLOPT_HTTP_VERSION = CURL_HTTP_VERSION_1_1` 后，同页面驱动仍出现 4 条 `tls=1592–1631 ms`（`i0.hdslb.com`、`newconn=1`、同刻完成），与基线 2155–2173 ms 同形态 ⇒ **h2 不是原因**（实验已回滚）。
+
+### 网络慢握手根因（2026-10-04 08:2x–08:4x）
+
+**轨迹证据**（`WILIWILI_IMG_TRACE` 式逐事件时间戳，单条慢传输 1801 ms）：
+
+```
++2ms    DNS 已解析 → Trying connect
++21ms   ssl-out 1555B（ClientHello 已发出）
++28ms   SSL Trust Anchors:            ← curl/OpenSSL 开始建信任库
++1727ms   CAfile: /app0/assets/ca-bundle.crt   ← 1.7 s 全花在这里
++1727ms ssl-in → Server hello
++1788ms SSL certificate verified via OpenSSL / Established connection
+```
+
+**离线对照（`caprobe`，同一进程）**：
+
+| 场景 | `SSL_CTX_load_verify_locations(188905 B ≈ 140 张 CA)` |
+|---|---|
+| 单条 | 11–12 ms |
+| 顺序 5 次 | 13 / 21 / 13 / 47 / 163 ms |
+| **并发 5 次** | **2242–2263 ms**（全部同刻完成） |
+| 同一文件的纯 `read` | 0–1 ms（188905 B 全部读出） |
+
+⇒ **根因**：每建一条新 TLS 连接，libcurl 都会为这个 easy 句柄新建 SSL_CTX 并重新解析整个 CA bundle；该调用在标题运行时里被进程内共享资源串行化（顺序 55 ms → 并发 5 路 2.2 s，且同刻完成）。页面加载时一次开 5–6 条新连接，于是每条都 ~2 s，表现为"图片/接口间歇 1.5–2.8 s"；单条探针 curl（无并发）与 payload 环境（并发解析不慢）都不复现。与 h2、fd、select/poll、SNI/ALPN、网络、CDN 均无关（见上）。
+
+**修复方向**：① 裁剪 CA bundle 到 B 站实际使用的 CA（保持 `SSL_VERIFY_PEER`，只是少解析无用证书）；② 或让 CA 解析只发生一次（共享 SSL_CTX/预解析，curl 无原生支持，需要在 curl 层定制）。先测 ①：5 张 / 40 张证书的并发解析耗时对比（`casubset` 探针）。
+
+**并发代价随 bundle 大小缩放（`capar` 探针，5 路并发）**：
+
+| bundle | 大小 | 证书数 | 单条 | 5 并发（各自） |
+|---|---|---|---|---|
+| `/app0/assets/ca-bundle.crt` | 188905 B | ~140 | 11 ms | **2214–2223 ms** |
+| `probe-ca-40.crt` | 64053 B | 40 | 3 ms | 674–680 ms |
+| `probe-ca-5.crt` | 7211 B | 5 | 1 ms | **111–113 ms** |
+
+⇒ 并发代价与证书数量近似线性；把 bundle 裁到 ~5–10 张（B 站实际用到的 GlobalSign 等）可把每连接开销从 ~2.2 s 降到 ~0.1–0.2 s，`SSL_VERIFY_PEER` 保持不变。另一个方向是找到并消除这个进程内串行化（顺序 5 次只要 55 ms，说明不是 CPU 而是锁/等待；嫌疑：curl 用的 stdio/allocator 在 clean-room 运行时里的全局锁）。

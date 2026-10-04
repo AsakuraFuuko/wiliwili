@@ -168,6 +168,35 @@ static void logImageStall(const char* operation, std::chrono::steady_clock::time
                   static_cast<long long>(elapsed.count()), running, active);
     wiliwili_boot_log(message);
 }
+/* 慢传输跟踪（诊断）：把 curl 的 VERBOSE 事件按"相对开始时刻"记下来，只在传输
+ * 结果很慢（≥1 s）时 dump。curl 的 TEXT 事件覆盖连接/TLS 阶段，SSL_DATA_IN/OUT
+ * 给出加密层收发时刻，用它能定位 2 s 级卡顿到底停在握手哪一步。 */
+struct TransferTrace {
+    std::chrono::steady_clock::time_point start;
+    std::string lines;
+    int count = 0;
+};
+
+static int imageDebugCallback(CURL*, curl_infotype type, char* data, size_t size, void* userptr) {
+    auto* trace = static_cast<TransferTrace*>(userptr);
+    if (trace == nullptr || trace->count >= 160 || trace->lines.size() > 7000) return 0;
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - trace->start).count();
+    if (type == CURLINFO_TEXT) {
+        std::string text(data, size);
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+        trace->lines += "+" + std::to_string(ms) + "ms " + text + "\n";
+    } else if (type == CURLINFO_SSL_DATA_IN) {
+        trace->lines += "+" + std::to_string(ms) + "ms ssl-in " + std::to_string(size) + "B\n";
+    } else if (type == CURLINFO_SSL_DATA_OUT) {
+        trace->lines += "+" + std::to_string(ms) + "ms ssl-out " + std::to_string(size) + "B\n";
+    } else {
+        return 0;
+    }
+    ++trace->count;
+    return 0;
+}
+
 class ImageRequestRunner {
     struct Request {
         std::string url;
@@ -182,6 +211,7 @@ class ImageRequestRunner {
         Request request;
         std::shared_ptr<cpr::Session> session;
         std::chrono::steady_clock::time_point startedAt;
+        std::shared_ptr<TransferTrace> trace;
     };
 
 public:
@@ -322,6 +352,28 @@ private:
         wiliwili_boot_log(message);
     }
 
+    /* 慢传输的 curl 事件时间线（最多 8 次 dump，避免刷日志）。 */
+    static void dumpTransferTrace(const ActiveRequest& request, long long elapsedMs) {
+        static std::atomic<unsigned> dumps{0};
+        if (!request.trace || request.trace->count == 0) return;
+        if (dumps.fetch_add(1) >= 1) return;
+        char head[160];
+        const std::string host = imageUrlHost(request.request.url);
+        std::snprintf(head, sizeof(head), "img-trace: begin elapsed=%lldms lines=%d host=%s", elapsedMs,
+                      request.trace->count, host.c_str());
+        wiliwili_boot_log(head);
+        const std::string& lines = request.trace->lines;
+        size_t pos               = 0;
+        while (pos < lines.size()) {
+            size_t end = lines.find('\n', pos);
+            if (end == std::string::npos) end = lines.size();
+            std::string line = "img-trace:  " + lines.substr(pos, end - pos);
+            wiliwili_boot_log(line.c_str());
+            pos = end + 1;
+        }
+        wiliwili_boot_log("img-trace: end");
+    }
+
     void finish(CURLM* multi, std::unordered_map<CURL*, ActiveRequest>& active, CURL* curl, CURLcode result) {
         auto it = active.find(curl);
         if (it == active.end()) return;
@@ -333,6 +385,10 @@ private:
         const bool failed      = result != CURLE_OK || response.status_code != 200 || response.downloaded_bytes == 0;
         if (result == CURLE_OK && !failed) {
             logSlowTransfer(curl, request.request, response, request.startedAt);
+            const auto elapsed = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - request.startedAt)
+                                     .count();
+            if (elapsed >= 1000) dumpTransferTrace(request, elapsed);
         } else if (!cancelled) {
             char message[192];
             const auto elapsed = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -417,8 +473,13 @@ private:
                 deliver(request, std::move(response));
                 continue;
             }
-            active.emplace(curl,
-                           ActiveRequest{std::move(request), std::move(session), std::chrono::steady_clock::now()});
+            auto trace   = std::make_shared<TransferTrace>();
+            trace->start = std::chrono::steady_clock::now();
+            curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+            curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, imageDebugCallback);
+            curl_easy_setopt(curl, CURLOPT_DEBUGDATA, trace.get());
+            active.emplace(curl, ActiveRequest{std::move(request), std::move(session), std::chrono::steady_clock::now(),
+                                               std::move(trace)});
 
             while (!active.empty()) {
                 bool shouldStop;

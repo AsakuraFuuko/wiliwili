@@ -1045,6 +1045,151 @@ static void wiliwili_curl_probe_start(void) {
     pthread_t thread;
     if (pthread_create(&thread, 0, wiliwili_curl_probe_thread, 0) == 0) pthread_detach(thread);
 }
+/* CA 加载对照（`WILIWILI_CRYPTO_PROBE=1`）：单条 vs 5 并发加载同一个 bundle。
+ * 2026-10-04 轨迹显示慢传输的 2 s 全部花在 "SSL Trust Anchors" → "CAfile:" 之间。 */
+static long long wiliwili_read_file_ms(const char *path, long long *bytesOut) {
+    long long t0 = wiliwili_probe_ms();
+    int fd       = open(path, 0 /* O_RDONLY */);
+    if (fd < 0) {
+        *bytesOut = -1;
+        return -1;
+    }
+    char buf[16384];
+    long long total = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fd);
+    *bytesOut = total;
+    return wiliwili_probe_ms() - t0;
+}
+
+static void *wiliwili_ca_probe_thread(void *arg) {
+    long idx = (long)arg;
+    char line[192];
+    long long bytes  = 0;
+    long long readMs = wiliwili_read_file_ms("/app0/assets/ca-bundle.crt", &bytes);
+    long long t0     = wiliwili_probe_ms();
+    SSL_CTX *ctx     = SSL_CTX_new(TLS_client_method());
+    long long newMs  = wiliwili_probe_ms() - t0;
+    long long loadMs = -1;
+    int rc           = -1;
+    if (ctx != 0) {
+        long long t1 = wiliwili_probe_ms();
+        rc           = SSL_CTX_load_verify_locations(ctx, "/app0/assets/ca-bundle.crt", 0);
+        loadMs       = wiliwili_probe_ms() - t1;
+        SSL_CTX_free(ctx);
+    }
+    snprintf(line, sizeof(line), "caprobe: idx=%ld read=%lldms bytes=%lld new=%lldms load_ca=%lldms rc=%d", idx, readMs,
+             bytes, newMs, loadMs, rc);
+    wiliwili_boot_log(line);
+    return 0;
+}
+
+/* 从完整 bundle 里截取前 N 张证书，写入另一个文件：验证"并发代价随证书数量缩放"。 */
+static int wiliwili_write_bundle_subset(const char *src, const char *dst, int maxCerts) {
+    FILE *in = fopen(src, "rb");
+    if (in == 0) return 0;
+    char buffer[524288];
+    size_t total = fread(buffer, 1, sizeof(buffer) - 1, in);
+    fclose(in);
+    buffer[total] = 0;
+    FILE *out     = fopen(dst, "wb");
+    if (out == 0) return 0;
+    const char *marker = "-----BEGIN CERTIFICATE-----";
+    const char *cursor = buffer;
+    int written        = 0;
+    while (written < maxCerts) {
+        const char *begin = strstr(cursor, marker);
+        if (begin == 0) break;
+        const char *endMarker = strstr(begin, "-----END CERTIFICATE-----");
+        if (endMarker == 0) break;
+        const char *end = endMarker + strlen("-----END CERTIFICATE-----");
+        fwrite(begin, 1, (size_t)(end - begin), out);
+        fwrite("\n", 1, 1, out);
+        cursor = end;
+        ++written;
+    }
+    fclose(out);
+    return written;
+}
+
+static void wiliwili_ca_subset_probe(void) {
+    const char *full = "/app0/assets/ca-bundle.crt";
+    if (wiliwili_write_bundle_subset(full, "/download0/probe-ca-5.crt", 5) == 0) return;
+    wiliwili_write_bundle_subset(full, "/download0/probe-ca-40.crt", 40);
+    const char *paths[2] = {"/download0/probe-ca-5.crt", "/download0/probe-ca-40.crt"};
+    for (int pathIndex = 0; pathIndex < 2; ++pathIndex) {
+        long long bytes  = 0;
+        long long readMs = wiliwili_read_file_ms(paths[pathIndex], &bytes);
+        long long t0     = wiliwili_probe_ms();
+        SSL_CTX *ctx     = SSL_CTX_new(TLS_client_method());
+        long long loadMs = -1;
+        int rc           = -1;
+        if (ctx != 0) {
+            long long t1 = wiliwili_probe_ms();
+            rc           = SSL_CTX_load_verify_locations(ctx, paths[pathIndex], 0);
+            loadMs       = wiliwili_probe_ms() - t1;
+            SSL_CTX_free(ctx);
+        }
+        char line[192];
+        snprintf(line, sizeof(line), "casubset: path=%s read=%lldms bytes=%lld new=%lldms single_load=%lldms rc=%d",
+                 paths[pathIndex], readMs, bytes, wiliwili_probe_ms() - t0 - (loadMs > 0 ? loadMs : 0), loadMs, rc);
+        wiliwili_boot_log(line);
+    }
+}
+
+/* 并发加载不同大小 bundle 的对照（每档 5 路并发）。 */
+struct CaPathArg {
+    const char *path;
+    long idx;
+};
+
+static void *wiliwili_ca_path_thread(void *arg) {
+    struct CaPathArg *a = (struct CaPathArg *)arg;
+    long long t0        = wiliwili_probe_ms();
+    SSL_CTX *ctx        = SSL_CTX_new(TLS_client_method());
+    int rc              = -1;
+    if (ctx != 0) {
+        rc = SSL_CTX_load_verify_locations(ctx, a->path, 0);
+        SSL_CTX_free(ctx);
+    }
+    char line[192];
+    snprintf(line, sizeof(line), "capar: path=%s idx=%ld ms=%lld rc=%d", a->path, a->idx, wiliwili_probe_ms() - t0, rc);
+    wiliwili_boot_log(line);
+    return 0;
+}
+
+static void wiliwili_ca_subset_parallel_probe(void) {
+    static const char *paths[3] = {"/app0/assets/ca-bundle.crt", "/download0/probe-ca-5.crt",
+                                   "/download0/probe-ca-40.crt"};
+    for (int pathIndex = 0; pathIndex < 3; ++pathIndex) {
+        pthread_t threads[5];
+        struct CaPathArg args[5];
+        int started = 0;
+        for (long i = 0; i < 5; ++i) {
+            args[i].path = paths[pathIndex];
+            args[i].idx  = i;
+            if (pthread_create(&threads[i], 0, wiliwili_ca_path_thread, &args[i]) == 0) ++started;
+        }
+        for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+    }
+}
+
+static void wiliwili_ca_parallel_probe(void) {
+    wiliwili_ca_probe_thread((void *)0); /* 单条基线 */
+    /* 顺序 5 次：与"5 并发"对照，区分"共享锁争用"与"CPU 被渲染抢走"。 */
+    for (long i = 0; i < 5; ++i) wiliwili_ca_probe_thread((void *)(100 + i));
+    pthread_t threads[5];
+    int started = 0;
+    for (long i = 0; i < 5; ++i) {
+        if (pthread_create(&threads[i], 0, wiliwili_ca_probe_thread, (void *)(i + 1)) == 0) ++started;
+    }
+    for (int i = 0; i < started; ++i) pthread_join(threads[i], 0);
+}
+
 static void wiliwili_crypto_probe(void) {
     char line[192];
     unsigned char buf[32];
@@ -1081,6 +1226,9 @@ static void wiliwili_crypto_probe(void) {
     wiliwili_tls_parallel_probe();
     wiliwili_select_probe();
     wiliwili_curl_probe_start();
+    wiliwili_ca_parallel_probe();
+    wiliwili_ca_subset_probe();
+    wiliwili_ca_subset_parallel_probe();
 }
 
 static void wiliwili_early_marker(void) {
