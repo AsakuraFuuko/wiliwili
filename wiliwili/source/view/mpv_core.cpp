@@ -1,4 +1,6 @@
 #include <fstream>
+#include <chrono>
+#include <cstdio>
 
 extern "C" void wiliwili_boot_log(const char *);
 //
@@ -537,6 +539,14 @@ void MPVCore::init() {
         }
     }
 
+#if defined(PS5_NATIVE_APP)
+    /* MPV_RENDER_API_TYPE_SW otherwise selects the general-quality scaler. On the
+     * PS5 title that path costs about 26 ms for a 1920x1080 RGBA frame. The
+     * built-in sw-fast profile keeps the same 1920x1080 output surface but uses
+     * the fast CPU conversion path; measured render cost is about 1 ms. */
+    mpvSetOptionString(mpv, "profile", "sw-fast");
+#endif
+
     if (MPVCore::INMEMORY_CACHE) {
         // cache
         brls::Logger::info("set memory cache: {}MB", MPVCore::INMEMORY_CACHE);
@@ -964,11 +974,33 @@ void MPVCore::setFrameSize(brls::Rect r) {
 #endif
     auto *vg = brls::Application::getNVGContext();
 #ifdef PS5_NATIVE_APP
-    // The native AGC NanoVG rect is already in physical pixels; multiplying by
-    // windowScale would over-allocate (e.g. 1920x1080 becomes 2880x1620).
-    int drawWidth  = (int)std::ceil(rect.getWidth());
-    int drawHeight = (int)std::ceil(rect.getHeight());
-    if (drawWidth <= 0 || drawHeight <= 0) return;
+    /* Fullscreen keeps a 1920x1080 SW surface; WILIWILI_SW_SIZE=800x450 remains
+     * an explicit fallback for low-memory or diagnostic runs. Small-player rects
+     * still scale their surface down, so the detail-page 60 FPS path is unchanged. */
+    int maxSwWidth  = 1920;
+    int maxSwHeight = 1080;
+    const char *requestedSwSize = std::getenv("WILIWILI_SW_SIZE");
+    int requestedWidth = 0;
+    int requestedHeight = 0;
+    if (requestedSwSize != nullptr && std::sscanf(requestedSwSize, "%dx%d", &requestedWidth, &requestedHeight) == 2 &&
+        requestedWidth > 0 && requestedHeight > 0) {
+        maxSwWidth  = requestedWidth;
+        maxSwHeight = requestedHeight;
+    }
+    const int rectWidth  = (int)std::ceil(rect.getWidth());
+    const int rectHeight = (int)std::ceil(rect.getHeight());
+    if (rectWidth <= 0 || rectHeight <= 0) return;
+    int drawWidth  = rectWidth;
+    int drawHeight = rectHeight;
+    const bool fullScreen = rectWidth >= 1200 && rectHeight >= 650;
+    if (fullScreen && maxSwWidth >= 1920 && maxSwHeight >= 1080) {
+        drawWidth  = 1920;
+        drawHeight = 1080;
+    } else {
+        const float scale = std::min(1.0f, std::min((float)maxSwWidth / rectWidth, (float)maxSwHeight / rectHeight));
+        drawWidth         = std::max(1, (int)std::ceil(rectWidth * scale));
+        drawHeight        = std::max(1, (int)std::ceil(rectHeight * scale));
+    }
 
     if (pixels != nullptr && nvg_image != 0 && sw_size[0] == drawWidth && sw_size[1] == drawHeight) return;
 
@@ -980,7 +1012,7 @@ void MPVCore::setFrameSize(brls::Rect r) {
     pixels             = nullptr;
     mpv_params[3].data = nullptr;
     size_t frameSize   = (size_t)drawWidth * (size_t)drawHeight;
-    pixels             = malloc(frameSize * PIXCEL_SIZE);
+    if (posix_memalign(&pixels, 64, frameSize * PIXCEL_SIZE) != 0) pixels = nullptr;
     if (pixels == nullptr) return;
     mpv_params[3].data = pixels;
 #else
@@ -1009,9 +1041,10 @@ void MPVCore::setFrameSize(brls::Rect r) {
     /* 检查点：SW 视频面与渲染上下文就绪。ctx 为 NULL 时后面 mpv 渲染会在 mpv 内部
      * 对 NULL+0x70 取字段后跳 0（真机 addr=0x70/rip=0x0，见 notes/06 §10.8）。 */
     {
-        char dline[160];
-        snprintf(dline, sizeof(dline), "mpv-sw: surface=%d ctx=%p %dx%d display=%dx%d", nvg_image, (void *)mpv_context,
-                 drawWidth, drawHeight, (int)rect.getWidth(), (int)rect.getHeight());
+        char dline[224];
+        snprintf(dline, sizeof(dline), "mpv-sw: surface=%d ctx=%p %dx%d display=%dx%d ptr=%p mod64=%zu",
+                 nvg_image, (void *)mpv_context, drawWidth, drawHeight, (int)rect.getWidth(), (int)rect.getHeight(),
+                 pixels, (size_t)pixels & 63u);
         wiliwili_boot_log(dline);
     }
 
