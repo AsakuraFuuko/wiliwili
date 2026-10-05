@@ -4,18 +4,18 @@
 >
 > 结论先行：C **值得做，但只在目标包含 4K、HEVC、10-bit 或释放 CPU 时值得做**。A 已经解决了当前 1080p SW 面 60 FPS；C 不应作为 A 的替代优化，而应作为一条按能力探测启用、失败回退到 A 的视频后端。
 >
-> 当前固件是 12.00。仓库内对当前主机已经验证的是 H.264 → NV12 探针；HEVC、P010、4K 和 4K60 在当前主机仍未验证。外部 EVO/Prospero 项目有 12.70 真机数据，可用于估算上限，不能直接当作本机验收证据。
+> 当前固件是 12.00。P0 已在本机跑过 H.264 4K、HEVC Main 4K、HEVC Main10 1080p：三种 decoder/输出格式能力均通过；但 `sceVideodec2` 的 `OutputInfo` 没有输出 PTS 字段，PTS/reorder 子项仍未闭环，不能据此进入 P1。外部 EVO/Prospero 项目有 12.70 真机数据，可用于估算上限，不能替代本机验收。
 
 ## 1. 决策摘要
 
 |问题|结论|
 |---|---|
 |C 能否带来 A 没有的能力？|能。硬解路径有机会覆盖 4K、HEVC Main、P010/Main10，并显著释放 CPU；A 只能优化 SW YUV→RGBA/缩放。|
-|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|不能。当前 wiliwili 探针没有跑过这些格式；本轮临时探针构建成功，但主机休眠，FTP `:2120` 不可用，10 分钟等待后未能部署。|
+|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 能力 P0 已通过三组样本，但不等于可播放：4K Main10 未测，PTS/reorder 未验证，NV12/P010 呈现也未接入。严格 P0 未完全通过，当前不进入 C 的 P1。|
 |NV12/P010 能否接现有 AGC？|接口形状已经具备：`evo_agc_blit_yuv()` 接受 NV12/planar/P010 参数，writer 有 R8/RG8/R16/RG16 T# 描述符。但当前 native 工作树的 video pipe 资源由 `EVO_AGC_HAVE_VIDEO_PIPES` 门控，`evo_agc_pipes.h` 当前只包含 UI pipe；还不是可直接接入的生产链路。|
 |VideoOut 是否能直接注册 NV12/P010 扫描面？|没有证据，按不可行处理。公开/仓库内 API 只显示单一 RGB/BGRA buffer + 两个 scanout buffer，没有 YUV plane/CSC 注册接口。NV12 必须先由 AGC/GL shader 转成最终 BGRA/RGB scanout。|
 |能否保留 mpv？|能保留 mpv 的音频、时钟、pause/speed/property/UI 状态；视频压缩流不能继续让 mpv 读取，否则会重复下载。视频需要独立 FFmpeg demux/BSF → `sceVideodec2` → present。|
-|推荐顺序|P0 能力探针 → P1 AGC NV12 8-bit 原型 → P2 seek/A-V/fallback/HEVC → P3 P010/高质量缩放生产收口。P0 失败就不做 C。|
+|推荐顺序|保留当前 A；若继续 C，先补齐独立 FFmpeg PTS + VDEC 输出顺序实验，再做 P1 AGC NV12 8-bit。P0 关键 gate 未闭环就不做生产重构。|
 
 ## 2. 现状盘点
 
@@ -23,17 +23,17 @@
 
 |能力/字段|状态|证据与含义|
 |---|---|---|
-|加载 `libSceVideodec2`、compute queue、decoder、reset|**已验证（当前主机）**|`scripts/ps5/native/videodec2_probe.c:287-360`；仓库历史记录的 P2a 真机结果是所有 bring-up rc=0。|
-|H.264/AVC 解码|**已验证（当前主机）**|探针只定义 `CODEC_AVC=1`，配置 High/640×368，见 `videodec2_probe.c:47-69,316-360`。连续 AU 流路径在 `:376-438`。|
-|连续 P 帧、`Decode` 后 `valid=0` 再 `Flush`|**已验证（当前探针路径）**|`:405-413`；`rc==0 && out.valid==0` 时调用 `sceVideodec2Flush()`。这不是异步 fence 模型，而是同步 API 调用加 decoder 内部缓冲。|
-|输出格式 NV12|**已验证（当前 H.264 样本）**|探针把 `out.buffer` 按 Y 平面 + 同 pitch、半高 UV 平面读取，见 `:415-429`；`notes/02-hwdecode.md:216-226` 记录了 `1920x1088/pitch=2048` 的同一布局。|
-|帧池/内存类型|**已验证为当前探针的分配方式；不是完整生产证明**|`alloc_direct()` 使用 type 12，frame/AU pool 映射为 `0x32`，compute/CPU-GPU 区域为 `0x33`，decoder CPU workspace 为 flexible `0x03`，见 `:251-255,339-353`。探针能从输出 buffer CPU 读取，证明当前样本的映射可读；尚未证明 GPU 能直接采样每种输出。|
-|槽位与 pipeline|**仅探针**|`PIPELINE_SLOTS=3`、`pipeline_depth=1`，见 `:47-51,325-326`。槽复用只由 AU index 控制；没有 GPU fence/VideoOut retire 保护。生产零拷贝必须在槽复用前等待 GPU 使用结束，或复制到自有缓冲。|
-|PTS/reorder|**仅探针**|输入 PTS 是 `g_au_index`、DTS 是 `UINT64_MAX`，见 `:385-391`。它没有验证真实 DASH 时间基、B 帧 reorder 或音视频时钟。|
-|seek/flush 后 SPS/PPS|**当前探针未验证；现有笔记已有生产坑**|`notes/02-hwdecode.md:172-183`、`:1151-1166`：DASH fMP4 必须过 `h264_mp4toannexb`/`hevc_mp4toannexb`，seek 后要重建 BSF；单纯 `av_bsf_flush()` 不会重新注入 SPS/PPS。|
-|HEVC Main|**当前 12.00 未知**|当前探针没有 HEVC codec tag/流。ABI 参考值是 `codec_type=974921, profile=1`，见 `references/EVO-PLAYER-PS5/projects/evoplayer/media/include/sce/sce_videodec2.h:40-55`。|
-|HEVC Main10/P010|**当前 12.00 未知**|ABI 只记录 P010 判据 `out.pitch_bytes == out.pitch*2`，见 `references/EVO-PLAYER-PS5/.../sce_videodec2.h:138-154`；当前探针没有跑 P010，也没有 P010 输出复制/显示路径。|
-|4K/4K60|**当前 12.00 未知**|当前探针配置上限只有 640×368；没有在本主机跑 3840×2160。`max_width/max_height` 是 Create 时固定能力参数，不是运行时自动扩容。|
+|加载 `libSceVideodec2`、compute queue、decoder、reset|**已验证（当前 12.00）**|三次 P0 均为 `sysmodule=0`, `query_compute=0`, `compute_queue=0`, `query_decoder=0`, `create=0`, `reset=0`；探针主流程 `videodec2_probe.c:352-467`。|
+|H.264/AVC 4K 8-bit|**已验证（当前 12.00）**|`PPSA99260`：codec=1/profile=100/level=52，60/60 AU，输出 3840×2160 NV12，见 P0 实测节。|
+|HEVC Main 4K 8-bit|**已验证（当前 12.00）**|`PPSA99261`：codec=974921/profile=1/level=153，60/60 AU，输出 3840×2160 NV12，见 P0 实测节。|
+|HEVC Main10 1080p/P010|**已验证（当前 12.00）**|`PPSA99262`：codec=974921/profile=2/level=123，60/60 AU，输出 1920×1088、`pitch_bytes=pitch*2`，P010 判定 60/60。|
+|连续 AU、`Decode` 后 `valid=0` 再 `Flush`|**已验证（当前 P0）**|三组均 `decoded=60/60`, `buffered=60`, `accepted=60`, `errors=0`；路径在 `videodec2_probe.c:530-546`。当前 `pipeline_depth=1`，每 AU 同步 Flush。|
+|输出格式/内存布局|**已验证（当前 P0）**|H.264/HEVC Main 为 `pitch=3840,pitch_bytes=3840`；Main10 为 `pitch=1920,pitch_bytes=3840`。`out.buffer` 三组均在 frame pool 内；探针校验见 `:554-592`。|
+|frame pool/direct memory|**已验证为当前配置；不是生产 zero-copy 证明**|三组 direct limit 均 `0x300000000`，type 12 + `0x32/0x33` 映射和 flexible `0x03` 均成功；原始/对齐大小见 P0 实测表。GPU 仍未直接采样这些槽。|
+|槽位与 pipeline|**仅探针**|`PIPELINE_SLOTS=3`、`pipeline_depth=1`，见 `videodec2_probe.c:51-54,414-415,506-598`。没有 GPU fence/VideoOut retire 保护，不能当作生产 zero-copy。|
+|PTS/reorder|**未闭环（严格 P0 gate 未通过）**|输入只送 synthetic 90 kHz PTS、`step=3000`、DTS=`UINT64_MAX`，见 `:516-522`；ABI `OutputInfo` 没有输出 PTS 字段，三次均记录 `output_pts=not_in_abi reorder=not_observable`。不能宣称 B 帧已按显示 PTS 正确重排。|
+|seek/flush 后 SPS/PPS|**当前 P0 未验证；现有笔记已有生产坑**|`notes/02-hwdecode.md:172-183,1151-1166`：DASH fMP4 必须过 Annex-B BSF，seek 后要重建 BSF；单纯 `av_bsf_flush()` 不会重新注入 SPS/PPS。|
+|4K/4K60|**4K 连续解码已验证；端到端 4K60 未验证**|H.264/HEVC Main 均解出 60/60 个 3840×2160 AU；该探针无呈现、无真实媒体时钟，不能把 decoder P95 当 displayed 4K60。|
 |VP9/AV1|**当前 wiliwili 未知/无 C 路线**|`sceVideodec2` ABI 参考声明 VP9 tag，但 wiliwili 探针没有实现；AV1 没有仓库内 `sceVideodec2` 路线。|
 
 ### 2.2 `notes/02-hwdecode.md` 中的坑重新分类
@@ -60,11 +60,11 @@
 
 |格式|当前 wiliwili / 固件 12.00|参考项目数据（PS5 12.70；不可直接移植为验收）|决策含义|
 |---|---|---|---|
-|H.264 AVC 8-bit 4:2:0|640×368 NV12 探针已通过；4K 未测|EVO `README.md:51-58`：4K30 real-time；4K60 约 14 FPS。其详细 sweep `docs/build/validation.md:297` 又记录 H.264 4K60 real-time，两个文档/版本口径冲突|C 的 4K60 必须在 12.00 实测端到端，不能用“decoder 可建”代替|
-|HEVC Main 8-bit|未测|EVO `README.md:53-56`、`docs/codec-support.md:13-20` 声称 4K real-time；详细 sweep 对 4K HEVC Main/60 也有 native 样本|最有希望成为 C 的第一生产 codec，但仍需本机 P0/P1|
-|HEVC Main10 / P010|未测；当前探针无 P010|已知 ABI 输出 P010；EVO release README 只把硬解 Main10 可靠列到 1080p，`README.md:55-63`。另一份后续 `docs/codec-support.md:13-20` 宣称 4K，但 `docs/on-demand-decoder-handoff.md:275-282` 又明确说 4K Main10 解码吞吐与呈现仍未完整测量|把“P010 解出一帧”和“4K HDR 60fps 可发布”分成两个里程碑|
-|VP9 Profile 0|未测|参考文档称 hardware/4K，但详细 validation 的 4K 样本在某一版本走 FFmpeg；版本差异明显|不放进第一原型，除非 B 站实际需求|
-|VP9 Profile 2 10-bit|未测|参考 README 标为未验证|不作为 C 首目标|
+|H.264 AVC 8-bit 4:2:0|**4K 连续解码通过**：3840×2160，60/60 AU，NV12，平均 16.504 ms、P95 20.195 ms；未测端到端 4K60 present|EVO `README.md:51-58` 与 validation 对 4K60 的口径冲突，仍只作参考|decoder 能力成立；4K60 播放仍需独立 present/时钟验收|
+|HEVC Main 8-bit|**4K 连续解码通过**：3840×2160，60/60 AU，NV12，平均 6.509 ms、P95 8.372 ms；未接呈现|EVO `README.md:53-56`、`docs/codec-support.md:13-20` 的 4K 结论与本机结果方向一致，但不能替代本机 present 验收|可作为后续 8-bit C 生产首目标；当前仍被 PTS/reorder gate 卡住|
+|HEVC Main10 / P010|**1080p 连续解码通过**：1920×1088 coded、60/60 AU，`pitch=1920,pitch_bytes=3840`，P010 60/60，平均 2.477 ms、P95 3.245 ms|参考 README 只可靠列到 1080p；后续文档对 4K Main10 仍有未完整测量说明|10-bit decoder 能力成立；4K Main10 与 HDR/present 仍未知|
+|HEVC Main10 4K|未测|参考项目文档本身也存在 4K Main10 吞吐/呈现未收口的记录|不进入当前 P0；若继续 C，另立能力测试|
+|VP9 Profile 0/2|未测|参考文档版本间口径不一致|不放进第一原型|
 |AV1|无 `sceVideodec2` 路线|参考项目走软件 dav1d|C 不覆盖 AV1|
 
 ### 3.2 解码输出和显示上限
@@ -185,10 +185,10 @@ VideoView::draw ── nativeVideo.present(recent frame, playback_time)
 
 测试矩阵：
 
-1. H.264 3840×2160 8-bit，一帧 IDR + 30–60 秒连续流。
-2. HEVC Main 3840×2160 8-bit，一帧 + 连续流。
-3. HEVC Main10 1920×1080 P010，一帧 + 连续流。
-4. 若 1–3 全部通过，再测 HEVC Main10 3840×2160；否则不投入 P010 4K present。
+1. H.264 3840×2160 8-bit，60 AU 连续样本（本轮实测；不是 30–60 秒长测）。
+2. HEVC Main 3840×2160 8-bit，60 AU 连续样本（本轮实测）。
+3. HEVC Main10 1920×1080 P010，60 AU 连续样本（本轮实测）。
+4. HEVC Main10 3840×2160 未测；因为 PTS/reorder gate 未闭环，按止损规则不进入该项。
 
 每个样本必须记录：
 
@@ -201,9 +201,70 @@ VideoView::draw ── nativeVideo.present(recent frame, playback_time)
 
 **P0 通过条件**：当前固件至少 H.264 4K + HEVC Main 4K 连续解码稳定；如果目标含 10-bit，则还必须得到合法 P010。P0 只通过一帧、连续流或 PTS/reorder 任一项失败，都不能进入生产实现。
 
-本轮实际尝试：主机生成了单帧 H.264 4K（342,966 B）、HEVC 4K Main（249,304 B）、HEVC Main10 1080p（69,929 B），临时探针构建成功；部署时 FTP `192.168.102.118:2120` 返回 curl 7，之后等待主机服务 10 分钟仍未恢复。因此没有伪造当前 12.00 的 HEVC/P010/4K 结果；临时代码、测试流、title dist 已删除。
+### 6.2 P0 实测（2026-10-05）
 
-### 6.2 P1：固定 URL、8-bit NV12、无复杂交互
+主机载荷恢复后，8080/2120/2323/3232/8084 均 open。临时标题分别为 `PPSA99260`（AVC）、`PPSA99261`（HEVC Main）、`PPSA99262`（HEVC Main10）；没有改正式 `PPSA99233`。每个流由 FFmpeg 生成 60 个 30fps Annex-B AU，含 `bframes=2`；这是连续解码样本，不是 30–60 秒长测，也没有接 GPU present。
+
+测试流主机侧属性：H.264 High 3840×2160 level 5.2；HEVC Main 3840×2160 level 150；HEVC Main10 1920×1080、`yuv420p10le` level 120。三组均 `aus=60`。
+
+#### 6.2.1 结果矩阵
+
+|样本|Create 配置|输出|连续性/格式|耗时|
+|---|---|---|---|---:|
+|H.264 4K|codec=1, profile=100, level=52, max=3840×2176, `dpb=-1`, depth=1|60 帧均 `valid=1,error=0,pics=1,codec=1,3840×2160,pitch=3840,pitch_bytes=3840,fmt=0,in_pool=1`; NV12 判定 0|`decoded=60/60, buffered=60, accepted=60, errors=0, format_mismatch=0`|平均 **16,504 us**，P95 **20,195 us**|
+|HEVC Main 4K|codec=974921, profile=1, level=153, max=3840×2176, `dpb=-1`, depth=1|60 帧均 `valid=1,error=0,pics=1,codec=974921,3840×2160,pitch=3840,pitch_bytes=3840,fmt=0,in_pool=1`; NV12 判定 0|`decoded=60/60, buffered=60, accepted=60, errors=0, format_mismatch=0`|平均 **6,509 us**，P95 **8,372 us**|
+|HEVC Main10 1080p|codec=974921, profile=2, level=123, max=1920×1088, `dpb=-1`, depth=1|60 帧均 `valid=1,error=0,pics=1,codec=974921,1920×1088,pitch=1920,pitch_bytes=3840,fmt=0,in_pool=1`; P010 判定 60/60|`decoded=60/60, buffered=60, accepted=60, errors=0, format_mismatch=0`|平均 **2,477 us**，P95 **3,245 us**|
+
+#### 6.2.2 原始关键日志与内存
+
+```text
+PPSA99260 AVC:
+sysmodule=0; query_compute=0 size=0x495300; compute_queue=0
+query_decoder=0
+mem raw cpu=0x3a43800 gpu=0x9505000 cpu_gpu=0x29f1300 frame=0xbf5000 align=256
+mem aligned cpu=0x3a44000 gpu=0x9508000 cpu_gpu=0x29f4000 map_rc=0 alloc=1/1/1
+pools au=0x1800000 frame=0x23e8000 frame_size=0xbf8000 ok=1/1
+create_decoder=0; reset=0
+out idx=0 ... 3840x2160 pitch=3840 pitch_bytes=3840 fmt=0 buf=12550144 accepted=1 p010=0 in_pool=1 required=12441600 us=36778
+stats decoded=60/60 buffered=60 accepted=60 errors=0 p010=0/60 format_mismatch=0 avg_us=16504 p95_us=20195
+pts input=synthetic90k_step3000 output_pts=not_in_abi reorder=not_observable
+result pass=1 complete=1 expected_p010=0 decoded=60
+```
+
+```text
+PPSA99261 HEVC Main:
+config codec=974921 profile=1 level=153 max=3840x2176 dpb=-1 depth=1
+mem raw cpu=0x271de80 gpu=0xa401500 cpu_gpu=0x4c5cb00 frame=0xbf5000 align=256
+mem aligned cpu=0x2720000 gpu=0xa404000 cpu_gpu=0x4c60000 map_rc=0 alloc=1/1/1
+pools au=0x1800000 frame=0x23e8000 frame_size=0xbf8000 ok=1/1
+create_decoder=0; reset=0
+out idx=0 ... 3840x2160 pitch=3840 pitch_bytes=3840 fmt=0 buf=12550144 accepted=1 p010=0 in_pool=1 required=12441600 us=9870
+stats decoded=60/60 buffered=60 accepted=60 errors=0 p010=0/60 format_mismatch=0 avg_us=6509 p95_us=8372
+pts input=synthetic90k_step3000 output_pts=not_in_abi reorder=not_observable
+result pass=1 complete=1 expected_p010=0 decoded=60
+```
+
+```text
+PPSA99262 HEVC Main10:
+config codec=974921 profile=2 level=123 max=1920x1088 dpb=-1 depth=1
+mem raw cpu=0x15c1000 gpu=0x51ed500 cpu_gpu=0x1c8d800 frame=0x5fb000 align=256
+mem aligned cpu=0x15c4000 gpu=0x51f0000 cpu_gpu=0x1c90000 map_rc=0 alloc=1/1/1
+pools au=0x1800000 frame=0x11f4000 frame_size=0x5fc000 ok=1/1
+create_decoder=0; reset=0
+out idx=0 ... 1920x1088 pitch=1920 pitch_bytes=3840 fmt=0 buf=6275072 accepted=1 p010=1 in_pool=1 required=6266880 us=5321
+stats decoded=60/60 buffered=60 accepted=60 errors=0 p010=60/60 format_mismatch=0 avg_us=2477 p95_us=3245
+pts input=synthetic90k_step3000 output_pts=not_in_abi reorder=not_observable
+result pass=1 complete=1 expected_p010=1 decoded=60
+```
+
+#### 6.2.3 判定
+
+- **decoder/内存/输出格式子项：3/3 通过**。当前 12.00 已证明 H.264 4K、HEVC Main 4K、HEVC Main10 1080p/P010 可以连续解码；三组输出 buffer 都落在 frame pool 内，所有 Create/Reset/Decode/Flush rc 和内存映射 rc 均为 0。
+- **PTS/reorder 子项：未通过验收，不是“默认通过”**。输入 PTS 是探针合成的 `0,3000,...`，而 ABI 的 `OutputInfo` 没有输出 PTS/显示序号。即使流含 B 帧，当前证据也只能证明 60 AU 被解出，不能证明输出顺序与 DASH 显示 PTS 正确对应。
+- **严格 P0 总判定：未完全通过；按止损规则停止 C 的 P1/生产化。** C 的 decoder 能力值得保留，但在另行完成 FFmpeg 时间戳到输出帧顺序的实验前，不得进入 NV12/AGC 管线重构，也不得宣称 4K/10-bit 播放完成。
+
+### 6.3 P1：固定 URL、8-bit NV12、无复杂交互
+
 
 建议只做一个固定 DASH 视频 URL + 已验证音频 URL：
 
@@ -215,7 +276,7 @@ VideoView::draw ── nativeVideo.present(recent frame, playback_time)
 
 P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 `Decode/Flush` 错误、无槽复用错误；1080p/4K 画面方向、BT.709 limited range、色彩和 crop 正确；AGC `dcb_full/ring_fail/tex_fail/timeouts` 全 0；UI、弹幕、OSD 不被视频覆盖。
 
-### 6.3 P2：可发布生产
+### 6.4 P2：可发布生产
 
 必须补齐：
 
@@ -235,7 +296,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 
 |阶段|工作量（1 人）|能换到什么|
 |---|---:|---|
-|P0 能力探针|2–4 人日（其中包含主机样本、解析、日志和 60 秒流）|当前 12.00 的真实 codec/尺寸/P010/内存结论；决定是否继续|
+|P0 能力探针|2–4 人日（本轮含三标题、流生成、构建、部署、日志解析）|当前 12.00 的 codec/尺寸/P010/内存/decoder P95 结论；本轮 decoder 子项通过，但 PTS/reorder gate 未闭环|
 |P1 8-bit NV12 原型|5–8 人日；连 P0 合计约 7–12 人日|固定视频链路能跑，CPU 解码释放，初步 4K/HEVC 能力；还不能发布|
 |P2 生产 8-bit|10–16 人日|A/V、seek、fallback、清晰度、长测完整；可覆盖 H.264/HEVC Main|
 |P2 + P010/高质量 AGC|额外 5–10 人日；若需新 AGC shader/toolchain，再加 5–10 人日|10-bit/HDR/高质量 GPU scale；最大不确定性在 pipe 资源和 P010 present|
@@ -243,12 +304,12 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 综合判断：
 
 - **仅要 1080p60**：不值得。A 已交付，C 的网络/同步/内存/VideoOut 风险远大于收益。
-- **要 4K/HEVC/CPU 余量**：值得，先做 P0/P1；预计 2–4 周日历时间可形成生产候选，取决于主机可用性和 AGC pipe 资源。
-- **要 4K HEVC Main10 + 高质量 60fps**：值得立项但不能承诺；按 3–5 周、较高风险预算。decoder 不是唯一瓶颈，P010 shader、tone-map、AGC pipe 和 UI/OSD 合成才是收口成本。
+- **要 4K/HEVC/CPU 余量**：decoder 能力已经证明值得保留，但严格 P0 尚未通过；先补 PTS/reorder 子项，再决定是否投入 P1。
+- **要 4K HEVC Main10 + 高质量 60fps**：仍不能承诺。当前只证明 1080p P010 解码，不覆盖 4K Main10、HDR、GPU CSC、呈现和时钟。
 
 ### 7.2 主要风险与放弃条件
 
-1. **固件/进程能力差异**：12.70 参考项目能跑，不代表 12.00 能跑。若当前主机 HEVC Main 4K 或 H.264 4K 连续流失败，放弃“4K C”，保留 A。
+1. **当前 decoder 能力没有触发固件止损**：H.264 4K、HEVC Main 4K、HEVC Main10 1080p 均连续通过；但 PTS/reorder 未闭环，严格规则下停止 P1。
 2. **P010 只解出但无法显示**：若 P010 `out.valid=1`，但 R16/RG16/AGC pipe 无法正确采样或 tone-map，先交付 8-bit HEVC，10-bit 标为 unsupported；不要把 P010 转回 8-bit CPU 后宣称完成目标。
 3. **VideoOut plane 假设错误**：没有 YUV scanout ABI；若 AGC video pipe 无法加载，停止 zero-copy/直写路线，最多做 B1 诊断，不继续挖 undocumented plane。
 4. **内存预算**：4K P010 单帧约 24.9 MiB，仅是输出；decoder GPU/CPU workspace、3 槽、AGC transient、UI/图片缓存还要叠加。若 native 标题在 Query/Create 或长测出现 direct/flexible 分配压力，停止 4K Main10，并让 A 处理可回退样本。
@@ -258,11 +319,10 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 ## 8. 明确推荐
 
 1. **现在不改正式 A 路径，不把 C 合入默认播放。**
-2. 主机恢复后先做 P0，优先 H.264 4K、HEVC Main 4K、HEVC Main10 1080p；P0 失败立即停止 C。
-3. P0 通过后，首个原型做“mpv audio-only + 独立视频线程 + AGC NV12 pipe”，不做 VideoOut YUV plane；AGC pipe 资源缺失时用 B1 双平面 shader 验证格式，但不把 B1 当最终高质量零拷贝方案。
-4. P1 只验证 8-bit NV12 和 A/V/槽生命周期；P010、HDR、高质量 upscale 在 P1 稳定后单独进入 P2。
-5. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败或不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。这样 C 的失败不会破坏当前 1080p60 交付。
+2. **先不进入 P1。** 需要单独补一个 FFmpeg 时间戳 + B 帧输出顺序实验；该实验通过后才重新评估 C。
+3. 未来若 gate 通过，首个原型才做“mpv audio-only + 独立视频线程 + AGC NV12 pipe”，不做 VideoOut YUV plane；AGC pipe 资源缺失时最多用 B1 双平面 shader 验证格式。
+4. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败或不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。这样 C 的失败不会破坏当前 1080p60 交付。
 
 ## 9. 临时实验清理
 
-本轮为能力验证临时修改过 `videodec2_probe.c`，并生成过主机侧单帧 H.264/HEVC 资产；由于主机在部署前进入不可达状态，未产生真机结果。临时代码、options、测试流、`PPSA99258` dist 均已删除；正式探针恢复为原来的 H.264/NV12 诊断路径。未修改 A 方案代码，未 push。
+本轮保留了 `videodec2_probe.c` 的 P0 统计模式，但仅由 `WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_P0=1` 门控；正式标题不触发。三组测试流、options、`PPSA99260/61/62` 本地 dist、`/tmp/*.ffpkg` 与日志均已删除；主机 `/data/homebrew` 已核对只剩正式 `PPSA99233.ffpkg`（另有原有目录），未修改 A 路径，未 push。

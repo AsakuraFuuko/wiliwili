@@ -2,12 +2,14 @@
  * sceVideodec2 硬解探针（原生标题 app slot 专用）。
  *
  * P2a（已通过，2026-09-26 真机）：完整 bring-up + 喂一帧 IDR ⇒ 全部 rc=0、出 NV12 帧。
- * P2b（本次）：连续解一段 Annex-B 流（30 帧，含 P 帧），并把解码出的 Y 平面当纹理每帧
- *             全屏绘制，测量"呈现"这一步的真实代价——这决定最终走哪条呈现路线
- *             （NV12 直接上传 / AGC 零拷贝）。
+ * P2b（历史）：连续解 Annex-B 流并把 NV12 Y/UV 当纹理绘制，验证呈现代价。
+ * P0（2026-10-05）：`WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_P0=1` 启用多格式
+ *     能力/内存/Decode P95 统计；`WILIWILI_VDEC_CODEC=avc|hevc`、
+ *     `WILIWILI_VDEC_MAIN10=1`、`WILIWILI_VDEC_PATH`、`WILIWILI_VDEC_WIDTH/HEIGHT`
+ *     选择样本。P0 不复制/绘制 4K/P010 帧，默认正式标题路径不触发探针。
  *
  * 序列、结构体与常量取自 EVO-PLAYER-PS5 的 sce_videodec2.h 与 videodec2-abi.md（GPL-3.0）。
- * 触发：assets/wiliwili-options.txt 的 WILIWILI_TEST_VDEC=1；片源：assets/vdec-stream.h264。
+ * 默认触发：assets/wiliwili-options.txt 的 WILIWILI_TEST_VDEC=1；片源为 H.264 诊断流。
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -46,9 +48,12 @@ int32_t sceVideodec2Flush(void *decoder, void *frame, void *output);
 
 #define SCE_SYSMODULE_VIDEODEC2 207
 #define CODEC_AVC 1u
+#define CODEC_HEVC 974921u
 #define RESOURCE_COMPUTE 1u
 #define PIPELINE_SLOTS 3
 #define MAX_AU 4096
+#define AU_SLOT_SIZE 0x800000u
+#define STREAM_CAP (8u * 1024u * 1024u)
 
 typedef struct {
     uint64_t size;
@@ -136,12 +141,21 @@ static void *g_frame_pool;
 static uint64_t g_frame_size;
 static void *g_decoder;
 
-static uint8_t g_stream[0x100000];
+static uint8_t g_stream[STREAM_CAP];
 static int g_stream_size;
 static int g_au_offset[MAX_AU];
 static int g_au_size[MAX_AU];
 static int g_au_count;
 static int g_au_index;
+
+static int g_vdec_codec = CODEC_AVC;
+static int g_vdec_main10;
+static int g_vdec_width = 640;
+static int g_vdec_height = 368;
+static int g_vdec_p0;
+static int g_vdec_draw;
+static uint32_t g_decode_us[MAX_AU];
+static int g_decode_count;
 
 static uint8_t g_y_storage[1920 * 1088]; /* 稳定副本（帧池槽会被复用） */
 static uint8_t g_uv_storage[1920 * 544]; /* NV12 的 UV 平面：半高度、交织 CbCr */
@@ -256,36 +270,108 @@ static void *alloc_direct(uint64_t limit, uint64_t size, int32_t prot) {
     return address;
 }
 
-/* 把 Annex-B 流切成 AU：新的 slice（类型 1/5）到来且已有累积时切分。 */
-static void split_stream(void) {
-    int au_start   = 0;
-    int seen_slice = 0;
-    for (int i = 0; i + 3 < g_stream_size;) {
-        if (g_stream[i] == 0 && g_stream[i + 1] == 0 && g_stream[i + 2] == 1) {
-            int type = g_stream[i + 3] & 0x1F;
-            if (type == 1 || type == 5) {
-                if (seen_slice && g_au_count < MAX_AU) {
-                    g_au_offset[g_au_count] = au_start;
-                    g_au_size[g_au_count]   = i - au_start;
-                    ++g_au_count;
-                    au_start = i;
-                }
-                seen_slice = 1;
-            }
-            i += 3;
-        } else {
-            ++i;
+static int find_start_code(int from, int *prefix_len) {
+    for (int i = from; i + 3 < g_stream_size; ++i) {
+        if (g_stream[i] != 0 || g_stream[i + 1] != 0) continue;
+        if (g_stream[i + 2] == 1) {
+            *prefix_len = 3;
+            return i;
+        }
+        if (g_stream[i + 2] == 0 && g_stream[i + 3] == 1) {
+            *prefix_len = 4;
+            return i;
         }
     }
-    if (au_start < g_stream_size && g_au_count < MAX_AU) {
+    return -1;
+}
+
+static int is_picture_start(int nal_start, int nal_size) {
+    if (g_vdec_codec == CODEC_AVC) {
+        if (nal_size < 2) return 0;
+        int type = g_stream[nal_start] & 0x1F;
+        /* P0 samples use one slice per picture. */
+        return type == 1 || type == 5;
+    }
+    if (nal_size < 3) return 0;
+    int type = (g_stream[nal_start] >> 1) & 0x3F;
+    /* HEVC first_slice_segment_in_pic_flag is bit 7 of the first payload byte. */
+    return type <= 31 && (g_stream[nal_start + 2] & 0x80) != 0;
+}
+
+/* Split one-picture Annex-B access units. The test encoder emits one slice per
+ * picture; the HEVC path additionally checks first_slice_segment_in_pic_flag. */
+static void split_stream(void) {
+    int au_start = 0;
+    int seen_picture = 0;
+    int first_prefix_len = 0;
+    int pos = find_start_code(0, &first_prefix_len);
+    while (pos >= 0) {
+        int prefix_len = 0;
+        (void)find_start_code(pos, &prefix_len);
+        int next_prefix_len = 0;
+        int next = find_start_code(pos + prefix_len, &next_prefix_len);
+        int nal_start = pos + prefix_len;
+        int nal_end = next >= 0 ? next : g_stream_size;
+        if (is_picture_start(nal_start, nal_end - nal_start)) {
+            if (seen_picture && g_au_count < MAX_AU) {
+                g_au_offset[g_au_count] = au_start;
+                g_au_size[g_au_count] = pos - au_start;
+                ++g_au_count;
+                au_start = pos;
+            }
+            seen_picture = 1;
+        }
+        if (next < 0) break;
+        pos = next;
+    }
+    if (seen_picture && au_start < g_stream_size && g_au_count < MAX_AU) {
         g_au_offset[g_au_count] = au_start;
-        g_au_size[g_au_count]   = g_stream_size - au_start;
+        g_au_size[g_au_count] = g_stream_size - au_start;
         ++g_au_count;
     }
 }
 
+static uint32_t vdec_elapsed_us(const struct timespec *a, const struct timespec *b) {
+    int64_t sec = (int64_t)b->tv_sec - (int64_t)a->tv_sec;
+    int64_t nsec = (int64_t)b->tv_nsec - (int64_t)a->tv_nsec;
+    return (uint32_t)(sec * 1000000LL + nsec / 1000LL);
+}
+
+static int vdec_compare_us(const void *left, const void *right) {
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static uint32_t vdec_p95_us(void) {
+    if (g_decode_count <= 0) return 0;
+    qsort(g_decode_us, (size_t)g_decode_count, sizeof(g_decode_us[0]), vdec_compare_us);
+    int index = (g_decode_count * 95 + 99) / 100 - 1;
+    if (index < 0) index = 0;
+    return g_decode_us[index];
+}
+
 void wiliwili_videodec2_probe(void) {
-    wiliwili_boot_log("vdec: enter");
+    const char *codec = getenv("WILIWILI_VDEC_CODEC");
+    const char *path = getenv("WILIWILI_VDEC_PATH");
+    const char *width_env = getenv("WILIWILI_VDEC_WIDTH");
+    const char *height_env = getenv("WILIWILI_VDEC_HEIGHT");
+    const int is_hevc = codec != NULL && strcmp(codec, "hevc") == 0;
+    g_vdec_p0 = getenv("WILIWILI_VDEC_P0") != NULL;
+    g_vdec_draw = !g_vdec_p0 || getenv("WILIWILI_VDEC_DRAW") != NULL;
+    g_vdec_codec = is_hevc ? CODEC_HEVC : CODEC_AVC;
+    g_vdec_main10 = is_hevc && getenv("WILIWILI_VDEC_MAIN10") != NULL;
+    g_vdec_width = width_env != NULL ? atoi(width_env) : (g_vdec_p0 ? 3840 : 640);
+    g_vdec_height = height_env != NULL ? atoi(height_env) : (g_vdec_p0 ? 2160 : 368);
+    if (g_vdec_width <= 0 || g_vdec_height <= 0) {
+        wiliwili_boot_log("vdec: invalid requested dimensions");
+        return;
+    }
+
+    char line[256];
+    snprintf(line, sizeof(line), "vdec: enter p0=%d codec=%s main10=%d visible=%dx%d", g_vdec_p0,
+             is_hevc ? "hevc" : "avc", g_vdec_main10, g_vdec_width, g_vdec_height);
+    wiliwili_boot_log(line);
 
     int32_t rc = sceSysmoduleLoadModule(SCE_SYSMODULE_VIDEODEC2);
     log2("vdec: sysmodule207 rc=%d", rc, 0);
@@ -297,141 +383,235 @@ void wiliwili_videodec2_probe(void) {
     ComputeMemoryInfo cm;
     memset(&cm, 0, sizeof(cm));
     cm.size = sizeof(cm);
-    rc      = sceVideodec2QueryComputeMemoryInfo(&cm);
+    rc = sceVideodec2QueryComputeMemoryInfo(&cm);
     log2("vdec: query_compute rc=%d size=0x%lx", rc, (long)cm.cpu_gpu_size);
     if (rc != 0) return;
     uint64_t cm_size = align16k(cm.cpu_gpu_size);
-    cm.cpu_gpu       = alloc_direct(limit, cm_size, 0x33);
-    cm.cpu_gpu_size  = cm_size;
-    if (cm.cpu_gpu == NULL) return;
+    cm.cpu_gpu = alloc_direct(limit, cm_size, 0x33);
+    cm.cpu_gpu_size = cm_size;
+    if (cm.cpu_gpu == NULL) {
+        wiliwili_boot_log("vdec: compute memory allocation failed");
+        return;
+    }
 
     ComputeConfigInfo cc;
     memset(&cc, 0, sizeof(cc));
-    cc.size             = sizeof(cc);
+    cc.size = sizeof(cc);
     void *compute_queue = NULL;
-    rc                  = sceVideodec2AllocateComputeQueue(&cc, &cm, &compute_queue);
+    rc = sceVideodec2AllocateComputeQueue(&cc, &cm, &compute_queue);
     log2("vdec: compute_queue rc=%d", rc, 0);
     if (rc != 0) return;
 
+    int config_height = (g_vdec_height + 15) & ~15;
+    if (g_vdec_height >= 2160) config_height = 2176;
     DecoderConfigInfo config;
     memset(&config, 0, sizeof(config));
-    config.size                 = sizeof(config);
-    config.resource_type        = RESOURCE_COMPUTE;
-    config.codec_type           = CODEC_AVC;
-    config.profile              = 100;
-    config.max_level            = 51;
-    config.max_width            = 640;
-    config.max_height           = 368;
-    config.max_dpb_frames       = 4;
-    config.pipeline_depth       = 1;
-    config.compute_queue        = (uint64_t)compute_queue;
-    config.cpu_affinity         = 0x3F;
-    config.cpu_priority         = 700;
+    config.size = sizeof(config);
+    config.resource_type = RESOURCE_COMPUTE;
+    config.codec_type = g_vdec_codec;
+    config.profile = is_hevc ? (g_vdec_main10 ? 2u : 1u) : 100u;
+    config.max_level = is_hevc ? (g_vdec_width >= 3840 ? 153 : 123) : (g_vdec_width >= 3840 ? 52 : 51);
+    config.max_width = g_vdec_width;
+    config.max_height = config_height;
+    config.max_dpb_frames = -1; /* B站样本的 ref count 可能超过 4，交给 VDEC AUTO。 */
+    config.pipeline_depth = 1;
+    config.compute_queue = (uint64_t)compute_queue;
+    config.cpu_affinity = 0x3F;
+    config.cpu_priority = 700;
     config.optimize_progressive = 1;
+    snprintf(line, sizeof(line), "vdec: config codec=%u profile=%u level=%d max=%dx%d dpb=%d depth=%u", config.codec_type,
+             config.profile, config.max_level, config.max_width, config.max_height, config.max_dpb_frames,
+             config.pipeline_depth);
+    wiliwili_boot_log(line);
 
     DecoderMemoryInfo mem;
     memset(&mem, 0, sizeof(mem));
     mem.size = sizeof(mem);
-    rc       = sceVideodec2QueryDecoderMemoryInfo(&config, &mem);
+    rc = sceVideodec2QueryDecoderMemoryInfo(&config, &mem);
     log2("vdec: query_decoder rc=%d", rc, 0);
     if (rc != 0) return;
+    snprintf(line, sizeof(line), "vdec: mem raw cpu=0x%lx gpu=0x%lx cpu_gpu=0x%lx frame=0x%lx align=%u",
+             (long)mem.cpu_size, (long)mem.gpu_size, (long)mem.cpu_gpu_size, (long)mem.max_frame_size,
+             mem.frame_alignment);
+    wiliwili_boot_log(line);
 
     uint64_t cpu_size = align16k(mem.cpu_size);
-    void *cpu_ws      = NULL;
-    if (cpu_size) sceKernelMapNamedFlexibleMemory(&cpu_ws, (size_t)cpu_size, 0x03, 0, "VdecCpu");
-    mem.cpu               = cpu_ws;
-    mem.cpu_size          = cpu_size;
-    uint64_t gpu_size     = align16k(mem.gpu_size);
-    mem.gpu               = gpu_size ? alloc_direct(limit, gpu_size, 0x32) : NULL;
-    mem.gpu_size          = gpu_size;
+    void *cpu_ws = NULL;
+    int32_t cpu_rc = cpu_size ? sceKernelMapNamedFlexibleMemory(&cpu_ws, (size_t)cpu_size, 0x03, 0, "VdecCpu") : 0;
+    mem.cpu = cpu_ws;
+    mem.cpu_size = cpu_size;
+    uint64_t gpu_size = align16k(mem.gpu_size);
+    mem.gpu = gpu_size ? alloc_direct(limit, gpu_size, 0x32) : NULL;
+    mem.gpu_size = gpu_size;
     uint64_t cpu_gpu_size = align16k(mem.cpu_gpu_size);
-    mem.cpu_gpu           = cpu_gpu_size ? alloc_direct(limit, cpu_gpu_size, 0x33) : NULL;
-    mem.cpu_gpu_size      = cpu_gpu_size;
+    mem.cpu_gpu = cpu_gpu_size ? alloc_direct(limit, cpu_gpu_size, 0x33) : NULL;
+    mem.cpu_gpu_size = cpu_gpu_size;
+    snprintf(line, sizeof(line), "vdec: mem aligned cpu=0x%lx gpu=0x%lx cpu_gpu=0x%lx map_rc=%d alloc=%d/%d/%d",
+             (long)cpu_size, (long)gpu_size, (long)cpu_gpu_size, cpu_rc, cpu_ws != NULL,
+             gpu_size == 0 || mem.gpu != NULL, cpu_gpu_size == 0 || mem.cpu_gpu != NULL);
+    wiliwili_boot_log(line);
+    if (cpu_rc != 0 || (gpu_size != 0 && mem.gpu == NULL) || (cpu_gpu_size != 0 && mem.cpu_gpu == NULL)) return;
 
     g_frame_size = align16k(mem.max_frame_size);
-    g_au_pool    = alloc_direct(limit, 0x800000u * PIPELINE_SLOTS, 0x32);
+    g_au_pool = alloc_direct(limit, (uint64_t)AU_SLOT_SIZE * PIPELINE_SLOTS, 0x32);
     g_frame_pool = alloc_direct(limit, g_frame_size * PIPELINE_SLOTS, 0x32);
-    log2("vdec: pools au=%d frame=%d", g_au_pool != NULL, g_frame_pool != NULL);
+    snprintf(line, sizeof(line), "vdec: pools au=0x%lx frame=0x%lx frame_size=0x%lx ok=%d/%d",
+             (long)AU_SLOT_SIZE * PIPELINE_SLOTS, (long)g_frame_size * PIPELINE_SLOTS, (long)g_frame_size,
+             g_au_pool != NULL, g_frame_pool != NULL);
+    wiliwili_boot_log(line);
     if (g_au_pool == NULL || g_frame_pool == NULL) return;
 
     rc = sceVideodec2CreateDecoder(&config, &mem, &g_decoder);
     log2("vdec: create_decoder rc=%d", rc, 0);
     if (rc != 0) return;
-    log2("vdec: reset rc=%d", sceVideodec2Reset(g_decoder), 0);
+    rc = sceVideodec2Reset(g_decoder);
+    log2("vdec: reset rc=%d", rc, 0);
+    if (rc != 0) return;
 
-    /* 读流 */
-    int fd = open("/app0/assets/vdec-stream.h264", O_RDONLY);
+    const char *default_path = is_hevc ? "/app0/assets/vdec-stream.hevc" : "/app0/assets/vdec-stream.h264";
+    const char *stream_path = path != NULL && path[0] != '\0' ? path : default_path;
+    int fd = open(stream_path, O_RDONLY);
     if (fd < 0) {
-        wiliwili_boot_log("vdec: stream file missing");
+        snprintf(line, sizeof(line), "vdec: stream file missing path=%s", stream_path);
+        wiliwili_boot_log(line);
         return;
     }
-    g_stream_size = (int)read(fd, g_stream, sizeof(g_stream));
+    g_stream_size = 0;
+    while (g_stream_size < (int)sizeof(g_stream)) {
+        ssize_t n = read(fd, g_stream + g_stream_size, sizeof(g_stream) - (size_t)g_stream_size);
+        if (n <= 0) break;
+        g_stream_size += (int)n;
+    }
     close(fd);
-    log2("vdec: stream bytes=%d", g_stream_size, 0);
+    snprintf(line, sizeof(line), "vdec: stream path=%s bytes=%d truncated=%d", stream_path, g_stream_size,
+             g_stream_size == (int)sizeof(g_stream));
+    wiliwili_boot_log(line);
     if (g_stream_size <= 0) return;
 
+    g_au_count = 0;
     split_stream();
-    log2("vdec: aus=%d", g_au_count, 0);
+    snprintf(line, sizeof(line), "vdec: aus=%d split_codec=%s", g_au_count, is_hevc ? "hevc" : "avc");
+    wiliwili_boot_log(line);
+    if (g_au_count <= 0) {
+        wiliwili_boot_log("vdec: no access units");
+        return;
+    }
 
-    /* 连续解：环状 AU/帧槽，valid 时把 Y 平面拷进稳定缓冲 */
-    int decoded     = 0;
-    int buffered    = 0;
-    double total_ms = 0.0;
-    int slot        = 0;
+    int decoded = 0;
+    int buffered = 0;
+    int decode_errors = 0;
+    int accepted_count = 0;
+    int format_mismatch = 0;
+    int p010_count = 0;
+    uint64_t total_us = 0;
+    g_decode_count = 0;
+    int slot = 0;
     for (g_au_index = 0; g_au_index < g_au_count; ++g_au_index) {
-        uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * 0x800000u;
+        if (g_au_size[g_au_index] > AU_SLOT_SIZE) {
+            wiliwili_boot_log("vdec: AU exceeds 8MiB slot");
+            ++decode_errors;
+            break;
+        }
+        uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * AU_SLOT_SIZE;
         memcpy(au_slot, g_stream + g_au_offset[g_au_index], (size_t)g_au_size[g_au_index]);
 
         InputData input;
         memset(&input, 0, sizeof(input));
-        input.size    = sizeof(input);
-        input.au      = au_slot;
+        input.size = sizeof(input);
+        input.au = au_slot;
         input.au_size = (uint64_t)g_au_size[g_au_index];
-        input.pts     = (uint64_t)g_au_index;
-        input.dts     = UINT64_MAX;
+        input.pts = (uint64_t)g_au_index * 3000u; /* synthetic 90 kHz, 30 fps */
+        input.dts = UINT64_MAX;
 
         FrameBuffer frame;
         memset(&frame, 0, sizeof(frame));
-        frame.size        = sizeof(frame);
-        frame.buffer      = (uint8_t *)g_frame_pool + (size_t)slot * g_frame_size;
+        frame.size = sizeof(frame);
+        frame.buffer = (uint8_t *)g_frame_pool + (size_t)slot * g_frame_size;
         frame.buffer_size = g_frame_size;
 
         OutputInfo out;
         memset(&out, 0, sizeof(out));
         out.size = sizeof(out);
-
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         rc = sceVideodec2Decode(g_decoder, &input, &frame, &out);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        total_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-
+        int did_flush = 0;
         if (rc == 0 && out.valid == 0) {
             memset(&out, 0, sizeof(out));
             out.size = sizeof(out);
-            rc       = sceVideodec2Flush(g_decoder, &frame, &out);
+            rc = sceVideodec2Flush(g_decoder, &frame, &out);
+            did_flush = 1;
             ++buffered;
         }
-        if (rc == 0 && out.valid) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint32_t elapsed_us = vdec_elapsed_us(&t0, &t1);
+        if (g_decode_count < MAX_AU) g_decode_us[g_decode_count++] = elapsed_us;
+        total_us += elapsed_us;
+
+        if (rc != 0) {
+            ++decode_errors;
+            snprintf(line, sizeof(line), "vdec: error idx=%d pts=%llu flush=%d rc=%d accepted=%u", g_au_index,
+                     (unsigned long long)input.pts, did_flush, rc, frame.accepted);
+            wiliwili_boot_log(line);
+        } else if (out.valid) {
             ++decoded;
-            /* 拷一份 Y 平面（NV12：Y 在前，pitch 个采样一行） */
-            int copy_w         = (int)out.width < 1920 ? (int)out.width : 1920;
-            int copy_h         = (int)out.height < 1088 ? (int)out.height : 1088;
-            g_y_width          = copy_w;
-            g_y_height         = copy_h;
-            g_y_pitch          = (int)out.pitch;
-            const uint8_t *src = (const uint8_t *)out.buffer;
-            /* Y：前 height 行；UV：紧跟其后、半高度（NV12 交织 CbCr）。都紧打包，便于直接上传。 */
-            for (int y = 0; y < copy_h; ++y)
-                memcpy(g_y_storage + (size_t)y * copy_w, src + (size_t)y * out.pitch, (size_t)copy_w);
-            const uint8_t *uv_src = src + (size_t)out.pitch * copy_h;
-            for (int y = 0; y < copy_h / 2; ++y)
-                memcpy(g_uv_storage + (size_t)y * copy_w, uv_src + (size_t)y * out.pitch, (size_t)copy_w);
+            if (frame.accepted) ++accepted_count;
+            int p010 = out.pitch_bytes != 0 && out.pitch_bytes == out.pitch * 2u;
+            if (p010) ++p010_count;
+            if (p010 != g_vdec_main10) ++format_mismatch;
+            uintptr_t base = (uintptr_t)g_frame_pool;
+            uintptr_t end = base + g_frame_size * PIPELINE_SLOTS;
+            uintptr_t address = (uintptr_t)out.buffer;
+            int in_pool = address >= base && address < end;
+            uint64_t row_bytes = out.pitch_bytes != 0 ? out.pitch_bytes : (uint64_t)out.pitch * (p010 ? 2u : 1u);
+            uint64_t expected_pitch_bytes = (uint64_t)out.pitch * (p010 ? 2u : 1u);
+            uint64_t required = row_bytes * ((uint64_t)out.height + ((uint64_t)out.height + 1u) / 2u);
+            if (!frame.accepted || out.error || out.picture_count != 1 || out.codec != config.codec_type ||
+                out.width < (uint32_t)g_vdec_width || out.height < (uint32_t)g_vdec_height || out.pitch < out.width ||
+                out.pitch_bytes != expected_pitch_bytes || out.buffer == NULL || out.buffer_size < required || !in_pool) {
+                ++decode_errors;
+            }
+            snprintf(line, sizeof(line),
+                     "vdec: out idx=%d in_pts=%llu valid=%u err=%u pics=%u codec=%u %ux%u pitch=%u pitch_bytes=%u fmt=%u buf=%llu accepted=%u p010=%d in_pool=%d required=%llu us=%u",
+                     g_au_index, (unsigned long long)input.pts, out.valid, out.error, out.picture_count, out.codec,
+                     out.width, out.height, out.pitch, out.pitch_bytes, out.frame_format,
+                     (unsigned long long)out.buffer_size, frame.accepted, p010, in_pool,
+                     (unsigned long long)required, elapsed_us);
+            wiliwili_boot_log(line);
+
+            if (g_vdec_draw && !p010 && out.width <= 1920 && out.height <= 1088 && out.pitch <= 1920) {
+                int copy_w = (int)out.width;
+                int copy_h = (int)out.height;
+                g_y_width = copy_w;
+                g_y_height = copy_h;
+                g_y_pitch = (int)out.pitch;
+                const uint8_t *src = (const uint8_t *)out.buffer;
+                for (int y = 0; y < copy_h; ++y)
+                    memcpy(g_y_storage + (size_t)y * copy_w, src + (size_t)y * out.pitch, (size_t)copy_w);
+                const uint8_t *uv_src = src + (size_t)out.pitch * copy_h;
+                for (int y = 0; y < copy_h / 2; ++y)
+                    memcpy(g_uv_storage + (size_t)y * copy_w, uv_src + (size_t)y * out.pitch, (size_t)copy_w);
+            }
+        } else {
+            snprintf(line, sizeof(line), "vdec: buffered idx=%d in_pts=%llu flush=%d us=%u", g_au_index,
+                     (unsigned long long)input.pts, did_flush, elapsed_us);
+            wiliwili_boot_log(line);
         }
         slot = (slot + 1) % PIPELINE_SLOTS;
     }
-    log2("vdec: stream decoded=%d buffered=%d", decoded, buffered);
-    log2("vdec: avg_decode_x100=%d", (long)(total_ms / (double)(g_au_count ? g_au_count : 1) * 100.0), 0);
+
+    uint32_t p95_us = vdec_p95_us();
+    uint32_t avg_us = g_decode_count > 0 ? (uint32_t)(total_us / (uint64_t)g_decode_count) : 0;
+    snprintf(line, sizeof(line), "vdec: stats decoded=%d/%d buffered=%d accepted=%d errors=%d p010=%d/%d format_mismatch=%d avg_us=%u p95_us=%u",
+             decoded, g_au_count, buffered, accepted_count, decode_errors, p010_count, decoded, format_mismatch,
+             avg_us, p95_us);
+    wiliwili_boot_log(line);
+    wiliwili_boot_log("vdec: pts input=synthetic90k_step3000 output_pts=not_in_abi reorder=not_observable");
+    int complete = decoded == g_au_count && decoded > 0;
+    int pass = complete && decode_errors == 0 && format_mismatch == 0 && (p010_count > 0) == g_vdec_main10;
+    snprintf(line, sizeof(line), "vdec: result pass=%d complete=%d expected_p010=%d decoded=%d", pass, complete,
+             g_vdec_main10, decoded);
+    wiliwili_boot_log(line);
     log3("vdec: last %dx%d pitch=%d", g_y_width, g_y_height, g_y_pitch);
     if (decoded > 0) g_ready = 1;
     wiliwili_boot_log("vdec: stream done");
