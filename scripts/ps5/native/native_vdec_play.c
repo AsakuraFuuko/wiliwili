@@ -790,6 +790,22 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
     return play_decode_call(s, slot, data, size, pts90k, 0, -1) < 0 ? -1 : VDEC_PLAY_RESULT_OK;
 }
 
+enum {
+    VDEC_PLAY_TRACE_PACKET_CAP = 8,
+    VDEC_PLAY_TRACE_NAL_CAP = 6,
+};
+
+typedef struct {
+    uint64_t index;
+    int64_t pts, dts, pos;
+    int size, duration, flags;
+    int format, length_size, nal_count, truncated;
+    uint32_t first_declared_size;
+    int first_declared_offset;
+    int type[VDEC_PLAY_TRACE_NAL_CAP];
+    int nal_size[VDEC_PLAY_TRACE_NAL_CAP];
+    int offset[VDEC_PLAY_TRACE_NAL_CAP];
+} VdecPlayPacketTrace;
 typedef struct {
     AVFormatContext *format;
     AVBSFContext *bsf;
@@ -798,8 +814,148 @@ typedef struct {
     uint32_t codec;
     int has_reorder;
     int video_delay, has_b_frames;
+    int nal_length_size;
+    uint64_t packet_index;
+    int trace_head, trace_count;
+    VdecPlayPacketTrace trace[VDEC_PLAY_TRACE_PACKET_CAP];
 } VdecPlayMedia;
 
+static int play_find_start_code(const uint8_t *data, int size, int from, int *prefix) {
+    for (int i = from; i + 3 < size; ++i) {
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            *prefix = 3;
+            return i;
+        }
+        if (i + 4 <= size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+            *prefix = 4;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int play_packet_trace_parse_avcc(VdecPlayPacketTrace *trace, const uint8_t *data, int size, uint32_t codec,
+                                        int nal_length_size) {
+    if (nal_length_size < 1 || nal_length_size > 4) nal_length_size = 4;
+    trace->length_size = nal_length_size;
+    int cursor = 0;
+    while (cursor + nal_length_size <= size) {
+        uint32_t nal_size = 0;
+        for (int i = 0; i < nal_length_size; ++i) nal_size = (nal_size << 8) | data[cursor + i];
+        if (trace->nal_count == 0) {
+            trace->first_declared_size = nal_size;
+            trace->first_declared_offset = cursor;
+        }
+        const int payload = cursor + nal_length_size;
+        if (nal_size > (uint32_t)(size - payload)) {
+            trace->truncated = 1;
+            return 0;
+        }
+        if (nal_size > 0) {
+            if (trace->nal_count < VDEC_PLAY_TRACE_NAL_CAP) {
+                const int slot = trace->nal_count;
+                trace->type[slot] = codec == VDEC_PLAY_CODEC_AVC ? data[payload] & 0x1f : (data[payload] >> 1) & 0x3f;
+                trace->nal_size[slot] = (int)nal_size;
+                trace->offset[slot] = cursor;
+            } else {
+                trace->truncated = 1;
+            }
+            ++trace->nal_count;
+        }
+        cursor = payload + (int)nal_size;
+    }
+    if (cursor != size) {
+        trace->truncated = 1;
+        return 0;
+    }
+    return 1;
+}
+
+static int play_packet_trace_parse_annexb(VdecPlayPacketTrace *trace, const uint8_t *data, int size, uint32_t codec) {
+    int prefix = 0;
+    const int start = play_find_start_code(data, size, 0, &prefix);
+    if (start != 0) return 0;
+    trace->format = 2;
+    int cursor = start;
+    while (cursor >= 0 && cursor < size) {
+        int current_prefix = 0;
+        const int nal_start = play_find_start_code(data, size, cursor, &current_prefix);
+        if (nal_start < 0) break;
+        const int payload = nal_start + current_prefix;
+        int next_prefix = 0;
+        const int next = play_find_start_code(data, size, payload, &next_prefix);
+        const int end = next >= 0 ? next : size;
+        if (payload >= end) return 0;
+        if (trace->nal_count < VDEC_PLAY_TRACE_NAL_CAP) {
+            const int slot = trace->nal_count;
+            trace->type[slot] = codec == VDEC_PLAY_CODEC_AVC ? data[payload] & 0x1f : (data[payload] >> 1) & 0x3f;
+            trace->nal_size[slot] = end - payload;
+            trace->offset[slot] = nal_start;
+        } else {
+            trace->truncated = 1;
+        }
+        ++trace->nal_count;
+        cursor = next >= 0 ? next : size;
+    }
+    return trace->nal_count > 0;
+}
+
+static void play_packet_trace_capture(VdecPlayPacketTrace *trace, const AVPacket *packet, uint32_t codec,
+                                      int nal_length_size, uint64_t index) {
+    memset(trace, 0, sizeof(*trace));
+    trace->index = index;
+    trace->pts = packet->pts;
+    trace->dts = packet->dts;
+    trace->pos = packet->pos;
+    trace->size = packet->size;
+    trace->duration = (int)packet->duration;
+    trace->flags = packet->flags;
+    const uint8_t *data = packet->data;
+    const int size = packet->size;
+    if (!data || size <= 0) {
+        trace->format = -1;
+        return;
+    }
+    trace->format = 1;
+    if (play_packet_trace_parse_avcc(trace, data, size, codec, nal_length_size)) return;
+    trace->nal_count = 0;
+    trace->truncated = 0;
+    if (play_packet_trace_parse_annexb(trace, data, size, codec)) return;
+    trace->format = -1;
+    trace->truncated = 1;
+}
+
+static void play_packet_trace_record(VdecPlayMedia *media, const AVPacket *packet) {
+    VdecPlayPacketTrace *trace = &media->trace[media->trace_head];
+    play_packet_trace_capture(trace, packet, media->codec, media->nal_length_size, media->packet_index++);
+    media->trace_head = (media->trace_head + 1) % VDEC_PLAY_TRACE_PACKET_CAP;
+    if (media->trace_count < VDEC_PLAY_TRACE_PACKET_CAP) ++media->trace_count;
+}
+
+static void play_packet_trace_log(const char *label, const VdecPlayPacketTrace *trace) {
+    char nals[256];
+    int used = 0;
+    nals[0] = '\0';
+    for (int i = 0; i < trace->nal_count && i < VDEC_PLAY_TRACE_NAL_CAP && used < (int)sizeof(nals); ++i) {
+        const int written = snprintf(nals + used, sizeof(nals) - (size_t)used, "%s%d/%d/%d", i ? "," : "",
+                                     trace->type[i], trace->nal_size[i], trace->offset[i]);
+        if (written < 0) break;
+        used += written;
+    }
+    play_logf("vdec-play: %s idx=%llu pts=%lld dts=%lld pos=%lld size=%d duration=%d flags=0x%x format=%s len=%d declared=%u@%d nals=%d%s [%s]",
+              label, (unsigned long long)trace->index, (long long)trace->pts, (long long)trace->dts,
+              (long long)trace->pos, trace->size, trace->duration, trace->flags,
+              trace->format == 1 ? "avcc" : trace->format == 2 ? "annexb" : "invalid", trace->length_size,
+              trace->first_declared_size, trace->first_declared_offset, trace->nal_count,
+              trace->truncated ? "+" : "", nals);
+}
+
+static void play_packet_trace_dump(const VdecPlayMedia *media) {
+    const int first = (media->trace_head + VDEC_PLAY_TRACE_PACKET_CAP - media->trace_count) %
+                      VDEC_PLAY_TRACE_PACKET_CAP;
+    for (int i = 0; i < media->trace_count; ++i)
+        play_packet_trace_log("bsf-last", &media->trace[(first + i) % VDEC_PLAY_TRACE_PACKET_CAP]);
+}
 static int play_choose_pending_limit(const VdecPlayMedia *media, const char **reason) {
     const int delay = media->video_delay;
     const int b_frames = media->has_b_frames;
@@ -840,6 +996,10 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     AVDictionary *options = NULL;
     av_dict_set(&options, "rw_timeout", "5000000", 0);
     av_dict_set(&options, "timeout", "5000000", 0);
+    av_dict_set(&options, "reconnect", "1", 0);
+    av_dict_set(&options, "reconnect_delay_max", "1", 0);
+    av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+    av_dict_set(&options, "multiple_requests", "1", 0);
     av_dict_set(&options, "headers", "Referer: https://www.bilibili.com\r\nUser-Agent: Mozilla/5.0\r\n", 0);
     int rc = avformat_open_input(&format, s->source_url, NULL, &options);
     av_dict_free(&options);
@@ -914,10 +1074,74 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     media->stream = stream;
     media->time_base = stream->time_base;
     media->codec = stream->codecpar->codec_id == AV_CODEC_ID_HEVC ? VDEC_PLAY_CODEC_HEVC : VDEC_PLAY_CODEC_AVC;
-    play_logf("vdec-play: demux ready stream=%d codec=%u size=%dx%d timebase=%d/%d bsf=%s reorder=%d",
+    media->nal_length_size = 4;
+    if (stream->codecpar->extradata && stream->codecpar->extradata_size >= 5) {
+        const int length_offset = stream->codecpar->codec_id == AV_CODEC_ID_HEVC ? 21 : 4;
+        if (stream->codecpar->extradata_size > length_offset)
+            media->nal_length_size = (stream->codecpar->extradata[length_offset] & 3) + 1;
+        if (media->nal_length_size < 1 || media->nal_length_size > 4) media->nal_length_size = 4;
+    }
+    play_logf("vdec-play: demux ready stream=%d codec=%u size=%dx%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
               stream_index, media->codec, stream->codecpar->width, stream->codecpar->height,
-              media->time_base.num, media->time_base.den, filter_name, media->has_reorder);
+              media->time_base.num, media->time_base.den, stream->codecpar->codec_tag,
+              stream->codecpar->extradata_size, media->nal_length_size, filter_name, media->has_reorder);
     return 0;
+}
+static int play_packet_is_complete(const VdecPlayMedia *media, const AVPacket *packet) {
+    if (!media || !packet || (media->codec != VDEC_PLAY_CODEC_AVC && media->codec != VDEC_PLAY_CODEC_HEVC)) return 1;
+    VdecPlayPacketTrace trace;
+    play_packet_trace_capture(&trace, packet, media->codec, media->nal_length_size, 0);
+    return trace.format != -1;
+}
+
+static int play_recover_packet(VdecPlaySession *s, VdecPlayMedia *media, AVPacket *packet) {
+    if (!s || !media || !media->format || !media->stream || !packet || packet->pos < 0 || packet->pts == AV_NOPTS_VALUE)
+        return -1;
+    const uint32_t wanted_codec = media->codec;
+    const int wanted_width = media->stream->codecpar->width;
+    const int wanted_height = media->stream->codecpar->height;
+    const int64_t wanted_pos = packet->pos;
+    const int64_t wanted_pts = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
+    AVPacket *candidate = av_packet_alloc();
+    if (!candidate) return -1;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        if (attempt > 1) {
+            play_media_close(media);
+            if (play_media_open(s, media) != 0) break;
+            if (media->codec != wanted_codec || media->stream->codecpar->width != wanted_width ||
+                media->stream->codecpar->height != wanted_height) {
+                play_media_close(media);
+                break;
+            }
+        }
+        av_packet_unref(packet);
+        avformat_flush(media->format);
+        const int rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, wanted_pts, INT64_MAX,
+                                           AVSEEK_FLAG_ANY);
+        play_logf("vdec-play: short-packet retry attempt=%d mode=%s seek_rc=%d pos=%lld pts=%lld", attempt,
+                  attempt == 1 ? "existing" : "reopen", rc, (long long)wanted_pos, (long long)wanted_pts);
+        if (rc < 0) continue;
+        for (int reads = 0; reads < 8192; ++reads) {
+            av_packet_unref(candidate);
+            const int read_rc = av_read_frame(media->format, candidate);
+            if (read_rc < 0) break;
+            if (candidate->stream_index != media->stream->index) continue;
+            if (candidate->pos == wanted_pos) {
+                av_packet_move_ref(packet, candidate);
+                if (play_packet_is_complete(media, packet)) {
+                    play_logf("vdec-play: short-packet recovered attempt=%d pos=%lld size=%d", attempt,
+                              (long long)packet->pos, packet->size);
+                    av_packet_free(&candidate);
+                    return 0;
+                }
+                av_packet_unref(packet);
+                break;
+            }
+            if (candidate->pos > wanted_pos) break;
+        }
+    }
+    av_packet_free(&candidate);
+    return -1;
 }
 
 static int play_sequential_seek_skip(VdecPlaySession *s, const AVPacket *packet, AVRational time_base) {
@@ -983,6 +1207,18 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             av_packet_unref(input);
             continue;
         }
+        play_packet_trace_record(media, input);
+        if (!play_packet_is_complete(media, input)) {
+            play_packet_trace_log("packet-short", &media->trace[(media->trace_head + VDEC_PLAY_TRACE_PACKET_CAP - 1) %
+                                                                 VDEC_PLAY_TRACE_PACKET_CAP]);
+            if (play_recover_packet(s, media, input) != 0) {
+                play_packet_trace_dump(media);
+                play_fail(s, "demux-short-packet", -9025);
+                result = -1;
+                break;
+            }
+            play_packet_trace_record(media, input);
+        }
         int rc = av_bsf_send_packet(media->bsf, input);
         av_packet_unref(input);
         if (rc < 0) {
@@ -997,6 +1233,7 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             if (rc == AVERROR_EOF) goto flush_bsf;
             if (rc < 0) {
                 play_log_av_error("BSF receive", rc);
+                play_packet_trace_dump(media);
                 play_fail(s, "bsf-error", rc);
                 result = -1;
                 goto done;

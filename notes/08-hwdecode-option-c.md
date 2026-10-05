@@ -433,7 +433,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 
 **M3 故障注入（当前代码）。** PPSA99356 bad-stream→`rc=-9015`；PPSA99357 中途 Reset `rc=0` 后→`rc=-9017`；PPSA99358 超窗→`rc=-9016`；PPSA99359 timeout（10 ms）→`rc=-9008`。四项各一条 `FALLBACK_A`，均有 mpv `audio active`、health 0、无崩溃。
 
-**当前 C 可用性判定。** 默认双门控 native 路径保持 `pending_limit=4`，可靠覆盖为固定 HTTP H.264 8-bit 无重排样本及已有 P0 的安全配对契约；真实 B3/B4 DASH、HEVC Main 480p 和普通 720p B 帧样本均已在显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 下通过，但默认 4 会按 gate 回退 A。普通 1080p MP4 在自适应实验中还出现 BSF 数据错误并回退，因此不能把自适应称为默认生产路径。M4 已补齐 HEVC Main 真实播放、pause、倍速、seek、EOF replay 的实验收据；仍不覆盖 P010/Main10/HDR、4K present、非全屏 AGC crop、任意更深 reorder、备份 URL/网络中断恢复和生产级 A/V 漂移统计。
+**当前 C 可用性判定。** 默认双门控 native 路径仍保持 `pending_limit=4`，可靠覆盖为固定 HTTP H.264 8-bit 无重排样本及已有 P0 的安全配对契约；真实 B3/B4 DASH、HEVC Main 480p 和普通 720p B 帧样本已在显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 下通过，但默认 4 会按 gate 回退 A。M5 已证明普通 1080p 的回退是 HTTP 短读造成的截断 AVCC 包，已通过重开 demux/BSF 并定位同一 sample 修复，PPSA99508 90 s 重跑无回退；自适应默认仍需等待扩展至 8–10 条语料后的零回退判定。仍不覆盖 P010/Main10/HDR、4K present、非全屏 AGC crop、备份 URL/网络中断恢复、随机 seek 长测和生产级 A/V 漂移统计。
 
 #### 6.5.3 M4：按流重排信息自适应 pending
 
@@ -452,6 +452,14 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 |PPSA99410|`BV1J7411374q` / `151345597` / 1080p|普通 HTTP MP4，H.264，`video_delay=2 has_b_frames=2`|6、5|反例；约 60 s 后 BSF `rc=-1094995529`，`FALLBACK_A`，此前 `presented=3480`、`dropped=0`|health 全 0；峰值 3,461,376 bytes|
 
 因此实验自适应集为 4 条通过、1 条回退；通过集没有顺序异常，但全集存在回退，**默认不改为自适应**。默认 4 下 PPSA99411 真实 B4 与 PPSA99412 真实 B3 均在第 5 AU `rc=-2128805632`→`FALLBACK_A`，health 仍全 0；B3/B4 继续由 A 接管。
+
+#### 6.5.4 M5：1080p 普通 MP4 BSF 回退根因与修复（2026-10-06）
+
+- **A/mpv 对照**：PPSA99506 在同一 `BV1J7411374q`、同一 1080p 普通 MP4 URL 上绕过 C，直接让 mpv 播放约 80 s；日志有 `m5-test: direct mpv url override`、`mpv: file loaded`、`audio active`，8 个 health 检查点均为 `dcb_full=0 ring_fail=0 tex_fail=0`，无回退。流本身正常。
+- **失败证据**：PPSA99501 的失败包为视频包 index=1494、`pos=18830711`、PTS/DTS=`959360/956160`、flags=`0x2`、收到 `size=10238`；AVCC 首个长度字段声明 `11174`，因此包内 NAL 不完整。前一包 index=1493 为 `pos=18829542 size=492`、NAL type 1、payload 488；同一完整本地样本 `/tmp/m5-1080.mp4` 在 pos=18830711 的包大小为 11178，完整 FFmpeg `h264_mp4toannexb` 通过。失败前没有 SPS/PPS/SEI 或参数集切换，BSF 只是正确拒绝截断的 AVCC 包。
+- **根因**：B 站 HTTP VOD 连接在 MP4 sample 尚未读完时返回短读/EOF；交叉 FFmpeg 7.0.1 的 HTTP/AVIO 路径在该连接关闭形态下向 MOV demux 暴露了短 packet，随后 `h264_mp4toannexb` 校验 `11174 > remaining` 返回 `AVERROR_INVALIDDATA`。不是 AVC3、带内参数集、多 SPS/PPS、AU 边界或 B 帧排序问题。
+- **修复**：保留 `reconnect=1`、`reconnect_on_network_error=1`、`multiple_requests=1`；不启用全局 `reconnect_at_eof`，避免真实 EOF 被当成重连。C 在送 BSF 前校验 AVCC/AnnexB 包完整性；发现短包时重开 HTTP demux/BSF、按原 DTS/PTS 定位并读取同一 byte position，失败仍以 `FALLBACK_A` 收口。诊断日志保留最后 8 个包的 type/size/offset/PTS/DTS/声明长度。
+- **修复后重跑**：PPSA99509 同一 1080p BV，显式 adaptive，监听 90 s；无 `packet-short`、无 BSF/FALLBACK_A，`presented=5040`（监听末端）、`dropped=0`、`errors=0`、`order_errors=0`、limit=6、pending peak=5；health frame=600…4800 全 0，direct_mem `4,247,808` bytes 稳定，mpv audio active，无 `img-net: failed`。
 
 ### 6.6 P2：可发布生产
 
