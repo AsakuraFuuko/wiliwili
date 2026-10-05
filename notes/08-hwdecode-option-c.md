@@ -11,11 +11,11 @@
 |问题|结论|
 |---|---|
 |C 能否带来 A 没有的能力？|能。硬解路径有机会覆盖 4K、HEVC Main、P010/Main10，并显著释放 CPU；A 只能优化 SW YUV→RGBA/缩放。|
-|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate、M1 静态 NV12→AGC→scanout、M2 受保护 8-bit 固定 MP4 链路均已在真机通过；仍不承诺 4K60、B4 DASH 窗口、A/V clock、P010/HDR 或生产长测。|
-|NV12/P010 能否接现有 AGC？|M1/M2 已导入并验证 GPL-3.0 的预编译 8-bit NV12 pipe：真实 HTTP MP4 经 FFmpeg BSF/VDEC/NV12 后由 `evo_agc_blit_yuv()` 进入当前 scanout；HDR/planar/upscaler pipe 仍未导入。|
+|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate、M1 静态 NV12→AGC→scanout、M2 8-bit 固定 MP4 和 M3 已取证的 H.264 B4 DASH 均在真机通过；仍不承诺 4K60、HEVC/P010/HDR、任意 reorder 深度或生产级网络恢复。|
+|NV12/P010 能否接现有 AGC？|M1/M3 已验证 GPL-3.0 的预编译 8-bit NV12 pipe：真实 HTTP MP4/B4 DASH 经 FFmpeg BSF/VDEC/NV12 后由 `evo_agc_blit_yuv()` 进入当前 scanout；HDR/planar/upscaler pipe 仍未导入。|
 |VideoOut 是否能直接注册 NV12/P010 扫描面？|没有证据，按不可行处理。公开/仓库内 API 只显示单一 RGB/BGRA buffer + 两个 scanout buffer，没有 YUV plane/CSC 注册接口。NV12 必须先由 AGC/GL shader 转成最终 BGRA/RGB scanout。|
 |能否保留 mpv？|能保留 mpv 的音频、时钟、pause/speed/property/UI 状态；视频压缩流不能继续让 mpv 读取，否则会重复下载。视频需要独立 FFmpeg demux/BSF → `sceVideodec2` → present。|
-|推荐顺序|保留当前 A；M1/M2 已通过，进入 M3：用 mpv playback-time 做视频发布节拍，补 pause/speed/seek/切档和长测；任一步 watchdog/fence/present 失败立即回退 A。|
+|推荐顺序|保留当前 A；受保护 C 的 M3 已完成，默认 pending=8、B4 实测峰值 6；下一阶段只做 HEVC/P010/HDR、4K、网络恢复和更广泛 seek/reorder 覆盖，失败仍立即回退 A。|
 
 ## 2. 现状盘点
 
@@ -416,17 +416,34 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 |`PPSA99293`|`...=window`|`FALLBACK_A reason=pending-window-injected rc=-9016`。|
 |`PPSA99294`|`...=timeout`, `WILIWILI_VDEC_TIMEOUT_MS=10`|`FALLBACK_A reason=flush-timeout rc=-9008`；mpv audio active。|
 
+#### 6.5.2 M3：时钟、交互与真实 B4（2026-10-05）
+
+- **发布节拍**：`VideoView::draw()` 把 mpv `playback-time`（90 kHz 换算）、`speed`、`paused` 传给 native；READY 队列只发布 `pts90k <= clock90k` 的最新帧，过期 READY 计入 `dropped`，CURRENT 仍由 AGC fence-retire 后复用。M3 自动场景日志中 clock 与视频 PTS 保持约 1–3 ms（例如 `clock90k=2515201`、`pts90k=2511000`），不再出现 M2 的解码线程提前 EOF/重复末帧。
+- **pause/resume**：PPSA99352 日志 `m3-test: pause` → `m3-test: resume`，demux 线程在条件变量上阻塞/唤醒，mpv audio active、无 crash/FALLBACK_A。
+- **倍速**：同一标题记录 `m3-test: speed=2.0`、`clock playback=6.784 speed=2.000`，随后 `speed=1.0`、`clock playback=18.495 speed=1.000`；发布节拍跟随 mpv clock，不用独立 wall-clock。
+- **seek**：`m3-test: seek target=27.723` 后实际整数秒目标为 27，日志为 `seek requested target=27.000`、`seek reset ... rc=0`、`generation=1 ... target90k=2430000`；首个新 AU 是 `pts=414720 dts=414720 key=1 idr=1`，随后 output seq=1/PTS=2430000。seek 路径为停读→`sceVideodec2Reset`→`avformat_seek_file`→BSF flush→清空槽/PTS→等待 true IDR；HEVC CRA 21 不满足 IDR gate。
+- **清晰度切换**：PPSA99352 的 `m3-test: quality-switch` 重新启动 native；新流 `320x184`，`decoder ready frame_size=0x28000`，参数集在首 AU 重注入，旧 decoder/槽先停止。未发生 crash 或 A fallback。
+
+**真实 B4 DASH 取证。** PPSA99353（pending=4）日志显示 `video_delay=4 has_b_frames=4`、`reorder=1`、`dpb=-1 depth=1`；BSF 输出的 AU 边界正常，首段为：`PTS/DTS 0/-1600`、`24030/-1072`、`11970/-528`、`6030/0`、`2970/528`、`9000/1072`、`18000/1600`（单位 90 kHz/换算后），即 DTS 解码序列单调而 display PTS 有真实 B-frame 重排；首 AU 带 SPS/PPS/IDR。VDEC 输出从前四个 pending 后出现 `valid=1 error=0 picture_count=1`，但 pending=4 在下一 AU decode 触发 `rc=-2128805632`，回退 A。
+
+- PPSA99354 设置 `WILIWILI_VDEC_PENDING_LIMIT=8` 实测约 80 s：pending 稳定为 6、`output seq` 持续单调、无 `FALLBACK_A`，`agc health` frame=600/1200/1800/2400/3000/3600/4200 均三项 0。该结果把根因收敛到真实 reorder/解码输出延迟，而不是 DASH 分片边界或 `h264_mp4toannexb` AU 切分错误。
+- **pending 决策：默认由 4 放宽为 8。** 已测无重排 H.264（峰值 0/逐 AU Flush）、P0 B1/B2/B3（≤4）和该真实 B4（实测峰值 6）；8 给出 2 帧 headroom，且数组容量同为 8。`WILIWILI_VDEC_PENDING_LIMIT` 仍可显式设为 4–8 做回归；超出 8、配对不唯一、PTS 倒退、计数/Flush 不一致仍立即回 A。PPSA99360 不设置覆盖项的默认 8 已再次运行 B4，首段达到 pending=6 并连续输出，无回退。
+
+**M3 长测。** PPSA99355 使用 `/tmp/m3-long.mp4`（660 s、640x368、H.264 8-bit `bf=0`、AAC）通过固定 HTTP URL，真机约 10 分 44 秒，视频 clock 播放到约 640 s；无提前 EOF、无末帧空转、无 `FALLBACK_A`、无 crash、无 `img-net: failed`。`agc health` 共 65 个检查点，覆盖 frame=600…38400，均 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0 vo_rc=0`；direct_mem 从约 55.6 MiB 上升到约 59.3 MiB 后稳定，峰值约 61.4 MiB，未持续增长。
+
+**M3 故障注入（当前代码）。** PPSA99356 bad-stream→`rc=-9015`；PPSA99357 中途 Reset `rc=0` 后→`rc=-9017`；PPSA99358 超窗→`rc=-9016`；PPSA99359 timeout（10 ms）→`rc=-9008`。四项各一条 `FALLBACK_A`，均有 mpv `audio active`、health 0、无崩溃。
+
+**当前 C 可用性判定。** 受保护 native 路径现在覆盖：固定 HTTP H.264 8-bit 无重排 MP4；真实 B4 H.264 DASH（已取证的 640x360 流，pending 默认 8）；mpv 音频时钟驱动、pause/resume、倍速、整数秒 seek/true-IDR 重启、参数集重注入切档；三槽 NV12→AGC 长测。仍不覆盖：HEVC 真实内容、P010/Main10/HDR、4K present、非全屏 AGC crop、任意 B-frame reorder 深度、备份 URL/网络中断恢复、EOF 后重播与随机 seek 长测；这些样本继续自动回退 A。
+
 ### 6.6 P2：可发布生产
 
-必须补齐：
+仍需补齐：
 
-- H.264/HEVC Main、DASH BSF/AU、真实 PTS/reorder；
-- pause/speed/seek/切清晰度/备份 URL/EOF/网络失败；
-- HEVC Main10 P010（若 P0 通过）、BT.2020/PQ/HLG tone-map 或明确 SDR tone-map；
-- direct frame slot + GPU fence；不确定时复制到自有 ring；
-- OSD/弹幕/字幕和 VideoOut 所有权；
-- 4K/1080p 长测、内存压力、退出/重启、native fallback 到 A；
-- 显示的是视频帧率和 PTS，不只报告 UI loop FPS。
+- HEVC Main 真实内容与更广泛 H.264/HEVC B-frame reorder；当前已取证 H.264 B4 单流和固定 H.264 8-bit。
+- 备份 URL、网络中断恢复、EOF 后重播、随机 seek/切档长测和退出/重启压力。
+- HEVC Main10 P010、BT.2020/PQ/HLG tone-map 或明确 SDR tone-map；4K present 与非全屏 crop。
+- direct frame slot 的更广泛 GPU fence 压力、字幕/VideoOut 所有权边界和生产资源预算。
+- 生产级 A/V 漂移统计；当前 M3 已用 mpv clock 发布，但未宣称任意网络/格式均可用。
 
 生产验收建议：1080p60 和 4K30/4K60 各至少 10 分钟；HEVC Main10 至少 10 分钟；随机 seek/暂停/倍速/清晰度切换；无崩溃、无黑帧/撕裂、A/V 漂移 <100 ms；默认 profile 的 GPU/AGC health 三项 0；native 不支持的样本自动回退 A。
 

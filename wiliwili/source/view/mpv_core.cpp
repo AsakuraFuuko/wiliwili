@@ -3,6 +3,11 @@
 #include <cstdio>
 
 extern "C" void wiliwili_boot_log(const char *);
+#if defined(PS5_NATIVE_APP)
+extern "C" void wiliwili_vdec_play_pause(int paused);
+extern "C" void wiliwili_vdec_play_stop(void);
+extern "C" int wiliwili_vdec_play_seek(double seconds);
+#endif
 //
 
 // Created by fang on 2022/8/12.
@@ -1590,19 +1595,56 @@ void MPVCore::setVolume(const std::string &value) {
 
 int64_t MPVCore::getVolume() const { return this->volume; }
 
-void MPVCore::resume() { command_async("set", "pause", "no"); }
+void MPVCore::resume() {
+    command_async("set", "pause", "no");
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_pause(0);
+#endif
+}
 
-void MPVCore::pause() { command_async("set", "pause", "yes"); }
+void MPVCore::pause() {
+    command_async("set", "pause", "yes");
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_pause(1);
+#endif
+}
 
-void MPVCore::stop() { command_async("stop"); }
+void MPVCore::stop() {
+    command_async("stop");
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_stop();
+#endif
+}
 
-void MPVCore::seek(int64_t p) { command_async("seek", p, "absolute"); }
+void MPVCore::seek(int64_t p) {
+    command_async("seek", p, "absolute");
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_seek((double)p);
+#endif
+}
 
-void MPVCore::seek(const std::string &p) { command_async("seek", p, "absolute"); }
+void MPVCore::seek(const std::string &p) {
+    command_async("seek", p, "absolute");
+#if defined(PS5_NATIVE_APP)
+    char *end = nullptr;
+    const double seconds = std::strtod(p.c_str(), &end);
+    if (end != p.c_str() && end != nullptr && *end == '\0') wiliwili_vdec_play_seek(seconds);
+#endif
+}
 
-void MPVCore::seekRelative(int64_t p) { command_async("seek", p, "relative"); }
+void MPVCore::seekRelative(int64_t p) {
+    command_async("seek", p, "relative");
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_seek(playback_time + (double)p);
+#endif
+}
 
-void MPVCore::seekPercent(double p) { command_async("seek", p * 100, "absolute-percent"); }
+void MPVCore::seekPercent(double p) {
+    command_async("seek", p * 100, "absolute-percent");
+#if defined(PS5_NATIVE_APP)
+    if (duration > 0) wiliwili_vdec_play_seek((double)duration * p);
+#endif
+}
 
 bool MPVCore::isStopped() const { return video_stopped; }
 

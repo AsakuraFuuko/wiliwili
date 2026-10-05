@@ -5,6 +5,7 @@
 #include <limits>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 
 #include <borealis/views/label.hpp>
 #include <borealis/views/progress_spinner.hpp>
@@ -37,11 +38,11 @@
 #include "view/mpv_core.hpp"
 
 #if defined(PS5_NATIVE_APP)
-extern "C" int wiliwili_vdec_play_start(const char *url);
+extern "C" int wiliwili_vdec_play_start(const char *url, int start_seconds);
 extern "C" int wiliwili_vdec_play_is_active(void);
 extern "C" void wiliwili_vdec_play_stop(void);
-extern "C" void wiliwili_vdec_play_pause(int paused);
-extern "C" int wiliwili_vdec_play_draw(void);
+extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int paused);
+extern "C" void wiliwili_boot_log(const char *message);
 #endif
 
 enum ClickState { IDLE = 0, PRESS = 1, FAST_RELEASE = 3, FAST_PRESS = 4, CLICK_DOUBLE = 5 };
@@ -163,9 +164,10 @@ VideoView::VideoView() {
         brls::Logger::verbose("Set progress: {}", progress);
         this->showOSD(true);
         this->showThumbnailPreview = false;
+        const double target = real_duration > 0 ? (double)real_duration * progress : (double)mpvCore->duration * progress;
         if (real_duration > 0) {
             // 当设置了视频时长数据
-            mpvCore->seek((float)real_duration * progress);
+            mpvCore->seek((float)target);
         } else {
             mpvCore->seekPercent(progress);
         }
@@ -625,6 +627,51 @@ void VideoView::requestSeeking(int seek, int delay) {
         });
     }
 }
+void VideoView::runNativeVdecAutotest() {
+#if defined(PS5_NATIVE_APP)
+    if (!native_vdec_autotest || !native_vdec_mpv_suppressed) return;
+    const uint64_t now = brls::getCPUTimeUsec();
+    if (native_vdec_autotest_start_us == 0) {
+        native_vdec_autotest_start_us = now;
+        wiliwili_boot_log("m3-test: start");
+    }
+    const uint64_t elapsed_ms = (now - native_vdec_autotest_start_us) / 1000;
+    if (native_vdec_autotest_stage == 0 && elapsed_ms >= 5000) {
+        wiliwili_boot_log("m3-test: pause");
+        this->pause();
+        native_vdec_autotest_stage = 1;
+    } else if (native_vdec_autotest_stage == 1 && elapsed_ms >= 8000) {
+        wiliwili_boot_log("m3-test: resume");
+        this->resume();
+        native_vdec_autotest_stage = 2;
+    } else if (native_vdec_autotest_stage == 2 && elapsed_ms >= 10000) {
+        wiliwili_boot_log("m3-test: speed=2.0");
+        this->setSpeed(2.0f);
+        native_vdec_autotest_stage = 3;
+    } else if (native_vdec_autotest_stage == 3 && elapsed_ms >= 16000) {
+        wiliwili_boot_log("m3-test: speed=1.0");
+        this->setSpeed(1.0f);
+        native_vdec_autotest_stage = 4;
+    } else if (native_vdec_autotest_stage == 4 && elapsed_ms >= 20000) {
+        double target = mpvCore->getPlaybackTime() + 5.0;
+        if (mpvCore->duration > 0 && target >= mpvCore->duration) target = (double)mpvCore->duration / 2.0;
+        char line[128];
+        std::snprintf(line, sizeof(line), "m3-test: seek target=%.3f", target);
+        wiliwili_boot_log(line);
+        mpvCore->seek((int64_t)target);
+        native_vdec_autotest_stage = 5;
+    } else if (native_vdec_autotest_stage == 5 && elapsed_ms >= 28000) {
+        const char *switch_url = std::getenv("WILIWILI_VDEC_SWITCH_URL");
+        if (switch_url != nullptr && switch_url[0] != '\0' && !native_vdec_autotest_switch_done) {
+            wiliwili_boot_log("m3-test: quality-switch");
+            native_vdec_autotest_switch_done = true;
+            this->setUrl(switch_url, 0, -1);
+        }
+        native_vdec_autotest_stage = 6;
+    }
+#endif
+}
+
 
 VideoView::~VideoView() {
     brls::Logger::debug("trying delete VideoView...");
@@ -646,11 +693,13 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     // VideoView is the normal video layer: native NV12 first, NanoVG OSD/danmaku after it.
     bool nativeVideo = false;
 #if defined(PS5_NATIVE_APP)
+    runNativeVdecAutotest();
     if (this->native_vdec_mpv_suppressed && !wiliwili_vdec_play_is_active()) {
         mpvCore->command_async("set", "vid", "auto");
         this->native_vdec_mpv_suppressed = false;
     }
-    if (this->native_vdec_mpv_suppressed) nativeVideo = wiliwili_vdec_play_draw() != 0;
+    if (this->native_vdec_mpv_suppressed)
+        nativeVideo = wiliwili_vdec_play_draw(mpvCore->getPlaybackTime(), mpvCore->getSpeed(), mpvCore->isPaused()) != 0;
 #endif
     if (!nativeVideo) mpvCore->draw(brls::Rect(x, y, width, height), alpha);
 
@@ -851,7 +900,9 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
     bool nativeVdec = false;
 #if defined(PS5_NATIVE_APP)
-    if (url.rfind("edl://", 0) != 0) nativeVdec = wiliwili_vdec_play_start(url.c_str()) != 0;
+    if (url.rfind("edl://", 0) != 0) nativeVdec = wiliwili_vdec_play_start(url.c_str(), start) != 0;
+    if (nativeVdec && !native_vdec_autotest && std::getenv("WILIWILI_VDEC_AUTOTEST") != nullptr)
+        native_vdec_autotest = true;
     if (!nativeVdec && this->native_vdec_mpv_suppressed) {
         mpvCore->command_async("set", "vid", "auto");
         this->native_vdec_mpv_suppressed = false;
@@ -906,23 +957,14 @@ void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) 
 
 void VideoView::resume() {
     mpvCore->resume();
-#if defined(PS5_NATIVE_APP)
-    wiliwili_vdec_play_pause(0);
-#endif
 }
 
 void VideoView::pause() {
     mpvCore->pause();
-#if defined(PS5_NATIVE_APP)
-    wiliwili_vdec_play_pause(1);
-#endif
 }
 
 void VideoView::stop() {
-#if defined(PS5_NATIVE_APP)
-    wiliwili_vdec_play_stop();
     this->native_vdec_mpv_suppressed = false;
-#endif
     mpvCore->stop();
 }
 

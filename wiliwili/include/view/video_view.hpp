@@ -368,6 +368,10 @@ private:
 
     MPVCore* mpvCore;
     bool native_vdec_mpv_suppressed = false;
+    bool native_vdec_autotest = false;
+    bool native_vdec_autotest_switch_done = false;
+    int native_vdec_autotest_stage = 0;
+    uint64_t native_vdec_autotest_start_us = 0;
     brls::Rect oldRect = brls::Rect(-1, -1, -1, -1);
 
     /**
@@ -376,6 +380,7 @@ private:
      * @param delay 请求的延迟触发时间，当值为 0 时立刻跳转
      */
     void requestSeeking(int seek, int delay = 400);
+    void runNativeVdecAutotest();
 
     bool is_seeking     = false;  // 是否正在请求跳转
     int seeking_range   = 0;      // 跳转的目标进度, 跳转结束后归零
