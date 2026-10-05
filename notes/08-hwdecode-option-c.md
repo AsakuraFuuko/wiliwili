@@ -448,7 +448,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 |PPSA99413|`BV1Da411Y7U4` / `584421165` / 360p|H.264 DASH B4，`video_delay=4 has_b_frames=4`|8、7|显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 通过；`presented=4200`，`dropped=0`，error/order=0，无回退|8 个 health 全 0；峰值 55,276,544 bytes|
 |PPSA99403|`BV1MSHY6eEq9` / `42417522439` / 480p|H.264 DASH B3，`video_delay=3 has_b_frames=3`|7、5|通过；`presented=4200`，`dropped=0`，error/order=0，无回退|8 个 health 全 0；峰值 3,882,752 bytes|
 |PPSA99405|`BV1AM4y1M71p` / `364849402` / 720p|普通 HTTP MP4，H.264，`video_delay=4 has_b_frames=4`|8、5|通过；`presented=4080`，`dropped=0`，error/order=0，无回退|8 个 health 全 0；峰值 55,312,640 bytes|
-|PPSA99409|`BV1MSHY6eEq9` / `42417522439` / 480p|HEVC Main DASH，`video_delay=4 has_b_frames=4`|8、5|通过；`presented=3960`，`dropped=0`，error/order=0；pause/resume、2x→1x、seek generation=1、EOF replay 均继续输出|10 个 health 全 0；峰值 55,723,008 bytes|
+|PPSA99417|`BV1MSHY6eEq9` / `42417522439` / 480p|HEVC Main DASH，`video_delay=4 has_b_frames=4`|8、5|最终代码显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 通过；`presented=3960`，`dropped=0`，error/order=0；pause/resume、2x→1x、seek（demux rc=-5 后 sequential-forward→true IDR）、EOF replay 均继续输出|10 个 health 全 0；峰值 55,723,008 bytes|
 |PPSA99410|`BV1J7411374q` / `151345597` / 1080p|普通 HTTP MP4，H.264，`video_delay=2 has_b_frames=2`|6、5|反例；约 60 s 后 BSF `rc=-1094995529`，`FALLBACK_A`，此前 `presented=3480`、`dropped=0`|health 全 0；峰值 3,461,376 bytes|
 
 因此实验自适应集为 4 条通过、1 条回退；通过集没有顺序异常，但全集存在回退，**默认不改为自适应**。默认 4 下 PPSA99411 真实 B4 与 PPSA99412 真实 B3 均在第 5 AU `rc=-2128805632`→`FALLBACK_A`，health 仍全 0；B3/B4 继续由 A 接管。
