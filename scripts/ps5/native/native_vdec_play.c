@@ -35,8 +35,10 @@ extern void wiliwili_boot_log(const char *message);
 
 enum {
     VDEC_PLAY_SLOTS = 3,
-    VDEC_PLAY_PENDING_LIMIT = 8,
+    VDEC_PLAY_PENDING_MIN = 4,
+    VDEC_PLAY_PENDING_LIMIT = 4,
     VDEC_PLAY_PENDING_CAP = 8,
+    VDEC_PLAY_CLOCK_JUMP_90K = 90000,
     VDEC_PLAY_AU_BYTES = 0x800000,
     VDEC_PLAY_TIMEOUT_MS_DEFAULT = 250,
     VDEC_PLAY_MAX_FLUSH = 32,
@@ -148,7 +150,7 @@ typedef struct {
     int timeout_ms, flush_each_decode, trace_au, pending_limit;
     volatile int paused;
     volatile int seek_requested;
-    int active, fallback, failure_logged, resources_live, decoder_ready, source_eof;
+    int active, fallback, failure_logged, resources_live, decoder_ready, source_eof, reopen_media;
     int current_slot, ready_queue[VDEC_PLAY_SLOTS], ready_count, present_pending;
     double seek_seconds;
     uint64_t seek_generation;
@@ -899,7 +901,16 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             break;
         }
         const int read_rc = av_read_frame(media->format, input);
-        if (read_rc == AVERROR_EOF) break;
+        if (read_rc == AVERROR_EOF) {
+            pthread_mutex_lock(&s->mutex);
+            s->source_eof = 1;
+            const uint64_t inputs = s->input_count;
+            const uint64_t outputs = s->output_count;
+            pthread_mutex_unlock(&s->mutex);
+            play_logf("vdec-play: demux EOF inputs=%llu outputs=%llu", (unsigned long long)inputs,
+                      (unsigned long long)outputs);
+            break;
+        }
         if (read_rc < 0) {
             if (__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
                 result = VDEC_PLAY_RESULT_SEEK;
@@ -995,8 +1006,11 @@ static void play_wait_if_paused(VdecPlaySession *s) {
 
 static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     double seconds = 0.0;
+    int reopen_media = 0;
     pthread_mutex_lock(&s->mutex);
     seconds = s->seek_seconds;
+    reopen_media = s->source_eof || s->reopen_media;
+    s->reopen_media = 0;
     s->seek_requested = 0;
     while (s->present_pending && !play_stop_requested(s) && !s->fallback)
         pthread_cond_wait(&s->condition, &s->mutex);
@@ -1005,18 +1019,38 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     if (cancelled) return -1;
 
     int32_t rc = sceVideodec2Reset(s->decoder.decoder);
-    play_logf("vdec-play: seek reset target=%.3f rc=%d", seconds, rc);
+    play_logf("vdec-play: seek reset target=%.3f rc=%d reopen=%d", seconds, rc, reopen_media);
     if (rc != 0) {
         play_fail(s, "seek-reset", rc);
         return -1;
     }
+    if (reopen_media) {
+        /* A completed HTTP/MP4 input may leave its AVIO demuxer non-seekable after EOF.
+         * Reopen it for replay; ordinary seeks keep the existing demuxer and seek path. */
+        play_media_close(media);
+        if (play_media_open(s, media) != 0) {
+            play_fail(s, "replay-open", -9022);
+            return -1;
+        }
+        if (media->codec != s->decoder.codec || media->stream->codecpar->width != s->decoder.visible_width ||
+            media->stream->codecpar->height != s->decoder.visible_height) {
+            play_media_close(media);
+            play_fail(s, "replay-format", -9023);
+            return -1;
+        }
+        s->flush_each_decode = !media->has_reorder;
+        play_logf("vdec-play: replay media reopened codec=%u size=%dx%d flush_each_decode=%d", media->codec,
+                  media->stream->codecpar->width, media->stream->codecpar->height, s->flush_each_decode);
+    }
     const int64_t target90k = (int64_t)llround(seconds * 90000.0);
     const int64_t target = av_rescale_q(target90k, (AVRational){1, 90000}, media->time_base);
-    rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, target, target, 0);
-    if (rc < 0) {
-        play_log_av_error("seek", rc);
-        play_fail(s, "seek-demux", rc);
-        return -1;
+    if (!reopen_media || target90k != 0) {
+        rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, target, target, 0);
+        if (rc < 0) {
+            play_log_av_error("seek", rc);
+            play_fail(s, "seek-demux", rc);
+            return -1;
+        }
     }
     av_bsf_flush(media->bsf);
     pthread_mutex_lock(&s->mutex);
@@ -1036,6 +1070,7 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     s->peak_pending_count = 0;
     s->last_output_pts = INT64_MIN;
     s->last_pts = 0;
+    s->last_clock_pts = INT64_MIN;
     s->awaiting_idr = 1;
     s->sps_seen = 0;
     s->pps_seen = 0;
@@ -1086,24 +1121,38 @@ static void *play_thread_main(void *opaque) {
                 break;
             }
             result = play_media_loop(s, &media);
-            if (result != VDEC_PLAY_RESULT_SEEK) break;
+            if (result == VDEC_PLAY_RESULT_SEEK) {
+                if (play_restart_after_seek(s, &media) != 0) {
+                    result = -1;
+                    break;
+                }
+                continue;
+            }
+            if (result != VDEC_PLAY_RESULT_OK || play_stop_requested(s) || s->fallback) break;
+
+            pthread_mutex_lock(&s->mutex);
+            if (s->input_count == 0 || s->output_count != s->accepted_count || s->pending_count != 0) {
+                play_fail_locked(s, "stream-count-mismatch", -9019);
+                pthread_mutex_unlock(&s->mutex);
+                result = -1;
+                break;
+            }
+            s->source_eof = 1;
+            const uint64_t inputs = s->input_count;
+            const uint64_t accepted = s->accepted_count;
+            const uint64_t outputs = s->output_count;
+            play_logf("vdec-play: EOF inputs=%llu accepted=%llu outputs=%llu", (unsigned long long)inputs,
+                      (unsigned long long)accepted, (unsigned long long)outputs);
+            while (!play_stop_requested(s) && !s->fallback && !s->seek_requested)
+                pthread_cond_wait(&s->condition, &s->mutex);
+            const int restart = !play_stop_requested(s) && !s->fallback && s->seek_requested;
+            pthread_mutex_unlock(&s->mutex);
+            if (!restart) break;
             if (play_restart_after_seek(s, &media) != 0) {
                 result = -1;
                 break;
             }
         }
-    }
-    if (result == 0 && !play_stop_requested(s) && !s->fallback) {
-        pthread_mutex_lock(&s->mutex);
-        if (s->input_count == 0 || s->output_count != s->accepted_count || s->pending_count != 0)
-            play_fail_locked(s, "stream-count-mismatch", -9019);
-        else {
-            s->source_eof = 1;
-            play_logf("vdec-play: EOF inputs=%llu accepted=%llu outputs=%llu",
-                      (unsigned long long)s->input_count, (unsigned long long)s->accepted_count,
-                      (unsigned long long)s->output_count);
-        }
-        pthread_mutex_unlock(&s->mutex);
     }
     play_media_close(&media);
     pthread_mutex_lock(&s->mutex);
@@ -1122,7 +1171,7 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->resources_live = 0;
     s->decoder_ready = 0;
     s->source_eof = 0;
-    s->current_slot = -1;
+    s->reopen_media = 0;
     s->ready_count = 0;
     s->present_pending = 0;
     s->timeout_ms = VDEC_PLAY_TIMEOUT_MS_DEFAULT;
@@ -1203,11 +1252,13 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     const char *pending_limit = getenv("WILIWILI_VDEC_PENDING_LIMIT");
     if (pending_limit != NULL) {
         const int requested_limit = atoi(pending_limit);
-        if (requested_limit >= VDEC_PLAY_PENDING_LIMIT && requested_limit <= VDEC_PLAY_PENDING_CAP)
+        if (requested_limit >= VDEC_PLAY_PENDING_MIN && requested_limit <= VDEC_PLAY_PENDING_CAP) {
             s->pending_limit = requested_limit;
+            play_logf("vdec-play: pending_limit override=%d", s->pending_limit);
+        } else {
+            play_logf("vdec-play: pending_limit request=%d rejected; keep=%d", requested_limit, s->pending_limit);
+        }
     }
-    if (pending_limit != NULL && s->pending_limit == VDEC_PLAY_PENDING_LIMIT)
-        play_logf("vdec-play: pending_limit request=%d rejected; keep=%d", atoi(pending_limit), s->pending_limit);
     if (start_seconds > 0) {
         s->seek_requested = 1;
         s->seek_seconds = start_seconds;
@@ -1238,6 +1289,7 @@ int wiliwili_vdec_play_seek(double seconds) {
         return 0;
     }
     s->seek_seconds = seconds;
+    s->last_clock_pts = INT64_MIN;
     s->seek_requested = 1;
     pthread_cond_broadcast(&s->condition);
     pthread_mutex_unlock(&s->mutex);
@@ -1284,12 +1336,30 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused) {
         play_logf("vdec-play: clock playback=%.3f speed=%.3f paused=%d", playback_time, speed, paused != 0);
         s->last_logged_speed = speed;
     }
+    /* mpv may reload its separate audio file at EOF and reset playback-time; restart the
+     * native timeline instead of leaving the decoder blocked behind stale READY frames. */
+    if (s->last_clock_pts != INT64_MIN && llabs(clock_pts90k - s->last_clock_pts) > VDEC_PLAY_CLOCK_JUMP_90K &&
+        !s->seek_requested) {
+        const int64_t previous_clock = s->last_clock_pts;
+        s->seek_seconds = playback_time;
+        if (clock_pts90k < previous_clock && clock_pts90k <= VDEC_PLAY_CLOCK_JUMP_90K)
+            s->reopen_media = 1;
+        s->seek_requested = 1;
+        s->last_clock_pts = INT64_MIN;
+        pthread_cond_broadcast(&s->condition);
+        play_logf("vdec-play: clock discontinuity old90k=%lld new90k=%lld; seek requested target=%.3f reopen=%d",
+                  (long long)previous_clock, (long long)clock_pts90k, playback_time, s->reopen_media);
+        pthread_mutex_unlock(&s->mutex);
+        return 1;
+    }
     s->last_clock_pts = clock_pts90k;
     int candidate = -1;
     for (int i = 0; i < s->ready_count; ++i) {
         const int ready_slot = s->ready_queue[i];
-        if ((!paused && s->slots[ready_slot].pts90k <= clock_pts90k) || (s->current_slot < 0 && i == 0))
+        if ((!paused && s->slots[ready_slot].pts90k <= clock_pts90k) || (s->current_slot < 0 && i == 0)) {
             candidate = i;
+            break;
+        }
     }
     if (candidate >= 0) {
         for (int i = 0; i < candidate; ++i) {

@@ -38,6 +38,7 @@
 #include "view/mpv_core.hpp"
 
 #if defined(PS5_NATIVE_APP)
+extern "C" int wiliwili_vdec_play_enabled(void);
 extern "C" int wiliwili_vdec_play_start(const char *url, int start_seconds);
 extern "C" int wiliwili_vdec_play_is_active(void);
 extern "C" void wiliwili_vdec_play_stop(void);
@@ -900,6 +901,7 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
     bool nativeVdec = false;
 #if defined(PS5_NATIVE_APP)
+    if (wiliwili_vdec_play_enabled()) mpvCore->reset();
     if (url.rfind("edl://", 0) != 0) nativeVdec = wiliwili_vdec_play_start(url.c_str(), start) != 0;
     if (nativeVdec && !native_vdec_autotest && std::getenv("WILIWILI_VDEC_AUTOTEST") != nullptr)
         native_vdec_autotest = true;
