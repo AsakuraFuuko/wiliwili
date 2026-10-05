@@ -433,17 +433,35 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 
 **M3 故障注入（当前代码）。** PPSA99356 bad-stream→`rc=-9015`；PPSA99357 中途 Reset `rc=0` 后→`rc=-9017`；PPSA99358 超窗→`rc=-9016`；PPSA99359 timeout（10 ms）→`rc=-9008`。四项各一条 `FALLBACK_A`，均有 mpv `audio active`、health 0、无崩溃。
 
-**当前 C 可用性判定。** 双门控 native 路径默认覆盖：固定 HTTP H.264 8-bit 无重排 MP4，以及 P0 已验证的 unknown-DTS H.264/HEVC B1/B2/B3 配对契约；mpv 音频时钟驱动、pause/resume、倍速、整数秒 seek/true-IDR 重启、参数集重注入切档和三槽 NV12→AGC 均有真机证据。真实 H.264 B4 DASH 已取证：显式 `pending_limit=8` 可覆盖这条流，但默认 4 会按设计 `FALLBACK_A`，因此 B4 仍是实验支持而非默认可用内容。仍不覆盖：HEVC 真实播放验收、P010/Main10/HDR、4K present、非全屏 AGC crop、任意更深 B-frame reorder、备份 URL/网络中断恢复、EOF 后重播压力和随机 seek 长测；不满足 gate 的样本继续自动回退 A。
+**当前 C 可用性判定。** 默认双门控 native 路径保持 `pending_limit=4`，可靠覆盖为固定 HTTP H.264 8-bit 无重排样本及已有 P0 的安全配对契约；真实 B3/B4 DASH、HEVC Main 480p 和普通 720p B 帧样本均已在显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 下通过，但默认 4 会按 gate 回退 A。普通 1080p MP4 在自适应实验中还出现 BSF 数据错误并回退，因此不能把自适应称为默认生产路径。M4 已补齐 HEVC Main 真实播放、pause、倍速、seek、EOF replay 的实验收据；仍不覆盖 P010/Main10/HDR、4K present、非全屏 AGC crop、任意更深 reorder、备份 URL/网络中断恢复和生产级 A/V 漂移统计。
+
+#### 6.5.3 M4：按流重排信息自适应 pending
+
+- **策略实现**：FFmpeg `AVStream::codecpar->video_delay` 与探针 `AVCodecContext::has_b_frames` 均已知且一致时，实验自适应采用 `limit = video_delay + 4`（无重排取 floor 4），硬上限 12；未知、负值、字段不一致或异常过大回退 4。初版 `video_delay + 2` 在 PPSA99401 的真实 B4 上取 limit=6，于第 7 个 AU 触发 VDEC `rc=-2128805632`；`+4` 是由真实 B4 pending 峰值 6–7 的窗口证据导出的余量。
+- **最终安全默认**：由于语料集中 PPSA99410 的普通 1080p MP4 在约 60 s 后发生 BSF `rc=-1094995529`→`FALLBACK_A`，本轮不能把自适应策略宣称为默认安全策略。最终代码默认 `pending_limit=4`（日志 `policy=fixed reason=fixed-safe-default`）；只有显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 才启用上述按流自适应。`WILIWILI_VDEC_PENDING_LIMIT=4..12` 仍可显式覆盖实验值。
+- 启动日志记录 `pending policy`、实际 `limit`、`video_delay`、`has_b_frames`、理由；呈现/FALLBACK_A/EOF 日志记录 `limit`、pending 峰值、输入/接受/输出、error/order_errors。既有 min-PTS、`error=0`、`picture_count=1`、严格递增 PTS、计数一致、Decode/Flush 超时和 Flush 上限安全网不变。
+
+**M4 真实 B 站语料（每条监听约 75 s；URL 只作当次签名来源，复现使用 BV/cid/清晰度）。**
+
+|标题|BV/cid、内容|格式/探针|实验 limit、pending 峰值|结果|health/direct_mem|
+|---|---|---|---|---|---|
+|PPSA99413|`BV1Da411Y7U4` / `584421165` / 360p|H.264 DASH B4，`video_delay=4 has_b_frames=4`|8、7|显式 `WILIWILI_VDEC_ADAPTIVE_PENDING=1` 通过；`presented=4200`，`dropped=0`，error/order=0，无回退|8 个 health 全 0；峰值 55,276,544 bytes|
+|PPSA99403|`BV1MSHY6eEq9` / `42417522439` / 480p|H.264 DASH B3，`video_delay=3 has_b_frames=3`|7、5|通过；`presented=4200`，`dropped=0`，error/order=0，无回退|8 个 health 全 0；峰值 3,882,752 bytes|
+|PPSA99405|`BV1AM4y1M71p` / `364849402` / 720p|普通 HTTP MP4，H.264，`video_delay=4 has_b_frames=4`|8、5|通过；`presented=4080`，`dropped=0`，error/order=0，无回退|8 个 health 全 0；峰值 55,312,640 bytes|
+|PPSA99409|`BV1MSHY6eEq9` / `42417522439` / 480p|HEVC Main DASH，`video_delay=4 has_b_frames=4`|8、5|通过；`presented=3960`，`dropped=0`，error/order=0；pause/resume、2x→1x、seek generation=1、EOF replay 均继续输出|10 个 health 全 0；峰值 55,723,008 bytes|
+|PPSA99410|`BV1J7411374q` / `151345597` / 1080p|普通 HTTP MP4，H.264，`video_delay=2 has_b_frames=2`|6、5|反例；约 60 s 后 BSF `rc=-1094995529`，`FALLBACK_A`，此前 `presented=3480`、`dropped=0`|health 全 0；峰值 3,461,376 bytes|
+
+因此实验自适应集为 4 条通过、1 条回退；通过集没有顺序异常，但全集存在回退，**默认不改为自适应**。默认 4 下 PPSA99411 真实 B4 与 PPSA99412 真实 B3 均在第 5 AU `rc=-2128805632`→`FALLBACK_A`，health 仍全 0；B3/B4 继续由 A 接管。
 
 ### 6.6 P2：可发布生产
 
 仍需补齐：
 
-- HEVC Main 真实内容与更广泛 H.264/HEVC B-frame reorder；当前已取证 H.264 B4 单流和固定 H.264 8-bit。
-- 备份 URL、网络中断恢复、EOF 后重播、随机 seek/切档长测和退出/重启压力。
+- 默认 pending=4 下更广泛真实 H.264/HEVC B-frame reorder；当前 B3/B4/HEVC Main/720p 仅为显式 adaptive 实验通过，默认仍回退 A。
+- 备份 URL、网络中断恢复、EOF 后重播压力、随机 seek/切档长测和退出/重启压力。
 - HEVC Main10 P010、BT.2020/PQ/HLG tone-map 或明确 SDR tone-map；4K present 与非全屏 crop。
 - direct frame slot 的更广泛 GPU fence 压力、字幕/VideoOut 所有权边界和生产资源预算。
-- 生产级 A/V 漂移统计；当前 M3 已用 mpv clock 发布，但未宣称任意网络/格式均可用。
+- 生产级 A/V 漂移统计；M4 已用 mpv clock 验证实验路径，但未宣称任意网络/格式均可用。
 
 生产验收建议：1080p60 和 4K30/4K60 各至少 10 分钟；HEVC Main10 至少 10 分钟；随机 seek/暂停/倍速/清晰度切换；无崩溃、无黑帧/撕裂、A/V 漂移 <100 ms；默认 profile 的 GPU/AGC health 三项 0；native 不支持的样本自动回退 A。
 
