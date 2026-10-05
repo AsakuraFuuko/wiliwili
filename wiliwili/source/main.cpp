@@ -268,7 +268,11 @@ int main(int argc, char *argv[]) {
 #if defined(PS5_NATIVE_APP)
             {
                 const char *vdec = getenv("WILIWILI_TEST_VDEC");
-                if (vdec != nullptr && vdec[0] != '\0') wiliwili_videodec2_probe();
+                const char *agc_m1 = getenv("WILIWILI_VDEC_AGC");
+                if (vdec != nullptr && vdec[0] != '\0' && (agc_m1 == nullptr || agc_m1[0] == '\0'))
+                    wiliwili_videodec2_probe();
+                /* VDEC_AGC selects the static NV12 M1 frame hook; do not also
+                 * spend startup time running the decoder-only P0 probe. */
                 /* 诊断：直接触发 MPVCore::init()。这正是"点播放"崩掉的那一步
                  * （mpv 在 app slot 里不可用），用来确认桩化之后不再崩。 */
                 if (getenv("WILIWILI_TEST_MPV") != nullptr) {

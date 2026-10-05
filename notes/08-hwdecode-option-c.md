@@ -11,11 +11,11 @@
 |问题|结论|
 |---|---|
 |C 能否带来 A 没有的能力？|能。硬解路径有机会覆盖 4K、HEVC Main、P010/Main10，并显著释放 CPU；A 只能优化 SW YUV→RGBA/缩放。|
-|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate 已通过（固定 `dts=UINT64_MAX` 契约），但 4K Main10、NV12/P010 呈现、4K60 时钟和长测仍未验证；只能进入受 watchdog/fallback 保护的 8-bit P1。|
-|NV12/P010 能否接现有 AGC？|接口形状已经具备：`evo_agc_blit_yuv()` 接受 NV12/planar/P010 参数，writer 有 R8/RG8/R16/RG16 T# 描述符。但当前 native 工作树的 video pipe 资源由 `EVO_AGC_HAVE_VIDEO_PIPES` 门控，`evo_agc_pipes.h` 当前只包含 UI pipe；还不是可直接接入的生产链路。|
+|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate 已通过；M1 静态 8-bit NV12→AGC→scanout 已在真机通过，但固定 URL M2、A/V 时钟、4K60、P010/HDR 和长测仍未验证。|
+|NV12/P010 能否接现有 AGC？|M1 已导入并验证 GPL-3.0 的预编译 8-bit NV12 pipe：静态 NV12 经 `evo_agc_blit_yuv()` 进入当前 scanout；HDR/planar/upscaler pipe 仍未导入。|
 |VideoOut 是否能直接注册 NV12/P010 扫描面？|没有证据，按不可行处理。公开/仓库内 API 只显示单一 RGB/BGRA buffer + 两个 scanout buffer，没有 YUV plane/CSC 注册接口。NV12 必须先由 AGC/GL shader 转成最终 BGRA/RGB scanout。|
 |能否保留 mpv？|能保留 mpv 的音频、时钟、pause/speed/property/UI 状态；视频压缩流不能继续让 mpv 读取，否则会重复下载。视频需要独立 FFmpeg demux/BSF → `sceVideodec2` → present。|
-|推荐顺序|保留当前 A；C 进入 8-bit NV12 P1，独立 FFmpeg demux/BSF + display PTS + `dts=UINT64_MAX` + Flush/Reset/IDR watchdog；present/seek/切档任一步失败立即回退 A。|
+|推荐顺序|保留当前 A；M1 已通过，继续做固定 URL M2：FFmpeg demux/BSF + display PTS + `dts=UINT64_MAX` + VDEC 三槽 + NV12 AGC；任一步 watchdog/fence/present 失败立即回退 A。|
 
 ## 2. 现状盘点
 
@@ -88,7 +88,7 @@ ABI 参考给出的 Create 尺寸档位是 `1920×1088`、`2560×1440`、`3840×
 1. AGC runtime API 已经定义了 `EVO_AGC_PIPE_VIDEO_NV12`、`VIDEO_HDR`、`VIDEO_HLG`、`VIDEO_PLANAR`，并暴露 `evo_agc_blit_yuv(y, y_pitch, uv, uv_pitch, u, u_pitch, v, v_pitch, coded_w, coded_h, disp_w, disp_h, view_mode, ten_bit, color_trc, is_direct, pts_us)`，见 `library/borealis/library/include/borealis/extern/nanovg/agc/evo_agc_runtime.h:14-20,305-314`。
 2. `evo_agc_runtime.c:3402-3650` 已有选 pipe、计算 crop/scale、构造 Y/UV 或 planar descriptor、记录 quad、标记 video PTS 的实现；`stage_plane()` 在 `:2532-2609` 对 256B 对齐且 direct 的源可直接把 CPU VA 当 GPU 地址，否则复制到 transient ring。
 3. AGC writer 有 R8/RG8/R16/RG16 T# builder，见 `library/borealis/library/lib/extern/nanovg/agc/evo_agc_writer.c:109-195`。这正好覆盖 NV12 的 Y/R8 + UV/RG8 和 P010 的 16-bit 平面。
-4. 这不是运行时 GLSL。`evo_agc_runtime.c:536-663` 通过预编译 shader metadata/ISA 调 `sceAgcCreateShader()` + `sceAgcLinkShaders()`；`evo_agc_pipes.h:1-6` 当前只包含 UI pipe 头。video pipe 编译由 `EVO_AGC_HAVE_VIDEO_PIPES` 门控，见 `evo_agc_runtime.c:1170-1200`；当前 native 对象 flags 没有该宏，当前工作树也没有 `video_yuv_*_pipe.h` 生成文件。故“API 有”不等于“当前 PPSA99233 已能调用 NV12 AGC pipe”。
+4. 这不是运行时 GLSL。`evo_agc_runtime.c` 通过预编译 shader metadata/ISA 调 `sceAgcCreateShader()` + `sceAgcLinkShaders()`；M1 将 `EVO_AGC_HAVE_VIDEO_PIPES` 限定为本地 8-bit NV12 生成头，运行时只注册 `EVO_AGC_PIPE_VIDEO_NV12`；HDR/planar/upscaler 生成文件仍缺失，不能宣称完整 video pipe 集合。
 5. `library/borealis/library/lib/extern/nanovg/nanovg_agc.cpp:232-344` 的 NanoVG backend 只把 UI geometry 绑定到 `EVO_AGC_PIPE_UI` 并写 T#/S# descriptor；它没有 GLSL 编译或通用 shader 注入入口。视频应走 runtime 的独立 `evo_agc_blit_yuv()`，不是给 NanoVG image handle 换一个像素格式。
 
 需要改的文件/模块：
@@ -356,8 +356,21 @@ at EOF: Flush until valid == 0; require pending_pts empty
 #### 6.3.6 闸门结论
 
 **PTS/reorder 闸门通过，C 可以进入 P1，但必须固定调用契约：真实 display PTS + `dts=UINT64_MAX`，不能把 FFmpeg decode DTS 传给 `sceVideodec2`。** H.264 的真实-DTS 反例证明了该约束不是优化项。P1 仍只做 8-bit NV12、真实 IDR seek、Flush/Reset、PTS watchdog 和失败回退 A；不能把本实验写成已完成 4K60 present、HDR 或 GPU zero-copy。
+### 6.4 P1 M1：静态 NV12 → AGC shader CSC → scanout（2026-10-05）
 
-### 6.4 P1：固定 URL、8-bit NV12、无复杂交互
+**实现。** 本地新增 `library/borealis/library/lib/extern/nanovg/agc/shaders/video_yuv_nv12_pipe.h`，只复用 EVO-PLAYER-PS5 GPL-3.0 的已生成 gfx1013 ISA/寄存器 artifact；本仓库同为 GPL-3.0。没有复制参考播放器的运行时实现，M1 的门控、静态图案、生命周期和失败检查由本仓库自实现。`evo_agc_pipes.h` 定义 `EVO_AGC_HAVE_VIDEO_PIPES`，但 runtime 只注册 NV12，HDR/planar/upscaler 仍保持关闭。
+
+- `ffmpeg_video_test.cpp` 生成 640×368 BT.601 limited color bars，Y pitch=640、UV pitch=640，调用 `evo_agc_blit_yuv()` 的 staged 路径（`is_direct=0`）。
+- `application.cpp` 在 `nvgEndFrame()` 后、AGC `endFrame()` 前调用 M1 hook，仅当 `WILIWILI_TEST_VDEC=1` 且 `WILIWILI_VDEC_AGC=1` 同时存在时启用；该组合跳过 decoder-only P0 启动探针。未开开关时 A 路径不绘制 NV12。
+- runtime 新增 pipeline-valid 检查；管线缺失、descriptor/slot 分配失败时返回错误，不向无效 pipeline 发 DCB。
+
+**PPSA99280 真机收据。** 启动日志出现 `AGC runtime successfully initialized`、`agc-m1: first NV12 blit accepted`；截图 `/tmp/m1-screen.png` 显示完整 8 色 NV12 色条已经经 AGC CSC 进入 3840×2160 当前 scanout。约 60 秒运行期间 `agc-m1` 达到 3840 帧，应用 FPS 约 59.9。`agc health` 在 frame=600/1200/1800/2400/3000/3600 均为 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0 vo_rc=0`，并有 `presents=600`、`flip_waits=600`；日志无 `img-net: failed`、crash 或 blit failure。
+
+**M1 判定：通过。** 缺失的不是 AGC shader 工具链，而是本地缺少 NV12 生成 artifact；复用 GPL-3.0 artifact 后，现有 runtime/writer/transient ring/三帧 DCB/fence/VideoOut 链路已在真机打通。M1 只证明 staged 静态 NV12 的 CSC/scanout，不证明 VDEC direct-memory zero-copy，也不证明 UI/OSD 合成顺序；当前 probe 故意在 UI 后覆盖全屏，M2 必须把视频 quad 接入 OSD 之前的正式绘制点。
+
+**下一步。** 进入 M2：固定 URL 的 FFmpeg demux/BSF → VDEC → 三槽 NV12，保留 display PTS + `dts=UINT64_MAX`、pending watchdog、fence/slot 所有权和 native→A 回退；M3 尚未开始。
+
+### 6.5 P1 M2/M3：固定 URL、8-bit NV12、无复杂交互
 
 建议只做一个固定 DASH 视频 URL + 已验证音频 URL：
 
@@ -369,7 +382,7 @@ at EOF: Flush until valid == 0; require pending_pts empty
 
 P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 `Decode/Flush` 错误、无槽复用错误；1080p/4K 画面方向、BT.709 limited range、色彩和 crop 正确；AGC `dcb_full/ring_fail/tex_fail/timeouts` 全 0；UI、弹幕、OSD 不被视频覆盖。
 
-### 6.5 P2：可发布生产
+### 6.6 P2：可发布生产
 
 必须补齐：
 
@@ -397,14 +410,14 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 综合判断：
 
 - **仅要 1080p60**：不值得。A 已交付，C 的网络/同步/内存/VideoOut 风险远大于收益。
-- **要 4K/HEVC/CPU 余量**：decoder 与 PTS/reorder 能力已经证明值得进入受保护 P1；先完成 NV12 present、A/V 时钟、IDR seek 与长测，再决定生产化。
+- **要 4K/HEVC/CPU 余量**：decoder、PTS/reorder 和 8-bit NV12 AGC M1 已通过；继续完成固定 URL M2 的 A/V 时钟、IDR seek、watchdog/fallback 与长测，再决定生产化。
 - **要 4K HEVC Main10 + 高质量 60fps**：仍不能承诺。当前只证明 1080p P010 解码，不覆盖 4K Main10、HDR、GPU CSC、呈现和时钟。
 
 ### 7.2 主要风险与放弃条件
 
 1. **当前 decoder/PTS gate 没有触发固件止损**：H.264 4K、HEVC Main 4K、HEVC Main10 1080p 和真实 B 帧配对均通过；P1 仍受 present/时钟/seek/fallback 条件约束。
 2. **P010 只解出但无法显示**：若 P010 `out.valid=1`，但 R16/RG16/AGC pipe 无法正确采样或 tone-map，先交付 8-bit HEVC，10-bit 标为 unsupported；不要把 P010 转回 8-bit CPU 后宣称完成目标。
-3. **VideoOut plane 假设错误**：没有 YUV scanout ABI；若 AGC video pipe 无法加载，停止 zero-copy/直写路线，最多做 B1 诊断，不继续挖 undocumented plane。
+3. **VideoOut plane 假设错误**：没有 YUV scanout ABI；M1 已证明“NV12 作为 AGC quad 画入单一 BGRA scanout”可行。若后续 AGC pipe/fence/合成路径回归失败，停止 zero-copy/直写路线，最多回退 A，不继续挖 undocumented plane。
 4. **内存预算**：4K P010 单帧约 24.9 MiB，仅是输出；decoder GPU/CPU workspace、3 槽、AGC transient、UI/图片缓存还要叠加。若 native 标题在 Query/Create 或长测出现 direct/flexible 分配压力，停止 4K Main10，并让 A 处理可回退样本。
 5. **时序和槽复用**：出现一次 GPU 采样已开始而 decoder 重用槽、黑帧、撕裂或 seek 后旧帧回屏，P1 不通过；必须回到复制 ring 或显式 fence。
 6. **网络/BSF/AU**：seek 后连续 `0x811D0303`、PTS 无法稳定、或 DASH 备份切换不能无崩溃恢复，停止生产化；不允许用“暂停视频/丢帧”掩盖同步错误。
@@ -412,10 +425,10 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 ## 8. 明确推荐
 
 1. **现在不改正式 A 路径，不把 C 合入默认播放。**
-2. **C 可以进入受保护的 P1**：FFmpeg demux/BSF → `sceVideodec2`，传 display PTS、`dts=UINT64_MAX`，独立视频线程 + 8-bit NV12；真实 IDR seek、Flush/Reset、PTS watchdog 和 native→A fallback 必须先实现。
-3. P1 不做 VideoOut YUV plane、Main10/HDR 或 4K60 present 承诺；AGC pipe 资源缺失时最多用 B1 双平面 shader 验证格式。
+2. **C 可以继续受保护的 P1**：M1 已打通静态 NV12→AGC→scanout；下一步是 FFmpeg demux/BSF → `sceVideodec2`，传 display PTS、`dts=UINT64_MAX`，独立视频线程 + 8-bit NV12 三槽；真实 IDR seek、Flush/Reset、PTS watchdog 和 native→A fallback 必须先实现。
+3. P1 不做 VideoOut YUV plane、Main10/HDR 或 4K60 present 承诺；HDR/planar pipe 仍未导入。
 4. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败、PTS watchdog 触发、起播不是 IDR 或 present 不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。
 
 ## 9. 临时实验清理
 
-本轮保留了 `videodec2_probe.c` 的 P0/PTS 统计模式，但仅由 `WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_P0=1` 门控；临时 `WILIWILI_VDEC_ORDER`/`DTS_UNKNOWN` 只在 options 中启用，正式标题不触发。PPSA99270–PPSA99278、测试流、sidecar、options、dist、ffpkg、日志和 `resources/vdec-reorder.*` 均已删除；主机 `/data/homebrew` 已核对只剩正式 `PPSA99233.ffpkg`（另有原有目录），未修改 A 路径，未 push。
+M1 已保留 `videodec2_probe.c` 的既有 P0/PTS 门控，并新增 `WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_AGC=1` 的静态 AGC 门控。临时主机包 `PPSA99279/PPSA99280` 已删除，主机当前只剩正式 `PPSA99233.ffpkg`；本地 `PPSA99280` dist、`/tmp/PPSA99280.ffpkg`、`/tmp/PPSA99280-boot.log` 和 `/tmp/m1-screen.png` 作为 M1 复核证据暂留，P1 收尾时清理。

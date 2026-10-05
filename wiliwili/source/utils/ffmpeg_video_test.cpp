@@ -24,6 +24,9 @@ typedef float GLfloat;
 #include <nanovg_gl.h>
 #endif
 #endif
+#if defined(BOREALIS_USE_AGC)
+#include <borealis/extern/nanovg/agc/evo_agc_runtime.h>
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -67,7 +70,31 @@ struct VideoTest {
 };
 
 VideoTest g_video;
+constexpr int M1_WIDTH = 640;
+constexpr int M1_HEIGHT = 368;
+static uint8_t g_m1_y[M1_WIDTH * M1_HEIGHT];
+static uint8_t g_m1_uv[M1_WIDTH * M1_HEIGHT / 2];
+static int g_m1_state = -1; /* -1 unknown, 0 disabled, 1 active, -2 failed */
+static uint64_t g_m1_frames = 0;
 
+void init_m1_pattern() {
+    static const uint8_t y_values[8] = {235, 210, 170, 145, 106, 81, 41, 16};
+    static const uint8_t u_values[8] = {128, 16, 166, 54, 202, 90, 240, 128};
+    static const uint8_t v_values[8] = {128, 146, 16, 34, 222, 240, 110, 128};
+    for (int y = 0; y < M1_HEIGHT; ++y) {
+        for (int x = 0; x < M1_WIDTH; ++x) {
+            const int bar = (x * 8) / M1_WIDTH;
+            g_m1_y[y * M1_WIDTH + x] = y_values[bar];
+        }
+    }
+    for (int y = 0; y < M1_HEIGHT / 2; ++y) {
+        for (int x = 0; x < M1_WIDTH / 2; ++x) {
+            const int bar = (x * 8) / (M1_WIDTH / 2);
+            g_m1_uv[y * M1_WIDTH + x * 2 + 0] = u_values[bar];
+            g_m1_uv[y * M1_WIDTH + x * 2 + 1] = v_values[bar];
+        }
+    }
+}
 void log_line(const std::string &text) { wiliwili_boot_log(text.c_str()); }
 
 /* 解出下一帧并转成 RGBA；成功返回 true。 */
@@ -104,7 +131,44 @@ bool decode_next_frame() {
 }
 
 }  // namespace
+extern "C" void wiliwili_agc_m1_draw() {
+#if defined(BOREALIS_USE_AGC)
+    if (g_m1_state == -1) {
+        const char *test_vdec = std::getenv("WILIWILI_TEST_VDEC");
+        const char *agc_m1 = std::getenv("WILIWILI_VDEC_AGC");
+        g_m1_state = (test_vdec && test_vdec[0] != '\0' && agc_m1 && agc_m1[0] != '\0') ? 1 : 0;
+        if (g_m1_state == 1) {
+            init_m1_pattern();
+            log_line("agc-m1: enabled static BT.601 bars 640x368 -> scanout");
+        }
+    }
+    if (g_m1_state != 1)
+        return;
 
+    const int64_t pts_us = static_cast<int64_t>(g_m1_frames) * 33333;
+    const int rc = evo_agc_blit_yuv(g_m1_y, M1_WIDTH,
+                                    g_m1_uv, M1_WIDTH,
+                                    nullptr, 0, nullptr, 0,
+                                    M1_WIDTH, M1_HEIGHT,
+                                    M1_WIDTH, M1_HEIGHT,
+                                    2 /* stretch */, 0 /* 8-bit */, 1 /* SDR */, 0 /* staged */, pts_us);
+    if (rc != 0) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "agc-m1: blit failed rc=%d; disabling", rc);
+        log_line(line);
+        g_m1_state = -2;
+        return;
+    }
+    if (g_m1_frames == 0) {
+        log_line("agc-m1: first NV12 blit accepted");
+    } else if ((g_m1_frames % 120u) == 0u) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "agc-m1: frames=%llu", (unsigned long long)g_m1_frames);
+        log_line(line);
+    }
+    ++g_m1_frames;
+#endif
+}
 extern "C" void wiliwili_video_test_start(const char *url) {
     log_line("vt: start " + std::string(url));
     if (const char *mode = getenv("WILIWILI_VIDEO_UPLOAD")) g_video.upload_mode = atoi(mode);
