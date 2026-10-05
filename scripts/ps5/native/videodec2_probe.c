@@ -7,6 +7,11 @@
  *     能力/内存/Decode P95 统计；`WILIWILI_VDEC_CODEC=avc|hevc`、
  *     `WILIWILI_VDEC_MAIN10=1`、`WILIWILI_VDEC_PATH`、`WILIWILI_VDEC_WIDTH/HEIGHT`
  *     选择样本。P0 不复制/绘制 4K/P010 帧，默认正式标题路径不触发探针。
+ * PTS 闸门（2026-10-06）：再加 `WILIWILI_VDEC_ORDER=1` 与
+ *     `WILIWILI_VDEC_META=/app0/assets/vdec-reorder.txt`，读取真实 FFmpeg
+ *     packet PTS/DTS，按输出 Y 平面识别带 B 帧的显示帧，并在 segment 变化时
+ *     执行 Flush→Reset。`WILIWILI_VDEC_DTS_UNKNOWN=1` 按 ABI 传 `UINT64_MAX`；不设时
+ *     传 sidecar 的真实 DTS（仅作反例对照）。它仍必须同时受 TEST_VDEC/P0 门控。
  *
  * 序列、结构体与常量取自 EVO-PLAYER-PS5 的 sce_videodec2.h 与 videodec2-abi.md（GPL-3.0）。
  * 默认触发：assets/wiliwili-options.txt 的 WILIWILI_TEST_VDEC=1；片源为 H.264 诊断流。
@@ -134,6 +139,17 @@ typedef struct {
     uint32_t frame_format;
     uint32_t pitch_bytes;
 } OutputInfo;
+typedef struct {
+    int64_t raw_pts;
+    int64_t raw_dts;
+    uint64_t fed_pts;
+    uint64_t fed_dts;
+    int display_index;
+    int expected_luma;
+    int segment;
+} OrderMeta;
+
+#define MAX_ORDER_OUTPUT (MAX_AU + 16)
 
 /* ---- 状态 ---- */
 static void *g_au_pool;
@@ -156,6 +172,18 @@ static int g_vdec_p0;
 static int g_vdec_draw;
 static uint32_t g_decode_us[MAX_AU];
 static int g_decode_count;
+static OrderMeta g_order_meta[MAX_AU];
+static int g_order_meta_count;
+static int g_order_mode;
+static int g_order_current_segment;
+static int g_order_segment_outputs;
+static int g_order_total_outputs;
+static int g_order_fifo_failures;
+static int g_order_unknown_outputs;
+static int g_order_duplicate_outputs;
+static int g_order_output_display[MAX_ORDER_OUTPUT];
+static int g_order_output_segment[MAX_ORDER_OUTPUT];
+static int g_order_unknown_dts;
 
 static uint8_t g_y_storage[1920 * 1088]; /* 稳定副本（帧池槽会被复用） */
 static uint8_t g_uv_storage[1920 * 544]; /* NV12 的 UV 平面：半高度、交织 CbCr */
@@ -330,6 +358,78 @@ static void split_stream(void) {
         ++g_au_count;
     }
 }
+static int is_au_prefix(int nal_start, int nal_size) {
+    if (nal_size <= 0) return 0;
+    if (g_vdec_codec == CODEC_AVC) {
+        int type = g_stream[nal_start] & 0x1F;
+        return type == 7 || type == 8 || type == 9;
+    }
+    int type = (g_stream[nal_start] >> 1) & 0x3F;
+    return type >= 32 && type <= 35;
+}
+
+/* Order-mode splitter keeps SPS/PPS/VPS/AUD with the following picture. This
+ * matters for a reset or a resolution switch: those headers are the first AU
+ * after the seek, not trailing bytes of the previous picture. */
+static void split_stream_order(void) {
+    int au_start = 0;
+    int pending_prefix = -1;
+    int seen_picture = 0;
+    int pos = find_start_code(0, &(int){0});
+    while (pos >= 0) {
+        int prefix_len = 0;
+        (void)find_start_code(pos, &prefix_len);
+        int next_prefix_len = 0;
+        int next = find_start_code(pos + prefix_len, &next_prefix_len);
+        int nal_start = pos + prefix_len;
+        int nal_end = next >= 0 ? next : g_stream_size;
+        int nal_size = nal_end - nal_start;
+        if (is_picture_start(nal_start, nal_size)) {
+            if (seen_picture && g_au_count < MAX_AU) {
+                int boundary = pending_prefix >= 0 ? pending_prefix : pos;
+                if (boundary > au_start) {
+                    g_au_offset[g_au_count] = au_start;
+                    g_au_size[g_au_count] = boundary - au_start;
+                    ++g_au_count;
+                }
+                au_start = boundary;
+            }
+            pending_prefix = -1;
+            seen_picture = 1;
+        } else if (seen_picture && is_au_prefix(nal_start, nal_size) && pending_prefix < 0) {
+            pending_prefix = pos;
+        }
+        if (next < 0) break;
+        pos = next;
+    }
+    if (seen_picture && au_start < g_stream_size && g_au_count < MAX_AU) {
+        g_au_offset[g_au_count] = au_start;
+        g_au_size[g_au_count] = g_stream_size - au_start;
+        ++g_au_count;
+    }
+}
+
+static int au_is_idr(int index) {
+    int start = g_au_offset[index];
+    int end = start + g_au_size[index];
+    int pos = find_start_code(start, &(int){0});
+    while (pos >= 0 && pos < end) {
+        int prefix_len = 0;
+        (void)find_start_code(pos, &prefix_len);
+        int next_prefix_len = 0;
+        int next = find_start_code(pos + prefix_len, &next_prefix_len);
+        int nal_start = pos + prefix_len;
+        if (nal_start >= end) break;
+        int type = g_vdec_codec == CODEC_AVC ? (g_stream[nal_start] & 0x1F) : ((g_stream[nal_start] >> 1) & 0x3F);
+        if ((g_vdec_codec == CODEC_AVC && type == 5) ||
+            (g_vdec_codec == CODEC_HEVC && (type == 19 || type == 20))) {
+            return 1;
+        }
+        if (next < 0 || next >= end) break;
+        pos = next;
+    }
+    return 0;
+}
 
 static uint32_t vdec_elapsed_us(const struct timespec *a, const struct timespec *b) {
     int64_t sec = (int64_t)b->tv_sec - (int64_t)a->tv_sec;
@@ -350,14 +450,318 @@ static uint32_t vdec_p95_us(void) {
     if (index < 0) index = 0;
     return g_decode_us[index];
 }
+static int load_order_meta(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    char line[256];
+    int length = 0;
+    char ch;
+    for (;;) {
+        ssize_t n = read(fd, &ch, 1);
+        if (n <= 0) break;
+        if (ch != '\n' && length < (int)sizeof(line) - 1) {
+            line[length++] = ch;
+            continue;
+        }
+        line[length] = '\0';
+        length = 0;
+        if (line[0] == '\0' || line[0] == '#') continue;
+        int seq, display, luma, segment;
+        long long raw_pts, raw_dts;
+        unsigned long long fed_pts, fed_dts;
+        if (sscanf(line, "%d %lld %lld %llu %llu %d %d %d", &seq, &raw_pts, &raw_dts, &fed_pts,
+                   &fed_dts, &display, &luma, &segment) != 8) {
+            continue;
+        }
+        if (g_order_meta_count >= MAX_AU) break;
+        OrderMeta *meta = &g_order_meta[g_order_meta_count++];
+        meta->raw_pts = (int64_t)raw_pts;
+        meta->raw_dts = (int64_t)raw_dts;
+        meta->fed_pts = (uint64_t)fed_pts;
+        meta->fed_dts = (uint64_t)fed_dts;
+        meta->display_index = display;
+        meta->expected_luma = luma;
+        meta->segment = segment;
+    }
+    if (length > 0 && g_order_meta_count < MAX_AU) {
+        line[length] = '\0';
+        if (line[0] != '\0' && line[0] != '#') {
+            int seq, display, luma, segment;
+            long long raw_pts, raw_dts;
+            unsigned long long fed_pts, fed_dts;
+            if (sscanf(line, "%d %lld %lld %llu %llu %d %d %d", &seq, &raw_pts, &raw_dts, &fed_pts,
+                       &fed_dts, &display, &luma, &segment) == 8) {
+                OrderMeta *meta = &g_order_meta[g_order_meta_count++];
+                meta->raw_pts = (int64_t)raw_pts;
+                meta->raw_dts = (int64_t)raw_dts;
+                meta->fed_pts = (uint64_t)fed_pts;
+                meta->fed_dts = (uint64_t)fed_dts;
+                meta->display_index = display;
+                meta->expected_luma = luma;
+                meta->segment = segment;
+            }
+        }
+    }
+    close(fd);
+    return g_order_meta_count;
+}
+
+static int order_expected_display(int segment, int ordinal) {
+    int previous = -1;
+    for (int n = 0; n <= ordinal; ++n) {
+        int best = 0x7fffffff;
+        for (int i = 0; i < g_order_meta_count; ++i) {
+            const OrderMeta *meta = &g_order_meta[i];
+            if (meta->segment == segment && meta->display_index > previous && meta->display_index < best) {
+                best = meta->display_index;
+            }
+        }
+        if (best == 0x7fffffff) return -1;
+        previous = best;
+    }
+    return previous;
+}
+
+static int order_sample_luma(const OutputInfo *out) {
+    if (out->buffer == NULL || out->width == 0 || out->height == 0 || out->pitch_bytes != out->pitch ||
+        out->pitch < out->width || out->buffer_size < (uint64_t)out->pitch_bytes * out->height) {
+        return -1;
+    }
+    const uint8_t *y = (const uint8_t *)out->buffer;
+    int cx = (int)out->width / 2;
+    int cy = (int)out->height / 2;
+    int sum = 0;
+    int count = 0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            int x = cx + dx;
+            int row = cy + dy;
+            if (x >= 0 && x < (int)out->width && row >= 0 && row < (int)out->height) {
+                sum += y[(size_t)row * out->pitch_bytes + (size_t)x];
+                ++count;
+            }
+        }
+    }
+    return count > 0 ? (sum + count / 2) / count : -1;
+}
+
+static int order_find_output(const OutputInfo *out, int segment, int *delta) {
+    int luma = order_sample_luma(out);
+    int best = -1;
+    int best_delta = 0x7fffffff;
+    for (int i = 0; i < g_order_meta_count; ++i) {
+        const OrderMeta *meta = &g_order_meta[i];
+        if (meta->segment != segment) continue;
+        int difference = luma >= 0 ? abs(luma - meta->expected_luma) : 0x7fffffff;
+        if (difference < best_delta) {
+            best = i;
+            best_delta = difference;
+        }
+    }
+    *delta = best_delta == 0x7fffffff ? -1 : best_delta;
+    return best;
+}
+
+static void order_begin_segment(int segment) {
+    g_order_current_segment = segment;
+    g_order_segment_outputs = 0;
+    char line[128];
+    snprintf(line, sizeof(line), "vdec: order segment=%d begin expected=%d", segment,
+             order_expected_display(segment, 0));
+    wiliwili_boot_log(line);
+}
+
+static void order_report_output(const char *phase, int input_index, int flush_index, const OutputInfo *out) {
+    if (!g_order_mode) return;
+    int delta = -1;
+    int matched_meta = order_find_output(out, g_order_current_segment, &delta);
+    int matched_display = matched_meta >= 0 ? g_order_meta[matched_meta].display_index : -1;
+    int expected_display = order_expected_display(g_order_current_segment, g_order_segment_outputs);
+    int fifo = matched_display >= 0 && matched_display == expected_display && delta <= 2;
+    if (!fifo) ++g_order_fifo_failures;
+    if (matched_meta < 0 || delta > 2) ++g_order_unknown_outputs;
+    for (int i = 0; i < g_order_total_outputs; ++i) {
+        if (g_order_output_segment[i] == g_order_current_segment &&
+            g_order_output_display[i] == matched_display && matched_display >= 0) {
+            ++g_order_duplicate_outputs;
+            break;
+        }
+    }
+    if (g_order_total_outputs < MAX_ORDER_OUTPUT) {
+        g_order_output_display[g_order_total_outputs] = matched_display;
+        g_order_output_segment[g_order_total_outputs] = g_order_current_segment;
+    }
+    int luma = order_sample_luma(out);
+    long long matched_pts = matched_meta >= 0 ? (long long)g_order_meta[matched_meta].raw_pts : -1;
+    char line[256];
+    snprintf(line, sizeof(line),
+             "vdec: order out_seq=%d seg=%d phase=%s input_idx=%d flush=%d luma=%d matched_display=%d matched_pts=%lld expected_display=%d delta=%d fifo=%d",
+             g_order_total_outputs, g_order_current_segment, phase, input_index, flush_index, luma,
+             matched_display, matched_pts, expected_display, delta, fifo);
+    wiliwili_boot_log(line);
+    ++g_order_total_outputs;
+    ++g_order_segment_outputs;
+}
+static void order_account_output(const DecoderConfigInfo *config, FrameBuffer *frame, OutputInfo *out, int input_index,
+                                 int flush_index, int *decoded, int *decode_errors, int *accepted_count,
+                                 int *format_mismatch, int *p010_count) {
+    if (!out->valid) return;
+    ++*decoded;
+    if (frame->accepted) ++*accepted_count;
+    int p010 = out->pitch_bytes != 0 && out->pitch_bytes == out->pitch * 2u;
+    if (p010) ++*p010_count;
+    if (p010 != g_vdec_main10) ++*format_mismatch;
+    uintptr_t base = (uintptr_t)g_frame_pool;
+    uintptr_t end = base + g_frame_size * PIPELINE_SLOTS;
+    uintptr_t address = (uintptr_t)out->buffer;
+    int in_pool = address >= base && address < end;
+    uint64_t row_bytes = out->pitch_bytes != 0 ? out->pitch_bytes : (uint64_t)out->pitch * (p010 ? 2u : 1u);
+    uint64_t expected_pitch_bytes = (uint64_t)out->pitch * (p010 ? 2u : 1u);
+    uint64_t required = row_bytes * ((uint64_t)out->height + ((uint64_t)out->height + 1u) / 2u);
+    int invalid = !frame->accepted || out->error || out->picture_count != 1 || out->codec != config->codec_type ||
+                  out->width == 0 || out->height == 0 || out->width > (uint32_t)config->max_width ||
+                  out->height > (uint32_t)config->max_height || out->pitch < out->width ||
+                  out->pitch_bytes != expected_pitch_bytes || out->buffer == NULL || out->buffer_size < required || !in_pool;
+    if (invalid) ++*decode_errors;
+    char line[256];
+    snprintf(line, sizeof(line),
+             "vdec: order frame input_idx=%d flush=%d valid=%u err=%u pics=%u codec=%u %ux%u pitch=%u pitch_bytes=%u fmt=%u buf=%llu accepted=%u in_pool=%d",
+             input_index, flush_index, out->valid, out->error, out->picture_count, out->codec, out->width,
+             out->height, out->pitch, out->pitch_bytes, out->frame_format, (unsigned long long)out->buffer_size,
+             frame->accepted, in_pool);
+    wiliwili_boot_log(line);
+    order_report_output(flush_index >= 0 ? "flush" : "decode", input_index, flush_index, out);
+}
+
+static void order_drain(const DecoderConfigInfo *config, const char *reason, int *slot, int *decoded,
+                        int *decode_errors, int *accepted_count, int *format_mismatch, int *p010_count,
+                        uint64_t *total_us) {
+    for (int flush_index = 0; flush_index < MAX_AU + 8; ++flush_index) {
+        FrameBuffer frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.size = sizeof(frame);
+        frame.buffer = (uint8_t *)g_frame_pool + (size_t)*slot * g_frame_size;
+        frame.buffer_size = g_frame_size;
+        OutputInfo out;
+        memset(&out, 0, sizeof(out));
+        out.size = sizeof(out);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int32_t rc = sceVideodec2Flush(g_decoder, &frame, &out);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint32_t elapsed_us = vdec_elapsed_us(&t0, &t1);
+        if (g_decode_count < MAX_AU) g_decode_us[g_decode_count++] = elapsed_us;
+        *total_us += elapsed_us;
+        if (rc != 0) {
+            ++*decode_errors;
+            char line[192];
+            snprintf(line, sizeof(line), "vdec: order flush reason=%s idx=%d rc=%d accepted=%u", reason, flush_index,
+                     rc, frame.accepted);
+            wiliwili_boot_log(line);
+            break;
+        }
+        if (!out.valid) {
+            char line[160];
+            snprintf(line, sizeof(line), "vdec: order flush reason=%s idx=%d empty=1", reason, flush_index);
+            wiliwili_boot_log(line);
+            break;
+        }
+        order_account_output(config, &frame, &out, -1, flush_index, decoded, decode_errors, accepted_count,
+                             format_mismatch, p010_count);
+        *slot = (*slot + 1) % PIPELINE_SLOTS;
+    }
+}
+
+static void run_order_experiment(const DecoderConfigInfo *config, int *decoded, int *buffered, int *decode_errors,
+                                 int *accepted_count, int *format_mismatch, int *p010_count, uint64_t *total_us) {
+    int slot = 0;
+    int current_segment = g_order_meta[0].segment;
+    for (g_au_index = 0; g_au_index < g_au_count; ++g_au_index) {
+        const OrderMeta *meta = &g_order_meta[g_au_index];
+        if (meta->segment != current_segment) {
+            order_drain(config, "segment", &slot, decoded, decode_errors, accepted_count, format_mismatch, p010_count,
+                        total_us);
+            int32_t reset_rc = sceVideodec2Reset(g_decoder);
+            char reset_line[160];
+            snprintf(reset_line, sizeof(reset_line), "vdec: order segment=%d reset_rc=%d", meta->segment, reset_rc);
+            wiliwili_boot_log(reset_line);
+            if (reset_rc != 0) ++*decode_errors;
+            current_segment = meta->segment;
+            order_begin_segment(current_segment);
+        }
+        if ((uint64_t)g_au_size[g_au_index] > AU_SLOT_SIZE) {
+            wiliwili_boot_log("vdec: order AU exceeds 8MiB slot");
+            ++*decode_errors;
+            break;
+        }
+        uint8_t *au_slot = (uint8_t *)g_au_pool + (size_t)slot * AU_SLOT_SIZE;
+        memcpy(au_slot, g_stream + g_au_offset[g_au_index], (size_t)g_au_size[g_au_index]);
+        InputData input;
+        memset(&input, 0, sizeof(input));
+        input.size = sizeof(input);
+        input.au = au_slot;
+        input.au_size = (uint64_t)g_au_size[g_au_index];
+        input.pts = meta->fed_pts;
+        input.dts = g_order_unknown_dts ? UINT64_MAX : meta->fed_dts;
+        char input_line[256];
+        snprintf(input_line, sizeof(input_line),
+                 "vdec: order in idx=%d seg=%d raw_pts=%lld raw_dts=%lld fed_pts=%llu fed_dts=%llu dts_unknown=%d idr=%d display=%d luma=%d",
+                 g_au_index, meta->segment, (long long)meta->raw_pts, (long long)meta->raw_dts,
+                 (unsigned long long)meta->fed_pts, (unsigned long long)meta->fed_dts, g_order_unknown_dts,
+                 au_is_idr(g_au_index), meta->display_index, meta->expected_luma);
+        wiliwili_boot_log(input_line);
+
+        FrameBuffer frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.size = sizeof(frame);
+        frame.buffer = (uint8_t *)g_frame_pool + (size_t)slot * g_frame_size;
+        frame.buffer_size = g_frame_size;
+        OutputInfo out;
+        memset(&out, 0, sizeof(out));
+        out.size = sizeof(out);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int32_t rc = sceVideodec2Decode(g_decoder, &input, &frame, &out);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint32_t elapsed_us = vdec_elapsed_us(&t0, &t1);
+        if (g_decode_count < MAX_AU) g_decode_us[g_decode_count++] = elapsed_us;
+        *total_us += elapsed_us;
+        if (rc != 0) {
+            ++*decode_errors;
+            char error_line[224];
+            snprintf(error_line, sizeof(error_line), "vdec: order error idx=%d seg=%d rc=%d valid=%u accepted=%u",
+                     g_au_index, meta->segment, rc, out.valid, frame.accepted);
+            wiliwili_boot_log(error_line);
+        } else if (out.valid) {
+            order_account_output(config, &frame, &out, g_au_index, -1, decoded, decode_errors, accepted_count,
+                                 format_mismatch, p010_count);
+        } else {
+            ++*buffered;
+            char buffered_line[192];
+            snprintf(buffered_line, sizeof(buffered_line), "vdec: order buffered idx=%d seg=%d", g_au_index,
+                     meta->segment);
+            wiliwili_boot_log(buffered_line);
+        }
+        slot = (slot + 1) % PIPELINE_SLOTS;
+    }
+    order_drain(config, "eof", &slot, decoded, decode_errors, accepted_count, format_mismatch, p010_count, total_us);
+}
 
 void wiliwili_videodec2_probe(void) {
     const char *codec = getenv("WILIWILI_VDEC_CODEC");
     const char *path = getenv("WILIWILI_VDEC_PATH");
+    const char *meta_path = getenv("WILIWILI_VDEC_META");
     const char *width_env = getenv("WILIWILI_VDEC_WIDTH");
     const char *height_env = getenv("WILIWILI_VDEC_HEIGHT");
     const int is_hevc = codec != NULL && strcmp(codec, "hevc") == 0;
     g_vdec_p0 = getenv("WILIWILI_VDEC_P0") != NULL;
+    g_order_mode = g_vdec_p0 && getenv("WILIWILI_VDEC_ORDER") != NULL && meta_path != NULL && meta_path[0] != '\0';
+    g_order_unknown_dts = getenv("WILIWILI_VDEC_DTS_UNKNOWN") != NULL;
+    g_order_meta_count = 0;
+    g_order_total_outputs = 0;
+    g_order_fifo_failures = 0;
+    g_order_unknown_outputs = 0;
+    g_order_duplicate_outputs = 0;
     g_vdec_draw = !g_vdec_p0 || getenv("WILIWILI_VDEC_DRAW") != NULL;
     g_vdec_codec = is_hevc ? CODEC_HEVC : CODEC_AVC;
     g_vdec_main10 = is_hevc && getenv("WILIWILI_VDEC_MAIN10") != NULL;
@@ -369,8 +773,8 @@ void wiliwili_videodec2_probe(void) {
     }
 
     char line[256];
-    snprintf(line, sizeof(line), "vdec: enter p0=%d codec=%s main10=%d visible=%dx%d", g_vdec_p0,
-             is_hevc ? "hevc" : "avc", g_vdec_main10, g_vdec_width, g_vdec_height);
+    snprintf(line, sizeof(line), "vdec: enter p0=%d order=%d dts_unknown=%d codec=%s main10=%d visible=%dx%d", g_vdec_p0,
+             g_order_mode, g_order_unknown_dts, is_hevc ? "hevc" : "avc", g_vdec_main10, g_vdec_width, g_vdec_height);
     wiliwili_boot_log(line);
 
     int32_t rc = sceSysmoduleLoadModule(SCE_SYSMODULE_VIDEODEC2);
@@ -489,12 +893,24 @@ void wiliwili_videodec2_probe(void) {
     if (g_stream_size <= 0) return;
 
     g_au_count = 0;
-    split_stream();
+    if (g_order_mode) split_stream_order();
+    else split_stream();
     snprintf(line, sizeof(line), "vdec: aus=%d split_codec=%s", g_au_count, is_hevc ? "hevc" : "avc");
     wiliwili_boot_log(line);
     if (g_au_count <= 0) {
         wiliwili_boot_log("vdec: no access units");
         return;
+    }
+    if (g_order_mode) {
+        int meta_count = load_order_meta(meta_path);
+        snprintf(line, sizeof(line), "vdec: order meta path=%s rc=%d count=%d", meta_path, meta_count,
+                 g_order_meta_count);
+        wiliwili_boot_log(line);
+        if (meta_count < 0 || g_order_meta_count != g_au_count) {
+            wiliwili_boot_log("vdec: order meta/AU count mismatch");
+            return;
+        }
+        order_begin_segment(g_order_meta[0].segment);
     }
 
     int decoded = 0;
@@ -506,8 +922,12 @@ void wiliwili_videodec2_probe(void) {
     uint64_t total_us = 0;
     g_decode_count = 0;
     int slot = 0;
-    for (g_au_index = 0; g_au_index < g_au_count; ++g_au_index) {
-        if (g_au_size[g_au_index] > AU_SLOT_SIZE) {
+    if (g_order_mode) {
+        run_order_experiment(&config, &decoded, &buffered, &decode_errors, &accepted_count, &format_mismatch,
+                             &p010_count, &total_us);
+    } else {
+        for (g_au_index = 0; g_au_index < g_au_count; ++g_au_index) {
+        if ((uint64_t)g_au_size[g_au_index] > AU_SLOT_SIZE) {
             wiliwili_boot_log("vdec: AU exceeds 8MiB slot");
             ++decode_errors;
             break;
@@ -599,18 +1019,36 @@ void wiliwili_videodec2_probe(void) {
         }
         slot = (slot + 1) % PIPELINE_SLOTS;
     }
+    }
 
     uint32_t p95_us = vdec_p95_us();
     uint32_t avg_us = g_decode_count > 0 ? (uint32_t)(total_us / (uint64_t)g_decode_count) : 0;
-    snprintf(line, sizeof(line), "vdec: stats decoded=%d/%d buffered=%d accepted=%d errors=%d p010=%d/%d format_mismatch=%d avg_us=%u p95_us=%u",
-             decoded, g_au_count, buffered, accepted_count, decode_errors, p010_count, decoded, format_mismatch,
-             avg_us, p95_us);
-    wiliwili_boot_log(line);
-    wiliwili_boot_log("vdec: pts input=synthetic90k_step3000 output_pts=not_in_abi reorder=not_observable");
-    int complete = decoded == g_au_count && decoded > 0;
-    int pass = complete && decode_errors == 0 && format_mismatch == 0 && (p010_count > 0) == g_vdec_main10;
-    snprintf(line, sizeof(line), "vdec: result pass=%d complete=%d expected_p010=%d decoded=%d", pass, complete,
-             g_vdec_main10, decoded);
+    if (g_order_mode) {
+        snprintf(line, sizeof(line),
+                 "vdec: stats order=1 decoded=%d inputs=%d buffered=%d accepted=%d errors=%d p010=%d/%d format_mismatch=%d avg_us=%u p95_us=%u",
+                 decoded, g_au_count, buffered, accepted_count, decode_errors, p010_count, decoded, format_mismatch,
+                 avg_us, p95_us);
+        wiliwili_boot_log(line);
+        snprintf(line, sizeof(line),
+                 "vdec: order stats outputs=%d fifo_failures=%d unknown=%d duplicates=%d segments=%d",
+                 g_order_total_outputs, g_order_fifo_failures, g_order_unknown_outputs, g_order_duplicate_outputs,
+                 g_order_current_segment + 1);
+        wiliwili_boot_log(line);
+        wiliwili_boot_log("vdec: pts input=real_packet_pts_dts output_pts=not_in_abi");
+    } else {
+        snprintf(line, sizeof(line), "vdec: stats decoded=%d/%d buffered=%d accepted=%d errors=%d p010=%d/%d format_mismatch=%d avg_us=%u p95_us=%u",
+                 decoded, g_au_count, buffered, accepted_count, decode_errors, p010_count, decoded, format_mismatch,
+                 avg_us, p95_us);
+        wiliwili_boot_log(line);
+        wiliwili_boot_log("vdec: pts input=synthetic90k_step3000 output_pts=not_in_abi reorder=not_observable");
+    }
+    int complete = g_order_mode ? g_order_total_outputs > 0 : decoded == g_au_count && decoded > 0;
+    int mapping_pass = !g_order_mode ||
+                       (g_order_fifo_failures == 0 && g_order_unknown_outputs == 0 && g_order_duplicate_outputs == 0);
+    int pass = complete && mapping_pass && decode_errors == 0 && format_mismatch == 0 &&
+               (p010_count > 0) == g_vdec_main10;
+    snprintf(line, sizeof(line), "vdec: result pass=%d complete=%d mapping_pass=%d expected_p010=%d decoded=%d",
+             pass, complete, mapping_pass, g_vdec_main10, decoded);
     wiliwili_boot_log(line);
     log3("vdec: last %dx%d pitch=%d", g_y_width, g_y_height, g_y_pitch);
     if (decoded > 0) g_ready = 1;

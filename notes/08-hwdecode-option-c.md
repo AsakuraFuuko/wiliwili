@@ -4,18 +4,18 @@
 >
 > 结论先行：C **值得做，但只在目标包含 4K、HEVC、10-bit 或释放 CPU 时值得做**。A 已经解决了当前 1080p SW 面 60 FPS；C 不应作为 A 的替代优化，而应作为一条按能力探测启用、失败回退到 A 的视频后端。
 >
-> 当前固件是 12.00。P0 已在本机跑过 H.264 4K、HEVC Main 4K、HEVC Main10 1080p：三种 decoder/输出格式能力均通过；但 `sceVideodec2` 的 `OutputInfo` 没有输出 PTS 字段，PTS/reorder 子项仍未闭环，不能据此进入 P1。外部 EVO/Prospero 项目有 12.70 真机数据，可用于估算上限，不能替代本机验收。
+> 当前固件是 12.00。P0 已在本机跑过 H.264 4K、HEVC Main 4K、HEVC Main10 1080p：三种 decoder/输出格式能力均通过；PTS/reorder 闸门也已用真实 B 帧流闭环，但调用必须传 `dts=UINT64_MAX`，不能把 decode DTS 传给 `sceVideodec2`。这只允许进入 8-bit P1，不等于 4K60 present/HDR/zero-copy 已完成。
 
 ## 1. 决策摘要
 
 |问题|结论|
 |---|---|
 |C 能否带来 A 没有的能力？|能。硬解路径有机会覆盖 4K、HEVC Main、P010/Main10，并显著释放 CPU；A 只能优化 SW YUV→RGBA/缩放。|
-|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 能力 P0 已通过三组样本，但不等于可播放：4K Main10 未测，PTS/reorder 未验证，NV12/P010 呈现也未接入。严格 P0 未完全通过，当前不进入 C 的 P1。|
+|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate 已通过（固定 `dts=UINT64_MAX` 契约），但 4K Main10、NV12/P010 呈现、4K60 时钟和长测仍未验证；只能进入受 watchdog/fallback 保护的 8-bit P1。|
 |NV12/P010 能否接现有 AGC？|接口形状已经具备：`evo_agc_blit_yuv()` 接受 NV12/planar/P010 参数，writer 有 R8/RG8/R16/RG16 T# 描述符。但当前 native 工作树的 video pipe 资源由 `EVO_AGC_HAVE_VIDEO_PIPES` 门控，`evo_agc_pipes.h` 当前只包含 UI pipe；还不是可直接接入的生产链路。|
 |VideoOut 是否能直接注册 NV12/P010 扫描面？|没有证据，按不可行处理。公开/仓库内 API 只显示单一 RGB/BGRA buffer + 两个 scanout buffer，没有 YUV plane/CSC 注册接口。NV12 必须先由 AGC/GL shader 转成最终 BGRA/RGB scanout。|
 |能否保留 mpv？|能保留 mpv 的音频、时钟、pause/speed/property/UI 状态；视频压缩流不能继续让 mpv 读取，否则会重复下载。视频需要独立 FFmpeg demux/BSF → `sceVideodec2` → present。|
-|推荐顺序|保留当前 A；若继续 C，先补齐独立 FFmpeg PTS + VDEC 输出顺序实验，再做 P1 AGC NV12 8-bit。P0 关键 gate 未闭环就不做生产重构。|
+|推荐顺序|保留当前 A；C 进入 8-bit NV12 P1，独立 FFmpeg demux/BSF + display PTS + `dts=UINT64_MAX` + Flush/Reset/IDR watchdog；present/seek/切档任一步失败立即回退 A。|
 
 ## 2. 现状盘点
 
@@ -23,16 +23,16 @@
 
 |能力/字段|状态|证据与含义|
 |---|---|---|
-|加载 `libSceVideodec2`、compute queue、decoder、reset|**已验证（当前 12.00）**|三次 P0 均为 `sysmodule=0`, `query_compute=0`, `compute_queue=0`, `query_decoder=0`, `create=0`, `reset=0`；探针主流程 `videodec2_probe.c:352-467`。|
+|加载 `libSceVideodec2`、compute queue、decoder、reset|**已验证（当前 12.00）**|三次 P0 均为 `sysmodule=0`, `query_compute=0`, `compute_queue=0`, `query_decoder=0`, `create=0`, `reset=0`；探针主流程 `videodec2_probe.c:750-957`。|
 |H.264/AVC 4K 8-bit|**已验证（当前 12.00）**|`PPSA99260`：codec=1/profile=100/level=52，60/60 AU，输出 3840×2160 NV12，见 P0 实测节。|
 |HEVC Main 4K 8-bit|**已验证（当前 12.00）**|`PPSA99261`：codec=974921/profile=1/level=153，60/60 AU，输出 3840×2160 NV12，见 P0 实测节。|
 |HEVC Main10 1080p/P010|**已验证（当前 12.00）**|`PPSA99262`：codec=974921/profile=2/level=123，60/60 AU，输出 1920×1088、`pitch_bytes=pitch*2`，P010 判定 60/60。|
-|连续 AU、`Decode` 后 `valid=0` 再 `Flush`|**已验证（当前 P0）**|三组均 `decoded=60/60`, `buffered=60`, `accepted=60`, `errors=0`；路径在 `videodec2_probe.c:530-546`。当前 `pipeline_depth=1`，每 AU 同步 Flush。|
-|输出格式/内存布局|**已验证（当前 P0）**|H.264/HEVC Main 为 `pitch=3840,pitch_bytes=3840`；Main10 为 `pitch=1920,pitch_bytes=3840`。`out.buffer` 三组均在 frame pool 内；探针校验见 `:554-592`。|
+|连续 AU、`Decode` 后 `valid=0` 再 `Flush`|**已验证（当前 P0）**|三组均 `decoded=60/60`, `buffered=60`, `accepted=60`, `errors=0`；旧 P0 路径在 `videodec2_probe.c:950-1019`，PTS 路径在 `:675-748`。当前 `pipeline_depth=1`。|
+|输出格式/内存布局|**已验证（当前 P0）**|H.264/HEVC Main 为 `pitch=3840,pitch_bytes=3840`；Main10 为 `pitch=1920,pitch_bytes=3840`。`out.buffer` 三组均在 frame pool 内；顺序探针校验见 `videodec2_probe.c:605-633`。|
 |frame pool/direct memory|**已验证为当前配置；不是生产 zero-copy 证明**|三组 direct limit 均 `0x300000000`，type 12 + `0x32/0x33` 映射和 flexible `0x03` 均成功；原始/对齐大小见 P0 实测表。GPU 仍未直接采样这些槽。|
-|槽位与 pipeline|**仅探针**|`PIPELINE_SLOTS=3`、`pipeline_depth=1`，见 `videodec2_probe.c:51-54,414-415,506-598`。没有 GPU fence/VideoOut retire 保护，不能当作生产 zero-copy。|
-|PTS/reorder|**未闭环（严格 P0 gate 未通过）**|输入只送 synthetic 90 kHz PTS、`step=3000`、DTS=`UINT64_MAX`，见 `:516-522`；ABI `OutputInfo` 没有输出 PTS 字段，三次均记录 `output_pts=not_in_abi reorder=not_observable`。不能宣称 B 帧已按显示 PTS 正确重排。|
-|seek/flush 后 SPS/PPS|**当前 P0 未验证；现有笔记已有生产坑**|`notes/02-hwdecode.md:172-183,1151-1166`：DASH fMP4 必须过 Annex-B BSF，seek 后要重建 BSF；单纯 `av_bsf_flush()` 不会重新注入 SPS/PPS。|
+|槽位与 pipeline|**仅探针**|`PIPELINE_SLOTS=3`、`pipeline_depth=1`，见 `videodec2_probe.c:53,675-748`。没有 GPU fence/VideoOut retire 保护，不能当作生产 zero-copy。|
+|PTS/reorder|**已闭环（P0 gate，通过 `dts=UINT64_MAX`）**|真实 H.264/HEVC B 帧 sidecar + 输出 Y 指纹：H.264/HEVC normal FIFO display order；H.264 真实 DTS 反例失败，故生产禁止传 decode DTS。完整数据见 §6.3。|
+|seek/flush 后 SPS/PPS|**边界已实测，生产仍需严格起播规则**|Flush 尾帧顺序正常；Reset 后 non-IDR 均 `-2128805117`；H.264 IDR/HEVC IDR 19/20 可恢复，HEVC CRA 21 在本样本不可作为安全起点；DASH fMP4 仍必须过 Annex-B BSF。|
 |4K/4K60|**4K 连续解码已验证；端到端 4K60 未验证**|H.264/HEVC Main 均解出 60/60 个 3840×2160 AU；该探针无呈现、无真实媒体时钟，不能把 decoder P95 当 displayed 4K60。|
 |VP9/AV1|**当前 wiliwili 未知/无 C 路线**|`sceVideodec2` ABI 参考声明 VP9 tag，但 wiliwili 探针没有实现；AV1 没有仓库内 `sceVideodec2` 路线。|
 
@@ -61,7 +61,7 @@
 |格式|当前 wiliwili / 固件 12.00|参考项目数据（PS5 12.70；不可直接移植为验收）|决策含义|
 |---|---|---|---|
 |H.264 AVC 8-bit 4:2:0|**4K 连续解码通过**：3840×2160，60/60 AU，NV12，平均 16.504 ms、P95 20.195 ms；未测端到端 4K60 present|EVO `README.md:51-58` 与 validation 对 4K60 的口径冲突，仍只作参考|decoder 能力成立；4K60 播放仍需独立 present/时钟验收|
-|HEVC Main 8-bit|**4K 连续解码通过**：3840×2160，60/60 AU，NV12，平均 6.509 ms、P95 8.372 ms；未接呈现|EVO `README.md:53-56`、`docs/codec-support.md:13-20` 的 4K 结论与本机结果方向一致，但不能替代本机 present 验收|可作为后续 8-bit C 生产首目标；当前仍被 PTS/reorder gate 卡住|
+|HEVC Main 8-bit|**4K 连续解码 + PTS/reorder gate 通过**：3840×2160，60/60 AU，NV12，平均 6.509 ms、P95 8.372 ms；未接呈现|EVO `README.md:53-56`、`docs/codec-support.md:13-20` 的 4K 结论与本机 decoder 方向一致，但不能替代 present 验收|可进入受 watchdog/fallback 保护的 8-bit C P1；仍未证明 4K60 present|
 |HEVC Main10 / P010|**1080p 连续解码通过**：1920×1088 coded、60/60 AU，`pitch=1920,pitch_bytes=3840`，P010 60/60，平均 2.477 ms、P95 3.245 ms|参考 README 只可靠列到 1080p；后续文档对 4K Main10 仍有未完整测量说明|10-bit decoder 能力成立；4K Main10 与 HDR/present 仍未知|
 |HEVC Main10 4K|未测|参考项目文档本身也存在 4K Main10 吞吐/呈现未收口的记录|不进入当前 P0；若继续 C，另立能力测试|
 |VP9 Profile 0/2|未测|参考文档版本间口径不一致|不放进第一原型|
@@ -123,7 +123,7 @@ ABI 参考给出的 Create 尺寸档位是 `1920×1088`、`2560×1440`、`3840×
 
 ### 4.3 B1 GL 双平面作为原型 fallback
 
-现有 `videodec2_probe.c:440-635` 已演示 R8 Y + RG8 UV、片元 shader CSC、crop/flip/U-V swap。它能证明“两个平面可以被当前 GL bridge 采样”，但有三个限制：
+现有 `videodec2_probe.c:1060-1207` 已演示 R8 Y + RG8 UV、片元 shader CSC、crop/flip/U-V swap。它能证明“两个平面可以被当前 GL bridge 采样”，但有三个限制：
 
 1. 它复制到稳定 CPU buffer，不是 decoder frame pool zero-copy。
 2. 它是诊断探针，不接入 `MPVCore::draw()` 或 VideoView 生命周期。
@@ -188,7 +188,7 @@ VideoView::draw ── nativeVideo.present(recent frame, playback_time)
 1. H.264 3840×2160 8-bit，60 AU 连续样本（本轮实测；不是 30–60 秒长测）。
 2. HEVC Main 3840×2160 8-bit，60 AU 连续样本（本轮实测）。
 3. HEVC Main10 1920×1080 P010，60 AU 连续样本（本轮实测）。
-4. HEVC Main10 3840×2160 未测；因为 PTS/reorder gate 未闭环，按止损规则不进入该项。
+4. HEVC Main10 3840×2160 未测；P0 仅覆盖 1080p P010，4K Main10/HDR 另立能力测试。
 
 每个样本必须记录：
 
@@ -260,11 +260,104 @@ result pass=1 complete=1 expected_p010=1 decoded=60
 #### 6.2.3 判定
 
 - **decoder/内存/输出格式子项：3/3 通过**。当前 12.00 已证明 H.264 4K、HEVC Main 4K、HEVC Main10 1080p/P010 可以连续解码；三组输出 buffer 都落在 frame pool 内，所有 Create/Reset/Decode/Flush rc 和内存映射 rc 均为 0。
-- **PTS/reorder 子项：未通过验收，不是“默认通过”**。输入 PTS 是探针合成的 `0,3000,...`，而 ABI 的 `OutputInfo` 没有输出 PTS/显示序号。即使流含 B 帧，当前证据也只能证明 60 AU 被解出，不能证明输出顺序与 DASH 显示 PTS 正确对应。
-- **严格 P0 总判定：未完全通过；按止损规则停止 C 的 P1/生产化。** C 的 decoder 能力值得保留，但在另行完成 FFmpeg 时间戳到输出帧顺序的实验前，不得进入 NV12/AGC 管线重构，也不得宣称 4K/10-bit 播放完成。
+- **PTS/reorder 子项：见 §6.3 的真实 B 帧闸门实验**。P0 的 synthetic PTS 只证明了解码路径，不再作为顺序证据。
+- **严格 P0 总判定：在规定的 `dts=UINT64_MAX` 调用契约下通过，允许进入 C 的 P1；仍不等于 4K/10-bit 可播放。**
 
-### 6.3 P1：固定 URL、8-bit NV12、无复杂交互
+### 6.3 PTS/reorder 闸门实验（2026-10-06）
 
+**样本与方法。** H.264/HEVC 均用 FFmpeg 生成真实带 B 帧的 640×368、30fps、GOP=12 流；用 `ffprobe -show_entries packet=pts,dts` 取得 packet 顺序的真实 PTS/DTS，再转 Annex-B。帧内容是每帧不同的纯色 Y 值，探针从输出 Y 平面中心取 5×5 平均值，只用于识别“输出的是哪一个源帧”，没有把 synthetic PTS 当作证据。样本由 `/tmp/generate_pts_gate.py` 生成，未进入提交树。
+
+每组输入 PTS/DTS 使用 90 kHz packet 值；因为 ABI 字段是无符号，raw DTS 的负值统一加 `1024` 后传入，保持 PTS/DTS 相对顺序不变。关键对照是：真实 DTS 传入时 H.264 会出现错误输出顺序；生产契约应传 `dts=UINT64_MAX`（`WILIWILI_VDEC_DTS_UNKNOWN=1`），并保留真实 DTS 只作诊断日志。
+
+#### 6.3.1 ABI 字段穷尽
+
+权威头文件：`references/EVO-PLAYER-PS5/projects/evoplayer/media/include/sce/sce_videodec2.h`。
+
+|结构|字段（头文件行）|是否能排序/关联输出|
+|---|---|---|
+|`SceVideodec2InputData`|`size` 122、`au` 123、`au_size` 124|调用描述/压缩数据地址；无输出关联 ID。|
+|同上|`pts` 125、`dts` 126、`attached` 127|只有调用方送入的时间戳；服务不会在 `OutputInfo` 回传它们。|
+|`SceVideodec2FrameBuffer`|`size` 131、`buffer` 132、`buffer_size` 133|调用方提供的输出槽；槽地址不是显示帧 ID。|
+|同上|`accepted` 134、`reserved` 135|只表示槽被接受；`reserved` 含义未验证，不可当序号。|
+|`SceVideodec2OutputInfo`|`size` 139|结构版本/大小；无时间信息。|
+|同上|`valid` 140、`error` 141、`picture_count` 142|输出有效性/错误/图片数；没有 display order。|
+|同上|`padding` 143、`reserved` 148|保留字段；头文件没有定义语义，不能探测性当 POC/frame_id 使用。|
+|同上|`codec` 144、`width` 145、`pitch` 146、`height` 147|格式和布局信息；没有 PTS、DTS、POC、frame_id、display index。|
+|同上|`buffer` 149–150、`buffer_size` 151|输出图像地址/大小；只能用内容指纹诊断，生产路径没有稳定帧关联字段。|
+|同上|`frame_format` 152、`pitch_bytes` 153|输出格式/字节 stride；没有排序信息。|
+|`SceVideodec2DecoderConfigInfo`|`max_dpb_frames` 72、`pipeline_depth` 73|影响内部 DPB/管线配置，不会出现在输出帧上；本实验为 `dpb=-1, depth=1`。|
+其他 `sceVideodec2` 结构也逐字段复核：`SceVideodec2DecoderConfigInfo` 的 `size/resource_type/codec_type/profile/max_level/max_width/max_height/max_dpb_frames/pipeline_depth/compute_queue/cpu_affinity/cpu_priority/optimize_progressive/check_memory_type/reserved` 均在 64–80 行；`SceVideodec2DecoderMemoryInfo` 的 `size/cpu_size/cpu/gpu_size/gpu/cpu_gpu_size/cpu_gpu/max_frame_size/frame_alignment/reserved` 在 82–93 行；`SceVideodec2ComputeConfigInfo` 的 `size/pipe_id/queue_id/check_memory_type/reserved0/reserved1` 在 95–102 行；`SceVideodec2ComputeMemoryInfo` 的 `size/cpu_gpu_size/cpu_gpu` 在 104–109 行；`SceVideodec2DirectMemory` 的 `size/allocation_size/address/direct_start` 在 114–119 行。它们分别是创建、内存和 compute queue 参数，没有输出图片排序/关联字段。
+
+**ABI 结论：** 当前 SDK/仓库权威头文件没有任何可直接用于输出排序或输入输出关联的字段。唯一可用契约是：caller 送入 PTS，按实测输出顺序建立 FIFO/min-PTS 配对；输出本身不能回读 PTS。
+
+#### 6.3.2 H.264 原始顺序与反例
+
+`PPSA99272` 用真实 packet DTS；normal segment 的输入开头是：
+
+```text
+input display/PTS/DTS = (0,0,-1024), (2,1024,-512), (1,512,0), (4,2048,512), (3,1536,1024)
+```
+
+输出 Y 指纹对应的 display 序列为：
+
+```text
+0,1,3,6,2,5,4,7,9,11,8,10,12,13,15,18,14,17,16,19,21,23,20,22
+```
+
+所有输出均 `valid=1,error=0,picture_count=1,640x368,pitch=768,pitch_bytes=768`，但 FIFO/display 对照 `fifo_failures=16`。最早反例：`out_seq=2 matched_display=3 expected_display=2`；`out_seq=3 matched_display=6 expected_display=3`。因此“把输入 PTS 按 display order 排队、输出 FIFO 直接取最小 PTS”在**传入真实 DTS**时不成立。
+
+同一流改为 `dts=UINT64_MAX` 的 ABI 对照标题 `PPSA99276`：normal、true-IDR resume、320×180→640×368（Baseline→High）切档均输出正确 display FIFO；汇总 `outputs=60, errors=7, fifo_failures=0, unknown=0, duplicates=0, mapping_pass=1`。7 个错误全部来自故意的 non-IDR seek 段，不是正常段顺序错误。
+
+#### 6.3.3 HEVC 原始顺序
+
+`PPSA99273`（真实 DTS）和 `PPSA99277`（`dts=UINT64_MAX`）的 normal segment 都是 display FIFO `0..23`，输出 `valid=1,error=0,picture_count=1`，8-bit `640x368,pitch=768,pitch_bytes=768`；两种 DTS 模式的 normal FIFO failures 均为 0。
+
+`PPSA99277` 汇总：`outputs=48, errors=19, fifo_failures=0, mapping_pass=1`。其中 7 个是 non-IDR seek 段；另外 12 个是第二 GOP 的 HEVC CRA（NAL type 21，不是真正 IDR 19/20）起播失败。后续 true-IDR 分辨率段正常输出，说明失败是起播边界而不是 PTS 配对错乱。
+
+#### 6.3.4 B 层级与最小窗口
+
+`vdec-bdepth` 真实流含 `bf=1` 和 `bf=3` 两段；`ffprobe` 确认 H.264/HEVC 均实际产生 B 帧。固定窗口分析定义为：堆积超过 `W` 帧才弹出当前最小 PTS，EOF 继续弹出。
+
+|codec/输入|输出证据|最小额外窗口|
+|---|---|---:|
+|H.264，真实 DTS，B1|24/24 FIFO，0 failure|0|
+|H.264，真实 DTS，B2|normal FIFO failures=16；固定序列分析为 `W=2`|2（但该 DTS 用法不可生产）|
+|H.264，真实 DTS，B3|FIFO failures=4；固定序列分析为 `W=1`|1（但该 DTS 用法不可生产）|
+|H.264，`dts=UINT64_MAX`，B1/B2/B3|B1/B3 `PPSA99278`、B2 `PPSA99276` 均 display FIFO、0 failure|0|
+|HEVC，真实 DTS，B1/B3；`dts=UINT64_MAX`，B2|三组 normal 均 display FIFO、0 failure|0|
+
+真实 DTS 的 H.264 表项是故意的反例：窗口需求随编码结构变化，不能用于生产。按 ABI 传 unknown DTS 后，H.264/HEVC 已覆盖 B1/B2/B3 的实测输出均为 display FIFO，正常路径的最小额外窗口为 0；实现仍可保留 `W=4` 作为监控上限，超出即 fallback，不把不确定帧硬配给 PTS。`max_dpb_frames=-1` 只让 decoder 自动管理 DPB，OutputInfo 没有把实际 reorder 深度回传出来。
+
+配对伪码与失败检测：
+
+```text
+for each AU in decode order:
+    pending_pts.push(input_display_pts)   # dts = UINT64_MAX
+    rc = sceVideodec2Decode(...)
+    if rc == 0 and output.valid:
+        frame_pts = min_pts(pending_pts)   # normal observed display FIFO; no added reorder delay
+        pending_pts.remove(frame_pts)
+        require output.error == 0 && picture_count == 1
+        require frame_pts >= last_pts
+        require pending_pts.size <= 4       # monitor cap; overflow => fallback, never guess
+    if output.valid == 0 && rc == 0: drain with Flush
+at EOF: Flush until valid == 0; require pending_pts empty
+```
+
+生产必须在以下任一情况立即丢弃 native session 并回退 A：Decode/Flush rc 非 0、`error/picture_count` 异常、输出帧数与 accepted AU 不一致、PTS 重复/倒退/无法从 pending 集合配对、Flush 尾帧无法清空、Reset 后首个 AU 不是可随机访问 IDR、分辨率超过 Create 上限或槽生命周期不满足 GPU fence。
+
+#### 6.3.5 seek、Flush/Reset、切档边界
+
+- **non-IDR seek**：H.264/HEVC Reset 后从 display 5 的非 IDR AU 起播，均出现 `rc=-2128805117, valid=0`；必须拒绝该 seek 点并找下一个 IDR。
+- **跨 GOP / Flush**：normal stream 跨两个 GOP；正常段最后两帧由 Flush 输出，随后 `empty=1`。`dts=UINT64_MAX` 模式下 display FIFO 保持成立。
+- **Reset 后真正 IDR**：H.264 IDR type 5、HEVC IDR type 19/20 后 Reset rc=0，输出顺序/PTS 配对恢复。HEVC CRA type 21 的对照段失败，不能把 CRA 当作安全 seek 起点。
+- **分辨率/档位切换**：Reset 后 H.264 Baseline 320×192 padded → High 640×368、HEVC 320×184 → 640×368 均解出；输出 pitch 分别 512/768。切换必须重新注入参数集并从 true IDR 开始；超出 Create 最大尺寸时重建 decoder。
+
+#### 6.3.6 闸门结论
+
+**PTS/reorder 闸门通过，C 可以进入 P1，但必须固定调用契约：真实 display PTS + `dts=UINT64_MAX`，不能把 FFmpeg decode DTS 传给 `sceVideodec2`。** H.264 的真实-DTS 反例证明了该约束不是优化项。P1 仍只做 8-bit NV12、真实 IDR seek、Flush/Reset、PTS watchdog 和失败回退 A；不能把本实验写成已完成 4K60 present、HDR 或 GPU zero-copy。
+
+### 6.4 P1：固定 URL、8-bit NV12、无复杂交互
 
 建议只做一个固定 DASH 视频 URL + 已验证音频 URL：
 
@@ -276,7 +369,7 @@ result pass=1 complete=1 expected_p010=1 decoded=60
 
 P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 `Decode/Flush` 错误、无槽复用错误；1080p/4K 画面方向、BT.709 limited range、色彩和 crop 正确；AGC `dcb_full/ring_fail/tex_fail/timeouts` 全 0；UI、弹幕、OSD 不被视频覆盖。
 
-### 6.4 P2：可发布生产
+### 6.5 P2：可发布生产
 
 必须补齐：
 
@@ -296,7 +389,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 
 |阶段|工作量（1 人）|能换到什么|
 |---|---:|---|
-|P0 能力探针|2–4 人日（本轮含三标题、流生成、构建、部署、日志解析）|当前 12.00 的 codec/尺寸/P010/内存/decoder P95 结论；本轮 decoder 子项通过，但 PTS/reorder gate 未闭环|
+|P0 能力探针|2–4 人日（本轮含三标题、流生成、构建、部署、日志解析）|当前 12.00 的 codec/尺寸/P010/内存/decoder P95 结论；本轮 decoder 与真实 PTS/reorder gate 均通过|
 |P1 8-bit NV12 原型|5–8 人日；连 P0 合计约 7–12 人日|固定视频链路能跑，CPU 解码释放，初步 4K/HEVC 能力；还不能发布|
 |P2 生产 8-bit|10–16 人日|A/V、seek、fallback、清晰度、长测完整；可覆盖 H.264/HEVC Main|
 |P2 + P010/高质量 AGC|额外 5–10 人日；若需新 AGC shader/toolchain，再加 5–10 人日|10-bit/HDR/高质量 GPU scale；最大不确定性在 pipe 资源和 P010 present|
@@ -304,12 +397,12 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 综合判断：
 
 - **仅要 1080p60**：不值得。A 已交付，C 的网络/同步/内存/VideoOut 风险远大于收益。
-- **要 4K/HEVC/CPU 余量**：decoder 能力已经证明值得保留，但严格 P0 尚未通过；先补 PTS/reorder 子项，再决定是否投入 P1。
+- **要 4K/HEVC/CPU 余量**：decoder 与 PTS/reorder 能力已经证明值得进入受保护 P1；先完成 NV12 present、A/V 时钟、IDR seek 与长测，再决定生产化。
 - **要 4K HEVC Main10 + 高质量 60fps**：仍不能承诺。当前只证明 1080p P010 解码，不覆盖 4K Main10、HDR、GPU CSC、呈现和时钟。
 
 ### 7.2 主要风险与放弃条件
 
-1. **当前 decoder 能力没有触发固件止损**：H.264 4K、HEVC Main 4K、HEVC Main10 1080p 均连续通过；但 PTS/reorder 未闭环，严格规则下停止 P1。
+1. **当前 decoder/PTS gate 没有触发固件止损**：H.264 4K、HEVC Main 4K、HEVC Main10 1080p 和真实 B 帧配对均通过；P1 仍受 present/时钟/seek/fallback 条件约束。
 2. **P010 只解出但无法显示**：若 P010 `out.valid=1`，但 R16/RG16/AGC pipe 无法正确采样或 tone-map，先交付 8-bit HEVC，10-bit 标为 unsupported；不要把 P010 转回 8-bit CPU 后宣称完成目标。
 3. **VideoOut plane 假设错误**：没有 YUV scanout ABI；若 AGC video pipe 无法加载，停止 zero-copy/直写路线，最多做 B1 诊断，不继续挖 undocumented plane。
 4. **内存预算**：4K P010 单帧约 24.9 MiB，仅是输出；decoder GPU/CPU workspace、3 槽、AGC transient、UI/图片缓存还要叠加。若 native 标题在 Query/Create 或长测出现 direct/flexible 分配压力，停止 4K Main10，并让 A 处理可回退样本。
@@ -319,10 +412,10 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 ## 8. 明确推荐
 
 1. **现在不改正式 A 路径，不把 C 合入默认播放。**
-2. **先不进入 P1。** 需要单独补一个 FFmpeg 时间戳 + B 帧输出顺序实验；该实验通过后才重新评估 C。
-3. 未来若 gate 通过，首个原型才做“mpv audio-only + 独立视频线程 + AGC NV12 pipe”，不做 VideoOut YUV plane；AGC pipe 资源缺失时最多用 B1 双平面 shader 验证格式。
-4. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败或不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。这样 C 的失败不会破坏当前 1080p60 交付。
+2. **C 可以进入受保护的 P1**：FFmpeg demux/BSF → `sceVideodec2`，传 display PTS、`dts=UINT64_MAX`，独立视频线程 + 8-bit NV12；真实 IDR seek、Flush/Reset、PTS watchdog 和 native→A fallback 必须先实现。
+3. P1 不做 VideoOut YUV plane、Main10/HDR 或 4K60 present 承诺；AGC pipe 资源缺失时最多用 B1 双平面 shader 验证格式。
+4. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败、PTS watchdog 触发、起播不是 IDR 或 present 不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。
 
 ## 9. 临时实验清理
 
-本轮保留了 `videodec2_probe.c` 的 P0 统计模式，但仅由 `WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_P0=1` 门控；正式标题不触发。三组测试流、options、`PPSA99260/61/62` 本地 dist、`/tmp/*.ffpkg` 与日志均已删除；主机 `/data/homebrew` 已核对只剩正式 `PPSA99233.ffpkg`（另有原有目录），未修改 A 路径，未 push。
+本轮保留了 `videodec2_probe.c` 的 P0/PTS 统计模式，但仅由 `WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_P0=1` 门控；临时 `WILIWILI_VDEC_ORDER`/`DTS_UNKNOWN` 只在 options 中启用，正式标题不触发。PPSA99270–PPSA99278、测试流、sidecar、options、dist、ffpkg、日志和 `resources/vdec-reorder.*` 均已删除；主机 `/data/homebrew` 已核对只剩正式 `PPSA99233.ffpkg`（另有原有目录），未修改 A 路径，未 push。
