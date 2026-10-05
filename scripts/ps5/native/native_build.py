@@ -233,8 +233,10 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     # The platform glue is compiled with the same feature defines as the
     # application: the software rendering variant gates its startup probe on one
     # of them.
-    feature_defines = tuple(d for d in NATIVE_DEFINES if d.startswith("-DWILIWILI_"))
-    extra_sources = ["native_shims.c", "native_fs.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c"]
+    feature_defines = tuple(d for d in NATIVE_DEFINES
+                            if d.startswith("-DWILIWILI_") or d in
+                            ("-DPS5_NATIVE_APP", "-DPS5_NATIVE_AGC", "-DBOREALIS_USE_AGC", "-DEVO_TARGET_PS5"))
+    extra_sources = ["native_shims.c", "native_fs.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c", "native_vdec_play.c"]
     # native_libc_trace.c reports every string and memory call reached with a
     # NULL argument, which is how the software renderer's crash was identified.
     # It wraps hot libc entry points, so it is a diagnostic aid and stays out of
@@ -242,7 +244,8 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     if os.environ.get("PS5_NATIVE_LIBC_TRACE") == "1":
         extra_sources.append("native_libc_trace.c")
     homebrew_include = sdk / "target" / "user" / "homebrew" / "include"
-    probe_defines    = feature_defines + (f"-I{homebrew_include}",)
+    borealis_include = root / "library" / "borealis" / "library" / "include"
+    probe_defines    = feature_defines + (f"-I{homebrew_include}", f"-I{borealis_include}")
     for extra in extra_sources:
         sources.append((Path(__file__).with_name(extra), "-std=gnu11",
                         probe_defines))

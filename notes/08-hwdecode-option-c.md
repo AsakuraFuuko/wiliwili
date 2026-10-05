@@ -11,11 +11,11 @@
 |问题|结论|
 |---|---|
 |C 能否带来 A 没有的能力？|能。硬解路径有机会覆盖 4K、HEVC Main、P010/Main10，并显著释放 CPU；A 只能优化 SW YUV→RGBA/缩放。|
-|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate 已通过；M1 静态 8-bit NV12→AGC→scanout 已在真机通过，但固定 URL M2、A/V 时钟、4K60、P010/HDR 和长测仍未验证。|
-|NV12/P010 能否接现有 AGC？|M1 已导入并验证 GPL-3.0 的预编译 8-bit NV12 pipe：静态 NV12 经 `evo_agc_blit_yuv()` 进入当前 scanout；HDR/planar/upscaler pipe 仍未导入。|
+|当前 12.00 能否直接承诺 4K/HEVC/10-bit/60？|decoder 与 PTS/reorder P0 gate、M1 静态 NV12→AGC→scanout、M2 受保护 8-bit 固定 MP4 链路均已在真机通过；仍不承诺 4K60、B4 DASH 窗口、A/V clock、P010/HDR 或生产长测。|
+|NV12/P010 能否接现有 AGC？|M1/M2 已导入并验证 GPL-3.0 的预编译 8-bit NV12 pipe：真实 HTTP MP4 经 FFmpeg BSF/VDEC/NV12 后由 `evo_agc_blit_yuv()` 进入当前 scanout；HDR/planar/upscaler pipe 仍未导入。|
 |VideoOut 是否能直接注册 NV12/P010 扫描面？|没有证据，按不可行处理。公开/仓库内 API 只显示单一 RGB/BGRA buffer + 两个 scanout buffer，没有 YUV plane/CSC 注册接口。NV12 必须先由 AGC/GL shader 转成最终 BGRA/RGB scanout。|
 |能否保留 mpv？|能保留 mpv 的音频、时钟、pause/speed/property/UI 状态；视频压缩流不能继续让 mpv 读取，否则会重复下载。视频需要独立 FFmpeg demux/BSF → `sceVideodec2` → present。|
-|推荐顺序|保留当前 A；M1 已通过，继续做固定 URL M2：FFmpeg demux/BSF + display PTS + `dts=UINT64_MAX` + VDEC 三槽 + NV12 AGC；任一步 watchdog/fence/present 失败立即回退 A。|
+|推荐顺序|保留当前 A；M1/M2 已通过，进入 M3：用 mpv playback-time 做视频发布节拍，补 pause/speed/seek/切档和长测；任一步 watchdog/fence/present 失败立即回退 A。|
 
 ## 2. 现状盘点
 
@@ -97,6 +97,13 @@ ABI 参考给出的 Create 尺寸档位是 `1920×1088`、`2560×1440`、`3840×
 - 新增 `NativeVideo`/`Ps5NativeVideo` 之类的线程安全 frame seam；由 `VideoView::draw()` 或同等视频绘制点调用 `evo_agc_blit_yuv()`。
 - `VideoView::draw()` 目前先画 mpv 视频，再画弹幕/OSD，见 `wiliwili/source/view/video_view.cpp:627-658`。AGC video quad 必须在 OSD 前进入同一 DCB；不能在 `nvgEndFrame()` 后再画，否则会盖住弹幕/OSD。Borealis 帧循环顺序见 `library/borealis/library/lib/core/application.cpp:761-852`。
 - 处理 AGC frame slot、VideoOut flip、GPU fence、P010 tone-map/HDR metadata 和视频 PTS。`evo_agc_runtime.h:114-168` 的 frame/slot/cache API 可复用，但当前 mpv SW image 路径没有使用它。
+### 4.1.1 AGC 生成 artifact 许可清单
+
+|文件|许可|出处/再生成方式|当前用途|
+|---|---|---|---|
+|`library/borealis/library/lib/extern/nanovg/agc/shaders/video_yuv_nv12_pipe.h`|GPL-3.0；本项目根树同为 GPL-3.0，组合分发允许|`references/EVO-PLAYER-PS5` 的 `projects/evoplayer/media/shaders/video_yuv_nv12.pipe` 及生成器 `tools/build_agc_pipes.py`；按其 gfx1013 目标重新生成后导入。本仓库没有复制参考播放器 runtime。|M1/M2 的 8-bit NV12 AGC shader metadata/ISA；未用于 HDR/P010。|
+
+Apache-2.0 的 borealis 子模块因此包含一个由 GPL-3.0 项目生成、且明确保留来源说明的 GPL artifact；以后若拆分许可边界，应把该 header 移到 GPL-3.0 根树并由 native build 引用，不在本 M2 中顺手重排子模块。
 
 代价与收益：
 
@@ -381,6 +388,33 @@ at EOF: Flush until valid == 0; require pending_pts empty
 - 保留 A 作为启动/codec/present 任一步失败时的回退。
 
 P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 `Decode/Flush` 错误、无槽复用错误；1080p/4K 画面方向、BT.709 limited range、色彩和 crop 正确；AGC `dcb_full/ring_fail/tex_fail/timeouts` 全 0；UI、弹幕、OSD 不被视频覆盖。
+#### 6.5.1 M2 实现设计（真机收据待补）
+
+- `scripts/ps5/native/native_vdec_play.c` 启动一个 FFmpeg demux/BSF 线程；根据 `AVCodecParameters` 建立 H.264/HEVC `h264_mp4toannexb`/`hevc_mp4toannexb`，每个 BSF packet 作为一个 AU，输入 PTS 从 stream time base 换算到 90 kHz，并以首 PTS 做零基准。每个 `sceVideodec2Decode` 都传该 display PTS，`dts` 固定为 `UINT64_MAX`。
+- decoder 配置使用 `max_dpb_frames=-1`、`pipeline_depth=1`；输出 frame pool 和 AU pool 各 3 槽。槽状态为 `FREE → INFLIGHT → READY → CURRENT`，VideoView 只消费 READY 的最小序列；`evo_agc_blit_yuv(..., is_direct=0)` 同步把 NV12 stage 到 AGC transient ring。`Application::frame()` 在 `AgcVideoContext::endFrame()` 返回、DCB fence 已 retire 后调用 `wiliwili_vdec_play_frame_retire()`，当前槽才允许被解码线程复用。
+- pending PTS 上限为 4；输出用 pending 集合的 min-PTS 配对，要求 `error=0`、`picture_count=1`、8-bit pitch/尺寸/地址均有效、输出 PTS 严格单调、`output_count == accepted_count`。Flush 最多 32 次，遇到 rc/error、尾帧不清空、计数不一致或 pending 非空即回退 A。
+- 额外看门狗：单次 Decode/Flush 默认 250 ms，可由 `WILIWILI_VDEC_TIMEOUT_MS` 调整；首个 AU 必须含 H.264 IDR 5 或 HEVC IDR 19/20。`WILIWILI_VDEC_INJECT=bad-stream|reset|window|timeout` 分别覆盖坏 AU、30 帧后 Reset、pending 超窗和解码超时，所有注入都记录 `FALLBACK_A reason=...`。
+- `VideoView::draw()` 在 mpv 视频绘制位置先调用 native NV12，再继续 NanoVG 弹幕/OSD；native 活跃时给 mpv 当前 file 设置 `vid=no`，失败或 stop 时设置 `vid=auto`，所以正式 A 仍由同一个 VideoView 绘制。pause/resume 同时唤醒/阻塞 native demux 线程。M2 原型只验证全屏 AGC quad；`evo_agc_blit_yuv` 当前没有矩形 x/y 参数，非全屏布局仍是后续边界。
+
+固定流测试入口：`WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_PLAY=1` + `WILIWILI_TEST_BV=<BVID>`；可用 `WILIWILI_VDEC_URL=<video.m4s>` 覆盖 API 返回的视频 URL，`WILIWILI_VDEC_AUDIO_URL=<audio.m4s>` 覆盖 mpv 的音频 URL。测试选项只写入 `/tmp/*-options.txt`，不进入 `resources/`。
+
+**M2 真机结果：通过（PPSA99290）。** 测试流是 `/tmp/m2-nob.mp4`，由 `testsrc2 640x368@30 + sine 48k` 生成，`libx264 -bf 0 -g 30 -pix_fmt yuv420p + AAC`，通过 `http://192.168.100.7:18080/m2-nob.mp4` 提供；`ffprobe` 确认 H.264 8-bit、`has_b_frames=0`、时长 180 s。样本和选项均在 `/tmp`，没有进入 `resources/`。
+生成命令：`ffmpeg -f lavfi -i testsrc2=size=640x368:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 180 -c:v libx264 -profile:v high -level 3.1 -bf 0 -g 30 -pix_fmt yuv420p -c:a aac -b:a 96k -movflags +faststart /tmp/m2-nob.mp4`。
+
+- 启动日志：`vdec-play: demux ready ... codec=1 size=640x368 ... bsf=h264_mp4toannexb reorder=0`、`flush_each_decode=1`、`dts=UINT64_MAX`；`decoder ready frame_size=0x6c000`。
+- 约 180 s 真机运行，`inputs=5400 accepted=5400 outputs=5400`，PTS 从 0 到 `16,197,000`（90 kHz）单调；无 `FALLBACK_A`、无 crash、无 `img-net: failed`。`agc health` frame=600/1200/1800/2400/3000/3600/4200/4800/5400/6000/6600/7200/7800/8400/9000/9600/10200 均为 `dcb_full=0 ring_fail=0 tex_fail=0 vo_rc=0`，且 `ring_fail/tex_fail/timeouts` 全 0。health 时间间隔约 10 s，UI/present cadence 约 60 Hz；源视频为 30 fps，M3 仍需用 mpv clock 做正式发布节拍。
+- `/tmp/m2-screen.png` 真机截图显示 AGC 彩色视频在底层，弹幕、播放器控件和右侧 UI 在其上，绘制位置已与 `VideoView::draw()` 正式视频层一致。M2 的 AGC API 是全画布 quad；非全屏矩形仍不宣称支持。
+
+**B 帧边界。** 同一 B 站 DASH H.264 流（`has_b_frames=4`，PPSA99288/PPSA99289）按 pending 上限 4 和 verified `dts=UINT64_MAX` 契约运行；它在首个输出前达到 pending 窗口或 VDEC Flush 错误，按设计记录 `FALLBACK_A`，未计入 M2 通过样本。该结果保留了“超窗/解码错误立即回 A”，后续若要覆盖 B4 真实流必须先扩展已验证 PTS/VDEC 窗口，不能放宽此 gate。
+
+**故意失败注入。** 每项均使用本地 HTTP 真实 MP4，启动后回到 A，日志没有崩溃：
+
+|标题|注入|结果|
+|---|---|---|
+|`PPSA99291`|`WILIWILI_VDEC_INJECT=bad-stream`|`FALLBACK_A reason=injected-bad-stream rc=-9015`；mpv audio active。|
+|`PPSA99292`|`...=reset`|30 帧后 `injected midstream reset rc=0`，随后 `FALLBACK_A reason=injected-reset-failure rc=-9017`。|
+|`PPSA99293`|`...=window`|`FALLBACK_A reason=pending-window-injected rc=-9016`。|
+|`PPSA99294`|`...=timeout`, `WILIWILI_VDEC_TIMEOUT_MS=10`|`FALLBACK_A reason=flush-timeout rc=-9008`；mpv audio active。|
 
 ### 6.6 P2：可发布生产
 
@@ -410,7 +444,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 综合判断：
 
 - **仅要 1080p60**：不值得。A 已交付，C 的网络/同步/内存/VideoOut 风险远大于收益。
-- **要 4K/HEVC/CPU 余量**：decoder、PTS/reorder 和 8-bit NV12 AGC M1 已通过；继续完成固定 URL M2 的 A/V 时钟、IDR seek、watchdog/fallback 与长测，再决定生产化。
+- **要 4K/HEVC/CPU 余量**：decoder、PTS/reorder、8-bit NV12 AGC M1 和固定无重排 MP4 的 M2 已通过；继续完成 M3 的 A/V 时钟、IDR seek、watchdog/fallback 与长测，再决定生产化。
 - **要 4K HEVC Main10 + 高质量 60fps**：仍不能承诺。当前只证明 1080p P010 解码，不覆盖 4K Main10、HDR、GPU CSC、呈现和时钟。
 
 ### 7.2 主要风险与放弃条件
@@ -425,7 +459,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 ## 8. 明确推荐
 
 1. **现在不改正式 A 路径，不把 C 合入默认播放。**
-2. **C 可以继续受保护的 P1**：M1 已打通静态 NV12→AGC→scanout；下一步是 FFmpeg demux/BSF → `sceVideodec2`，传 display PTS、`dts=UINT64_MAX`，独立视频线程 + 8-bit NV12 三槽；真实 IDR seek、Flush/Reset、PTS watchdog 和 native→A fallback 必须先实现。
+2. **C 可以继续进入 M3**：M2 已打通固定 8-bit HTTP MP4 的 FFmpeg demux/BSF → `sceVideodec2` → 三槽 NV12 → AGC scanout，并验证正式 VideoView 层级和 A fallback；M3 负责 playback-time、pause/speed、seek/切档与长测。
 3. P1 不做 VideoOut YUV plane、Main10/HDR 或 4K60 present 承诺；HDR/planar pipe 仍未导入。
 4. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败、PTS watchdog 触发、起播不是 IDR 或 present 不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。
 

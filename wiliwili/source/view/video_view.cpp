@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 #include <borealis/views/label.hpp>
 #include <borealis/views/progress_spinner.hpp>
@@ -34,6 +35,14 @@
 #include "view/video_profile.hpp"
 #include "view/danmaku_core.hpp"
 #include "view/mpv_core.hpp"
+
+#if defined(PS5_NATIVE_APP)
+extern "C" int wiliwili_vdec_play_start(const char *url);
+extern "C" int wiliwili_vdec_play_is_active(void);
+extern "C" void wiliwili_vdec_play_stop(void);
+extern "C" void wiliwili_vdec_play_pause(int paused);
+extern "C" int wiliwili_vdec_play_draw(void);
+#endif
 
 enum ClickState { IDLE = 0, PRESS = 1, FAST_RELEASE = 3, FAST_PRESS = 4, CLICK_DOUBLE = 5 };
 
@@ -619,6 +628,9 @@ void VideoView::requestSeeking(int seek, int delay) {
 
 VideoView::~VideoView() {
     brls::Logger::debug("trying delete VideoView...");
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_stop();
+#endif
     this->unRegisterMpvEvent();
     APP_E->unsubscribe(customEventSubscribeID);
     brls::Logger::debug("Delete VideoView done");
@@ -631,8 +643,16 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     brls::Time current = brls::getCPUTimeUsec();
     bool drawOSD       = this->osd_state == OSDState::ALWAYS_ON || current < this->osdLastShowTime;
 
-    // draw video
-    mpvCore->draw(brls::Rect(x, y, width, height), alpha);
+    // VideoView is the normal video layer: native NV12 first, NanoVG OSD/danmaku after it.
+    bool nativeVideo = false;
+#if defined(PS5_NATIVE_APP)
+    if (this->native_vdec_mpv_suppressed && !wiliwili_vdec_play_is_active()) {
+        mpvCore->command_async("set", "vid", "auto");
+        this->native_vdec_mpv_suppressed = false;
+    }
+    if (this->native_vdec_mpv_suppressed) nativeVideo = wiliwili_vdec_play_draw() != 0;
+#endif
+    if (!nativeVideo) mpvCore->draw(brls::Rect(x, y, width, height), alpha);
 
     // draw highlight progress
     // OSD绘制时，进度条也包含了高能进度条，避免太杂乱仅在不显示 OSD 时绘制
@@ -829,7 +849,25 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
 }
 
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
-    mpvCore->setUrl(url, genExtraUrlParam(start, end, audios));
+    bool nativeVdec = false;
+#if defined(PS5_NATIVE_APP)
+    if (url.rfind("edl://", 0) != 0) nativeVdec = wiliwili_vdec_play_start(url.c_str()) != 0;
+    if (!nativeVdec && this->native_vdec_mpv_suppressed) {
+        mpvCore->command_async("set", "vid", "auto");
+        this->native_vdec_mpv_suppressed = false;
+    }
+#endif
+    std::string extra = genExtraUrlParam(start, end, audios);
+#if defined(PS5_NATIVE_APP)
+    const char* audioOverride = getenv("WILIWILI_VDEC_AUDIO_URL");
+    if (nativeVdec && audioOverride != nullptr && audioOverride[0] != '\0')
+        extra += fmt::format(",audio-file=\"{}\"", audioOverride);
+    if (nativeVdec) {
+        extra += ",vid=no";
+        this->native_vdec_mpv_suppressed = true;
+    }
+#endif
+    mpvCore->setUrl(url, extra);
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::string& audio) {
@@ -837,7 +875,11 @@ void VideoView::setBackupUrl(const std::string& url, int start, int end, const s
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
-    mpvCore->setBackupUrl(url, genExtraUrlParam(start, end, audios));
+    std::string extra = genExtraUrlParam(start, end, audios);
+#if defined(PS5_NATIVE_APP)
+    if (this->native_vdec_mpv_suppressed) extra += ",vid=no";
+#endif
+    mpvCore->setBackupUrl(url, extra);
 }
 
 void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) {
@@ -864,13 +906,23 @@ void VideoView::setUrl(const std::vector<EDLUrl>& edl_urls, int start, int end) 
 
 void VideoView::resume() {
     mpvCore->resume();
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_pause(0);
+#endif
 }
 
 void VideoView::pause() {
     mpvCore->pause();
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_pause(1);
+#endif
 }
 
 void VideoView::stop() {
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_stop();
+    this->native_vdec_mpv_suppressed = false;
+#endif
     mpvCore->stop();
 }
 

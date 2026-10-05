@@ -269,7 +269,9 @@ int main(int argc, char *argv[]) {
             {
                 const char *vdec = getenv("WILIWILI_TEST_VDEC");
                 const char *agc_m1 = getenv("WILIWILI_VDEC_AGC");
-                if (vdec != nullptr && vdec[0] != '\0' && (agc_m1 == nullptr || agc_m1[0] == '\0'))
+                const char *vdec_play = getenv("WILIWILI_VDEC_PLAY");
+                if (vdec != nullptr && vdec[0] != '\0' && (agc_m1 == nullptr || agc_m1[0] == '\0') &&
+                    (vdec_play == nullptr || vdec_play[0] == '\0'))
                     wiliwili_videodec2_probe();
                 /* VDEC_AGC selects the static NV12 M1 frame hook; do not also
                  * spend startup time running the decoder-only P0 probe. */

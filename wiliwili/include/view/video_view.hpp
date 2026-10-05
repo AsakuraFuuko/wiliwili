@@ -367,6 +367,7 @@ private:
     bool showThumbnailPreview  = false;  // 是否显示缩略图预览
 
     MPVCore* mpvCore;
+    bool native_vdec_mpv_suppressed = false;
     brls::Rect oldRect = brls::Rect(-1, -1, -1, -1);
 
     /**

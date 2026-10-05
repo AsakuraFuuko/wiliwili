@@ -136,7 +136,9 @@ extern "C" void wiliwili_agc_m1_draw() {
     if (g_m1_state == -1) {
         const char *test_vdec = std::getenv("WILIWILI_TEST_VDEC");
         const char *agc_m1 = std::getenv("WILIWILI_VDEC_AGC");
-        g_m1_state = (test_vdec && test_vdec[0] != '\0' && agc_m1 && agc_m1[0] != '\0') ? 1 : 0;
+        const char *vdec_play = std::getenv("WILIWILI_VDEC_PLAY");
+        g_m1_state = (test_vdec && test_vdec[0] != '\0' && agc_m1 && agc_m1[0] != '\0' &&
+                      (vdec_play == nullptr || vdec_play[0] == '\0')) ? 1 : 0;
         if (g_m1_state == 1) {
             init_m1_pattern();
             log_line("agc-m1: enabled static BT.601 bars 640x368 -> scanout");
