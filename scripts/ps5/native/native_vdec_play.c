@@ -160,7 +160,7 @@ typedef struct {
     int64_t pending_pts[VDEC_PLAY_PENDING_CAP];
     int pending_count, peak_pending_count;
     int64_t last_output_pts, first_pts, last_pts, timeline_origin_pts, last_clock_pts;
-    int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen;
+    int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen, stress_eof_count;
     double last_logged_speed;
     uint64_t input_count, accepted_count, output_count, presented_count, retired_count, sequence;
     uint64_t advanced_count, dropped_count, error_count, order_error_count;
@@ -1435,6 +1435,8 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     seconds = s->seek_seconds;
     reopen_media = s->source_eof || s->reopen_media;
     if (s->output_count > 0 || s->input_count > 0) current_pts90k = s->last_pts - s->timeline_origin_pts;
+    const int64_t requested_target90k = (int64_t)llround(seconds * 90000.0);
+    if (current_pts90k != INT64_MIN && requested_target90k < current_pts90k) reopen_media = 1;
     s->reopen_media = 0;
     s->seek_requested = 0;
     while (s->present_pending && !play_stop_requested(s) && !s->fallback)
@@ -1450,8 +1452,8 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
         return -1;
     }
     if (reopen_media) {
-        /* A completed HTTP/MP4 input may leave its AVIO demuxer non-seekable after EOF.
-         * Reopen it for replay; ordinary seeks keep the existing demuxer and seek path. */
+        /* EOF or a backward seek can leave the HTTP/MP4 AVIO demuxer in a stale
+         * range state; reopen before seeking, while ordinary forward seeks reuse it. */
         play_media_close(media);
         if (play_media_open(s, media) != 0) {
             play_fail(s, "replay-open", -9022);
@@ -1591,6 +1593,13 @@ static void *play_thread_main(void *opaque) {
                       (unsigned long long)inputs, (unsigned long long)accepted, (unsigned long long)outputs,
                       s->pending_limit, s->peak_pending_count, (unsigned long long)s->error_count,
                       (unsigned long long)s->order_error_count);
+            if (play_gate_value("WILIWILI_VDEC_STRESS") && s->stress_eof_count < 5) {
+                ++s->stress_eof_count;
+                s->seek_seconds = 0.0;
+                s->reopen_media = 1;
+                s->seek_requested = 1;
+                play_logf("m5-stress: eof=%d/5", s->stress_eof_count);
+            }
             while (!play_stop_requested(s) && !s->fallback && !s->seek_requested)
                 pthread_cond_wait(&s->condition, &s->mutex);
             const int restart = !play_stop_requested(s) && !s->fallback && s->seek_requested;
@@ -1633,6 +1642,7 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->trace_au = 0;
     s->seek_seconds = 0.0;
     s->seek_generation = 0;
+    s->stress_eof_count = 0;
     s->pending_count = 0;
     s->peak_pending_count = 0;
     s->last_output_pts = INT64_MIN;
@@ -1793,6 +1803,10 @@ static void play_p010_to_nv12(const uint8_t *src, int src_pitch_bytes, uint8_t *
         for (int x = 0; x < width; ++x) dst_row[x] = play_p010_to_u8(src_row[x]);
     }
 }
+void wiliwili_vdec_p010_to_nv12(const uint8_t *src, int src_pitch_bytes, uint8_t *dst, int dst_pitch_bytes,
+                                int width, int height) {
+    play_p010_to_nv12(src, src_pitch_bytes, dst, dst_pitch_bytes, width, height);
+}
 
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
                             int view_h) {
@@ -1922,7 +1936,6 @@ void wiliwili_vdec_play_frame_retire(void) {
 
 int wiliwili_vdec_play_start(const char *url, int start_seconds) { (void)url; (void)start_seconds; return 0; }
 int wiliwili_vdec_play_seek(double seconds) { (void)seconds; return 0; }
-int wiliwili_vdec_play_is_active(void) { return 0; }
 void wiliwili_vdec_play_stop(void) {}
 void wiliwili_vdec_play_pause(int paused) { (void)paused; }
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,

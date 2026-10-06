@@ -39,9 +39,13 @@ extern "C" {
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
-
 extern "C" void wiliwili_boot_log(const char *message);
+/* Production bridge: P010 (10-bit samples in the high bits) to stable NV12. */
+extern "C" void wiliwili_vdec_p010_to_nv12(const uint8_t *src, int src_pitch_bytes,
+                                            uint8_t *dst, int dst_pitch_bytes,
+                                            int width, int height);
 
 namespace {
 
@@ -74,7 +78,12 @@ constexpr int M1_WIDTH = 640;
 constexpr int M1_HEIGHT = 368;
 static uint8_t g_m1_y[M1_WIDTH * M1_HEIGHT];
 static uint8_t g_m1_uv[M1_WIDTH * M1_HEIGHT / 2];
+static uint16_t g_m1_p010_y[M1_WIDTH * M1_HEIGHT];
+static uint16_t g_m1_p010_uv[M1_WIDTH * M1_HEIGHT / 2];
+static uint8_t g_m1_p010_src[M1_WIDTH * M1_HEIGHT * 3];
+static uint8_t g_m1_p010_nv12[M1_WIDTH * M1_HEIGHT * 3 / 2];
 static int g_m1_state = -1; /* -1 unknown, 0 disabled, 1 active, -2 failed */
+static bool g_m1_p010 = false;
 static uint64_t g_m1_frames = 0;
 
 void init_m1_pattern() {
@@ -94,6 +103,29 @@ void init_m1_pattern() {
             g_m1_uv[y * M1_WIDTH + x * 2 + 1] = v_values[bar];
         }
     }
+}
+void init_m1_p010_pattern() {
+    static const uint16_t u_values[8] = {512, 64, 664, 216, 808, 360, 960, 512};
+    static const uint16_t v_values[8] = {512, 584, 64, 136, 888, 960, 440, 512};
+    for (int y = 0; y < M1_HEIGHT; ++y) {
+        for (int x = 0; x < M1_WIDTH; ++x) {
+            const uint16_t sample = (y < M1_HEIGHT / 2)
+                                        ? static_cast<uint16_t>((16 + ((235 - 16) * ((x * 8) / M1_WIDTH))) << 6)
+                                        : static_cast<uint16_t>((64 + (876 * y) / (M1_HEIGHT - 1)) << 6);
+            g_m1_p010_y[y * M1_WIDTH + x] = sample;
+        }
+    }
+    for (int y = 0; y < M1_HEIGHT / 2; ++y) {
+        for (int x = 0; x < M1_WIDTH / 2; ++x) {
+            const int bar = (x * 8) / (M1_WIDTH / 2);
+            g_m1_p010_uv[y * M1_WIDTH + x * 2 + 0] = u_values[bar] << 6;
+            g_m1_p010_uv[y * M1_WIDTH + x * 2 + 1] = v_values[bar] << 6;
+        }
+    }
+    std::memcpy(g_m1_p010_src, g_m1_p010_y, sizeof(g_m1_p010_y));
+    std::memcpy(g_m1_p010_src + sizeof(g_m1_p010_y), g_m1_p010_uv, sizeof(g_m1_p010_uv));
+    wiliwili_vdec_p010_to_nv12(g_m1_p010_src, M1_WIDTH * 2, g_m1_p010_nv12, M1_WIDTH,
+                               M1_WIDTH, M1_HEIGHT);
 }
 void log_line(const std::string &text) { wiliwili_boot_log(text.c_str()); }
 
@@ -140,16 +172,25 @@ extern "C" void wiliwili_agc_m1_draw() {
         g_m1_state = (test_vdec && test_vdec[0] != '\0' && agc_m1 && agc_m1[0] != '\0' &&
                       (vdec_play == nullptr || vdec_play[0] == '\0')) ? 1 : 0;
         if (g_m1_state == 1) {
-            init_m1_pattern();
-            log_line("agc-m1: enabled static BT.601 bars 640x368 -> scanout");
+            const char *p010 = std::getenv("WILIWILI_VDEC_P010");
+            g_m1_p010 = p010 && p010[0] != '\0';
+            if (g_m1_p010) {
+                init_m1_p010_pattern();
+                log_line("agc-m1: enabled static P010 bars+limited-gray 640x368, range=Y64..940 UV512, converted=NV12");
+            } else {
+                init_m1_pattern();
+                log_line("agc-m1: enabled static BT.601 bars 640x368 -> scanout");
+            }
         }
     }
     if (g_m1_state != 1)
         return;
 
     const int64_t pts_us = static_cast<int64_t>(g_m1_frames) * 33333;
-    const int rc = evo_agc_blit_yuv(g_m1_y, M1_WIDTH,
-                                    g_m1_uv, M1_WIDTH,
+    const uint8_t *y_plane = g_m1_p010 ? g_m1_p010_nv12 : g_m1_y;
+    const uint8_t *uv_plane = g_m1_p010 ? g_m1_p010_nv12 + M1_WIDTH * M1_HEIGHT : g_m1_uv;
+    const int rc = evo_agc_blit_yuv(y_plane, M1_WIDTH,
+                                    uv_plane, M1_WIDTH,
                                     nullptr, 0, nullptr, 0,
                                     M1_WIDTH, M1_HEIGHT,
                                     M1_WIDTH, M1_HEIGHT,
@@ -162,7 +203,8 @@ extern "C" void wiliwili_agc_m1_draw() {
         return;
     }
     if (g_m1_frames == 0) {
-        log_line("agc-m1: first NV12 blit accepted");
+        log_line(g_m1_p010 ? "agc-m1: P010 range Y64..940 UV512 converted once; first NV12 present accepted"
+                           : "agc-m1: first NV12 blit accepted");
     } else if ((g_m1_frames % 120u) == 0u) {
         char line[128];
         std::snprintf(line, sizeof(line), "agc-m1: frames=%llu", (unsigned long long)g_m1_frames);

@@ -674,6 +674,26 @@ void VideoView::runNativeVdecAutotest() {
 #endif
 }
 
+void VideoView::runNativeVdecStress() {
+#if defined(PS5_NATIVE_APP)
+    if (!native_vdec_mpv_suppressed || std::getenv("WILIWILI_VDEC_STRESS") == nullptr) return;
+    const uint64_t now = brls::getCPUTimeUsec();
+    if (native_vdec_stress_next_us == 0) native_vdec_stress_next_us = now + 2000000;
+    if (native_vdec_stress_seek_done < 20 && now >= native_vdec_stress_next_us) {
+        const char *duration_option = std::getenv("WILIWILI_VDEC_STRESS_DURATION");
+        const int configured_duration = duration_option != nullptr ? std::atoi(duration_option) : 0;
+        const int duration = configured_duration > 2 ? configured_duration : (mpvCore->duration > 2 ? mpvCore->duration : 30);
+        const unsigned seed = (unsigned)native_vdec_stress_seek_done * 2654435761u + 1013904223u;
+        const int target = 1 + (int)(seed % (unsigned)(duration - 1));
+        char line[128];
+        std::snprintf(line, sizeof(line), "m5-stress: seek=%d/20 target=%d", native_vdec_stress_seek_done + 1, target);
+        wiliwili_boot_log(line);
+        mpvCore->seek(target);
+        ++native_vdec_stress_seek_done;
+        native_vdec_stress_next_us = now + 1500000;
+    }
+#endif
+}
 
 VideoView::~VideoView() {
     brls::Logger::debug("trying delete VideoView...");
@@ -696,6 +716,7 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     bool nativeVideo = false;
 #if defined(PS5_NATIVE_APP)
     runNativeVdecAutotest();
+    runNativeVdecStress();
     if (this->native_vdec_mpv_suppressed && !wiliwili_vdec_play_is_active()) {
         mpvCore->command_async("set", "vid", "auto");
         this->native_vdec_mpv_suppressed = false;

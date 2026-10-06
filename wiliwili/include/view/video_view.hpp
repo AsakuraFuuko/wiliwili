@@ -372,6 +372,8 @@ private:
     bool native_vdec_autotest_switch_done = false;
     int native_vdec_autotest_stage = 0;
     uint64_t native_vdec_autotest_start_us = 0;
+    int native_vdec_stress_seek_done = 0;
+    uint64_t native_vdec_stress_next_us = 0;
     brls::Rect oldRect = brls::Rect(-1, -1, -1, -1);
 
     /**
@@ -381,6 +383,7 @@ private:
      */
     void requestSeeking(int seek, int delay = 400);
     void runNativeVdecAutotest();
+    void runNativeVdecStress();
 
     bool is_seeking     = false;  // 是否正在请求跳转
     int seeking_range   = 0;      // 跳转的目标进度, 跳转结束后归零

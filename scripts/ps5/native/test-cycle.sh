@@ -1,105 +1,170 @@
 #!/usr/bin/env bash
-# One test cycle for the native title: stop the running title, delete every old
-# test image, upload the freshly built one and capture its UDP boot log.
+# One test cycle for the formal native title: stop the running title, wait for
+# its persistent download data and mount to settle, atomically replace the
+# package, then capture the boot log.  The package is deliberately refreshed
+# under the same title ID; changing the ID would create a new download0/login
+# namespace.
 #
-#   test-cycle.sh <title-id> [listen-seconds]
+#   test-cycle.sh [PPSA99233] [listen-seconds] [options-file]
 #
-# A new TITLE_ID is required for every cycle: ShadowMountPlus caches a title's
-# assets per id and silently keeps serving the old copy ("[SPEED] Skipping file
-# copy (Assets already exist)"), so a rebuilt image under the same id can run
-# stale options/assets. The running title must also exit first, because it owns
-# VideoOut and the audio device.
+# ShadowMountPlus may keep an image mounted while its title is running.  A
+# completed upload to a temporary FTP name followed by RNFR/RNTO replacement
+# gives the scanner a complete package without touching download0.
 set -euo pipefail
 
-title_id=${1:?usage: test-cycle.sh <title-id> [listen-seconds] [options-file]}
+title_id=${1:-PPSA99233}
 listen_seconds=${2:-90}
 options_file=${3:-}
+[[ "$title_id" == PPSA99233 ]] || {
+    echo "only the formal title PPSA99233 is supported" >&2
+    exit 2
+}
 host=${WILIWILI_PS5_HOST:-192.168.102.118}
 ftp_port=${WILIWILI_PS5_FTP_PORT:-2120}
 web_port=${WILIWILI_PS5_WEB_PORT:-8080}
 mgr_port=${WILIWILI_PS5_MGR_PORT:-8084}
 udp_port=${WILIWILI_LOG_UDP_PORT:-9999}
+settle_seconds=${WILIWILI_SHADOWMOUNT_SETTLE_SECONDS:-15}
+build_marker=${WILIWILI_BUILD_MARKER:-}
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 dist="$repo/build-ps5/native/dist/$title_id"
-image="/tmp/$title_id.ffpkg"
 log="/tmp/$title_id-boot.log"
+image="/tmp/$title_id.ffpkg"
+remote_dir=/data/homebrew
+remote_name="$title_id.ffpkg"
+remote_tmp=".${title_id}.ffpkg.upload.$$"
 ufs2="$repo/build-ps5/pkg-experiment/third_party/ufs2tool/linux-x64/linux-x64/UFS2Tool"
 
 [[ -f "$dist/eboot.bin" ]] || { echo "no eboot.bin under $dist" >&2; exit 1; }
 [[ -x "$ufs2" ]] || { echo "missing UFS2Tool at $ufs2" >&2; exit 1; }
 
+# Prefer the marker embedded in this exact eboot so a stale mounted image is
+# distinguishable from this package; callers may override it explicitly.
+if [[ -z "$build_marker" ]]; then
+    build_marker=$(strings "$dist/eboot.bin" 2>/dev/null |
+        grep -m1 -E '^wiliwili: build [A-Z][a-z]{2} [ 0-9][0-9] [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}$' || true)
+fi
+
 # Write the options file here, immediately before packaging: `build-native.sh`
 # wipes dist/assets, so writing it after a build is the only order that works.
+# Credentials are title-owned state, not package options.  Refuse sensitive
+# keys rather than copying them (or merely redacting their console output).
 if [[ -n "$options_file" ]]; then
     [[ -f "$options_file" ]] || { echo "no such options file: $options_file" >&2; exit 1; }
+    if grep -Eiq '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(cookie|password|passwd|token|secret|authorization|credential|api[_-]?key)[A-Za-z0-9_]*[[:space:]]*=' "$options_file"; then
+        echo "options contains a credential key; keep cookie only in /download0/wiliwili/config/wiliwili_config.json" >&2
+        exit 2
+    fi
     cp "$options_file" "$dist/assets/wiliwili-options.txt"
-    safe_options=$(sed 's/^WILIWILI_TEST_BILI_COOKIE=.*/WILIWILI_TEST_BILI_COOKIE=<redacted>/' "$options_file" | tr '\n' ' ')
-    echo "==> options: $safe_options"
+    option_keys=$(awk '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        {
+            key = $0
+            if (index(key, "=") > 0) sub(/[[:space:]]*=.*/, "", key)
+            else key = "<invalid>"
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key !~ /^[A-Za-z_][A-Za-z0-9_]*$/) key = "<invalid>"
+            printf "%s ", key
+        }
+    ' "$options_file")
+    echo "==> options keys: ${option_keys:-<none>}"
 else
     rm -f "$dist/assets/wiliwili-options.txt"
 fi
+echo "==> cookie source: /download0/wiliwili/config/wiliwili_config.json (not packaged)"
 
-echo "==> stopping any running title (it owns VideoOut and the audio device)"
-for pid in $(curl -sS -m 10 "http://$host:$mgr_port/processes_list" 2>/dev/null |
-        python3 -c 'import json,sys
+process_pids() {
+    local listing
+    listing=$(curl -sS --fail -m 10 "http://$host:$mgr_port/processes_list") || return 1
+    python3 -c 'import json,sys
 try:
     data=json.load(sys.stdin)
 except Exception:
-    raise SystemExit
+    raise SystemExit(1)
 for p in data.get("processes", []):
     if p.get("name", "").startswith(("eboot", "PPSA")):
-        print(p["pid"])' 2>/dev/null); do
+        print(p["pid"])' <<<"$listing"
+}
+
+echo "==> stopping any running title (it owns VideoOut and the audio device)"
+pids=$(process_pids) || { echo "cannot read title process state" >&2; exit 1; }
+for pid in $pids; do
     echo "    kill $pid"
     curl -sS -m 15 "http://$host:$mgr_port/process_kill?pid=$pid" >/dev/null 2>&1 || true
 done
-sleep 5
+
+remaining=
+for wait_round in {1..30}; do
+    remaining=$(process_pids) || { echo "cannot verify title shutdown" >&2; exit 1; }
+    [[ -z "$remaining" ]] && break
+    sleep 2
+done
+[[ -z "$remaining" ]] || { echo "title process did not exit; refusing to replace mounted image" >&2; exit 1; }
+echo "==> title stopped; waiting ${settle_seconds}s for download0 persistence and mount release"
+sleep "$settle_seconds"
 
 echo "==> packaging $title_id"
 rm -f "$image"
 DOTNET_ROOT=/opt/dotnet PATH=/opt/dotnet:$PATH \
     "$ufs2" newfs -D "$dist" "$image" wiliwili >/dev/null
 
-# Drop every other test image so ShadowMountPlus cannot reuse a stale mount.
-for old in $(curl -sS --list-only --user anonymous: "ftp://$host:$ftp_port/data/homebrew/" 2>/dev/null |
-        grep -E '^PPSA[0-9]+\.ffpkg$' || true); do
-    [[ "$old" == "$title_id.ffpkg" ]] && continue
-    echo "    removing stale $old"
-    curl -sS --user anonymous: -Q "-DELE /data/homebrew/$old" "ftp://$host:$ftp_port/" >/dev/null 2>&1 || true
-done
-sleep 8
-
-echo "==> uploading $(du -h "$image" | cut -f1)"
+echo "==> uploading $(du -h "$image" | cut -f1) to temporary FTP name"
 curl -sS --fail --connect-timeout 5 --max-time 600 --disable-epsv --user anonymous: \
-    --upload-file "$image" "ftp://$host:$ftp_port/data/homebrew/$title_id.ffpkg"
+    --upload-file "$image" "ftp://$host:$ftp_port$remote_dir/$remote_tmp"
 
-echo "==> waiting for ShadowMountPlus to register the image"
+# The scanner only sees the completed final pathname.  RNFR/RNTO is one FTP
+# server-side rename, so it never observes a partially uploaded final image.
+echo "==> atomically replacing $remote_dir/$remote_name"
+curl -sS --fail --connect-timeout 5 --max-time 60 --disable-epsv --user anonymous: \
+    --quote "RNFR $remote_dir/$remote_tmp" --quote "RNTO $remote_dir/$remote_name" \
+    "ftp://$host:$ftp_port/"
+
+echo "==> waiting for ShadowMountPlus to register the refreshed image"
 sleep 45
 
-( timeout "$listen_seconds" python3 "$repo/scripts/ps5/native/log-listen.py" "$udp_port" > "$log" 2>&1 & )
+( timeout "$listen_seconds" python3 "$repo/scripts/ps5/native/log-listen.py" "$udp_port" |
+    sed -uE \
+        -e 's/(WILIWILI_TEST_BILI_COOKIE=)[^[:space:]]*/\1<redacted>/g' \
+        -e 's/((cookie|authorization|password|passwd|token|secret|api[_-]?key)[=:][[:space:]]*)[^[:space:]]*/\1<redacted>/gi' \
+        > "$log" 2>&1 & )
 sleep 2
 
 echo "==> launching"
 launched=0
 for attempt in 1 2 3 4 5 6; do
-    if curl -sS --fail --connect-timeout 3 --max-time 25 \
-            "http://$host:$web_port/launch?titleId=$title_id" >/dev/null 2>&1; then
+    launch_status=$(curl -sS --connect-timeout 3 --max-time 25 -o /dev/null -w '%{http_code}' \
+        "http://$host:$web_port/launch?titleId=$title_id" || true)
+    if [[ "$launch_status" =~ ^2[0-9][0-9]$ ]]; then
         launched=1
         break
     fi
-    # A 503 usually means "this title is already running" (the previous cycle's
-    # process has not exited yet). Treat a live process as a successful launch.
-    if curl -sS -m 10 "http://$host:$mgr_port/processes_list" 2>/dev/null |
-        grep -q '"name":"eboot'; then
-        echo "    launch returned non-success but a title process is running"
+    if pids=$(process_pids) && [[ -n "$pids" ]]; then
+        echo "    launch HTTP $launch_status; title process observed only to collect boot marker (not acceptance evidence)"
         launched=1
         break
     fi
-    echo "    launch not ready (attempt $attempt), retrying in 15s"
-    sleep 15
+    echo "    launch HTTP $launch_status not ready (attempt $attempt), retrying in 15s"
 done
-[[ $launched == 1 ]] || { echo "launch failed after retries" >&2; exit 1; }
+[[ $launched == 1 ]] || { echo "launch did not return a 2xx response" >&2; exit 1; }
 
-sleep $((listen_seconds - 5))
+if (( listen_seconds > 5 )); then
+    sleep $((listen_seconds - 5))
+else
+    sleep 1
+fi
+if [[ -n "$build_marker" ]]; then
+    grep -Fq -- "$build_marker" "$log" || {
+        echo "boot log did not contain the requested build marker" >&2
+        exit 1
+    }
+else
+    grep -Eq 'wiliwili: build [^[:space:]]+' "$log" || {
+        echo "boot log did not contain a wiliwili build marker" >&2
+        exit 1
+    }
+fi
+echo "==> boot build marker verified"
+
 echo "==> log ($log)"
 cat "$log"
