@@ -494,7 +494,7 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 AGC rect API 已扩展为 `evo_agc_blit_yuv_rect()`，`VideoView::draw()` 将实际 view rect 传入，非全屏时关闭 upscaler 并用 rect aspect/scissor；但当前仍缺独立的非全屏真机截图/字幕对位收据，不能把“代码已接入”写成验收通过。4K present 已有本地全屏收据，非全屏 crop 仍为剩余风险。
 
-**P010/网络/压力状态。** P010 当前走稳定的 P010→NV12 staged 转换，尚未导入 R16/RG16 AGC P010 pipe/tone-map。PPSA99233 默认未显式 adaptive 的本地 4K smoke 日志为 `policy=adaptive limit=6`，`presented=...`、health 三项 0；播放中断收据为 PPSA99233：HTTP 服务在约 10 s 后停止，native 先输出约 480 帧，随后 `FALLBACK_A reason=demux-short-packet rc=-9025`，mpv audio active，后续 health 三项仍为 0，无 crash。备用 URL 自动切换尚未形成独立收据。随机 seek×20、EOF×5、≥30 分钟以及 A/V 漂移分布仍未完成，不能宣称压力项通过。
+**P010/网络/压力状态。** P010 当前走稳定的 P010→NV12 staged 转换，尚未导入 R16/RG16 AGC P010 pipe/tone-map。PPSA99233 静态 P010 smoke 已通过：日志 `agc-m1: enabled static P010 bars+limited-gray`、`P010 range Y64..940 UV512 converted once; first NV12 present accepted`，frame=600…3000 health 三项 0。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：HTTP 服务在约 10 s 后停止，native 先输出约 480 帧，随后 `FALLBACK_A reason=demux-short-packet rc=-9025`，mpv audio active，后续 health 三项仍为 0，无 crash。Range 本地短样本压力已完成 seek=20/20、EOF=1/5，600 AU、无 error/order/drop；其余 EOF 4 次仍未完成。长测旧 M3 约 10 分钟有效；本轮 ≥30 分钟任务启动后因同标题数据/部署故障未形成有效收据，不能宣称压力项通过。
 
 ### 6.6 P2：可发布生产
 
