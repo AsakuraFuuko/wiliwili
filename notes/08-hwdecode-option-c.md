@@ -488,14 +488,14 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 |样本|属性|结果|
 |---|---|---|
-|`/tmp/m5-main10.mp4`|本地 HEVC Main10/P010，640×368，12 s|PPSA99233 `p010=1`，转换到 NV12 后呈现，`accepted/outputs` 连续、`dropped=0/errors=0/order_errors=0`，health 三项 0；这是 SDR 8-bit 转换验证，不是原生 P010 shader/HDR。|
+|`/tmp/m5-main10.mp4`|本地 HEVC Main10/P010，640×368，12 s|PPSA99233 `p010=1`，当前走 staged P010→NV12；早期正常播放收据 `accepted/outputs` 连续、`dropped=0/errors=0/order_errors=0`；这是 SDR 8-bit 转换验证，不是原生 P010 shader/HDR。|
 |`/tmp/m5-4k.mp4`|本地 H.264 3840×2160，8 s|PPSA99233 adaptive `limit=6`，240 AU 全部解码/Flush、`dropped=0/errors=0/order_errors=0`；截图 `/tmp/m5-4k-adaptive-screen.png` 显示色条、弹幕和 OSD，证明本地 4K 源在 1080p scanout 上全屏 present。|
 |`/tmp/m2-nob.mp4`|本地 H.264 640×368、无 B 帧，180 s|PPSA99290，M2 基线通过。|
 |`/tmp/m5-4k-43.mp4`|本地 H.264 2880×2160（4:3），30 s|PPSA99233 adaptive `limit=6`，Fit 与 Crop 均连续 present，`dropped=0/errors=0/order_errors=0`、health 三项 0；截图分别为 `/tmp/m5-99233-4k-43-screen.png` 与 `/tmp/m5-99233-4k-43-crop-screen.png`。|
 
 `evo_agc_blit_yuv_rect()` 现在接收 VideoView 实际 rect 和播放器 aspect mode：默认/固定比例为 Fit（黑边），`-2` 为 Stretch，`-3` 为 Crop；非全屏路径关闭 upscaler，并以 rect scissor 绘制。PPSA99233 的 3840×2160 小 rect 截图 `/tmp/m5-99233-4k-switch-screen.png` 通过；4:3 Fit/Crop 截图显示视频尺寸变化与裁切，弹幕/OSD 均在同一 view rect 上绘制，health 三项 0。
 
-**P010/网络/压力状态。** P010 SDR 仍走稳定的 P010→NV12 staged 转换。新增 GPL-3.0 `video_yuv_p010_hdr_pipe.h`（来源 `references/EVO-PLAYER-PS5`，由 `tools/build_agc_pipes.py` 生成）并接入 `EVO_AGC_PIPE_VIDEO_HDR`：本地合成 PQ P010 `/tmp/m6-hdr-p010.mp4` 的 `trc=16` 真走原生 R16/RG16 AGC pipe→SDR，`inputs=240 accepted=240 outputs=240`，无 fallback/error/order/drop，health frame=600…6000 三项 0；该 pipe 是 PQ→SDR，不是 HDR10 输出信号。现有静态 P010 smoke 仍走 staged SDR 转换。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：长源服务中途停止后 `FALLBACK_A reason=demux-error rc=-5`，随后 mpv audio active，health 三项仍为 0，无 crash。短样本 Range 压力已完成 seek=20/20、EOF=5/5，`EOF inputs=600 accepted=600 outputs=600`、无 error/order/drop，health 三项 0。当前 fresh C 长测在约 197 s、5850 inputs 后仍 `FALLBACK_A reason=flush-timeout rc=-9008`；失败前漂移 96 点 `p50=27.83 ms p95=72.02 ms max=84.02 ms mean=30.54 ms`，`direct_mem` 当前 3.19→6.14 MiB、峰值分配 52.65 MiB、health 26 点全 0；C ≥30m 仍不通过，历史 A 长测继续稳定。
+**P010/网络/压力状态。** P010 SDR 仍走稳定的 P010→NV12 staged 转换。新增 GPL-3.0 `video_yuv_p010_hdr_pipe.h`（来源 `references/EVO-PLAYER-PS5`，由 `tools/build_agc_pipes.py` 生成）并接入 `EVO_AGC_PIPE_VIDEO_HDR`：本地合成 PQ P010 `/tmp/m6-hdr-p010.mp4` 的 `trc=16` fresh 收据为 native `presented` 连续至 `inputs=240 accepted=240 outputs=240`，无 fallback/error/order/drop，health frame=600…6000 三项 0；该 pipe 是 PQ→SDR，不是 HDR10 输出信号。现有静态 P010 smoke 仍走 staged SDR 转换。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：长源服务中途停止后 `FALLBACK_A reason=demux-error rc=-5`，随后 mpv audio active，health 三项仍为 0，无 crash。短样本 Range 压力已完成 seek=20/20、EOF=5/5，`EOF inputs=600 accepted=600 outputs=600`、无 error/order/drop，health 三项 0。当前 fresh C 长测在约 197 s、5850 inputs 后仍 `FALLBACK_A reason=flush-timeout rc=-9008`；失败前漂移 96 点 `p50=27.83 ms p95=72.02 ms max=84.02 ms mean=30.54 ms`，`direct_mem` 当前 3.19→6.14 MiB、峰值分配 52.65 MiB、health 26 点全 0；C ≥30m 仍不通过，历史 A 长测继续稳定。
 
 ### 6.6 P2：可发布生产
 
