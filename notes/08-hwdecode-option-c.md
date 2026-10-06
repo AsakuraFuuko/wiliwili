@@ -497,6 +497,14 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 **P010/网络/压力状态。** P010 SDR 仍走稳定的 P010→NV12 staged 转换。新增 GPL-3.0 `video_yuv_p010_hdr_pipe.h`（来源 `references/EVO-PLAYER-PS5`，由 `tools/build_agc_pipes.py` 生成）并接入 `EVO_AGC_PIPE_VIDEO_HDR`：本地合成 PQ P010 `/tmp/m6-hdr-p010.mp4` 的 `trc=16` fresh 收据为 native `presented` 连续至 `inputs=240 accepted=240 outputs=240`，无 fallback/error/order/drop，health frame=600…6000 三项 0；该 pipe 是 PQ→SDR，不是 HDR10 输出信号。现有静态 P010 smoke 仍走 staged SDR 转换。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：长源服务中途停止后 `FALLBACK_A reason=demux-error rc=-5`，随后 mpv audio active，health 三项仍为 0，无 crash。短样本 Range 压力已完成 seek=20/20、EOF=5/5，`EOF inputs=600 accepted=600 outputs=600`、无 error/order/drop，health 三项 0。当前 fresh C 长测在约 197 s、5850 inputs 后仍 `FALLBACK_A reason=flush-timeout rc=-9008`；失败前漂移 96 点 `p50=27.83 ms p95=72.02 ms max=84.02 ms mean=30.54 ms`；`direct_mem` 从 3.19 MiB 到 6.14 MiB，按完整 197 s 窗口端点斜率约 `0.90 MiB/min`，约 61 s 后进入平台，峰值分配 52.65 MiB；health 26 点全 0。C ≥30m 仍不通过，历史 A 长测继续稳定。
 
+#### 6.5.6 M7：native 视频 rect 坐标回归（2026-10-07）
+
+用户提供的 `/tmp/pos-now.png`（1280×720）显示 native 小窗只占左上约 520×290，右侧/下方为 `brls/clear` 浅灰。根因不是 `vid=no` 跳过页面 UI：`VideoView::draw()` 在 native draw 后仍执行 progress、danmaku、OSD、subtitle；`Application::frame()` 也照常遍历并提交全部 Activity。根因是坐标系错配：AGC SDL 固定 `window=1920×1080`、`content=1280×720`、`windowScale=1.5`；A 路径保存未缩放 NanoVG content rect，由 `nvgScale(windowScale)` 变为物理顶点，native raw DCB 却把同一 `x/y/w/h` 直接当 scanout 像素传给 `evo_agc_blit_yuv_rect()`。因此 800×450 逻辑小窗被画成 800×450 物理像素，截图约为预期的 2/3。
+
+修复位于 `wiliwili/source/view/video_view.cpp`：仅 native AGC 调用前将 VideoView content rect 乘 `brls::Application::windowScale`，再传入 `wiliwili_vdec_play_draw()`；新增一次性 rect 诊断行，记录 logical/physical/scale/mode。A 路径仍把未缩放 rect 交给 `MPVCore::draw()`，未改变。`evo_agc_blit_yuv_rect()` 原本就按 scanout viewport/scissor 工作，Fit(0)/Crop(1)/Stretch(2) 的比例计算也按目标 rect 工作，无需再次换算；AGC 注释现明确该物理坐标契约。
+
+回归归因：真正引入 rect 参数的是 root `cdf0a0a` 与 borealis `81e0f0df` 的 native destination-rect 接线；`a04bc92` 只增加 Fit/Stretch/Crop mode 参数，不是尺寸缩小的引入点。修复构建 marker 为 `Oct  7 2026 07:01:11`；同用户 options 的 `test-cycle.sh PPSA99233 20 /tmp/c-enabled-opts.txt` 已成功替换正式包并启动，boot log 确认两个开关、marker、AGC 1920×1080 初始化和 health=0。该命令本身没有输入注入，故详情页小窗/按叉全屏的后修复截图需在真机进入播放器后取得；当前保留用户的 pre-fix `/tmp/pos-now.png` 作为回归收据，不把未取得的后修复画面冒充验收。
+
 ### 6.6 P2：可发布生产
 
 仍需补齐：

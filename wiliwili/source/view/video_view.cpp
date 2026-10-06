@@ -5,6 +5,8 @@
 #include <limits>
 #include <cmath>
 #include <cstdlib>
+#include <climits>
+#include <cstring>
 #include <cstdio>
 
 #include <borealis/views/label.hpp>
@@ -727,9 +729,28 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
             view_mode = 2;
         else if (mpvCore->video_aspect == -3.0f)
             view_mode = 1;
+
+        /* View::draw receives NanoVG content coordinates. Application::frame
+         * applies windowScale before the AGC UI vertices reach the 1920x1080
+         * scanout; the raw video DCB has no such transform, so pass the same
+         * physical rectangle that the A/NanoVG path produces. */
+        const float nativeScale = brls::Application::windowScale > 0.0f ? brls::Application::windowScale : 1.0f;
+        const int nativeX      = (int)std::lround(x * nativeScale);
+        const int nativeY      = (int)std::lround(y * nativeScale);
+        const int nativeWidth  = (int)std::lround(width * nativeScale);
+        const int nativeHeight = (int)std::lround(height * nativeScale);
+        static int lastRect[5] = {INT_MIN, INT_MIN, INT_MIN, INT_MIN, INT_MIN};
+        const int rect[5]      = {nativeX, nativeY, nativeWidth, nativeHeight, view_mode};
+        if (std::memcmp(lastRect, rect, sizeof(rect)) != 0) {
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "vdec-play: rect logical=%.1f,%.1f %.1fx%.1f physical=%d,%d %dx%d scale=%.3f mode=%d",
+                          x, y, width, height, nativeX, nativeY, nativeWidth, nativeHeight, nativeScale, view_mode);
+            wiliwili_boot_log(line);
+            std::memcpy(lastRect, rect, sizeof(rect));
+        }
         nativeVideo = wiliwili_vdec_play_draw(mpvCore->getPlaybackTime(), mpvCore->getSpeed(), mpvCore->isPaused(),
-                                               (int)std::lround(x), (int)std::lround(y), (int)std::lround(width),
-                                               (int)std::lround(height), view_mode) != 0;
+                                               nativeX, nativeY, nativeWidth, nativeHeight, view_mode) != 0;
     }
 #endif
     if (!nativeVideo) mpvCore->draw(brls::Rect(x, y, width, height), alpha);

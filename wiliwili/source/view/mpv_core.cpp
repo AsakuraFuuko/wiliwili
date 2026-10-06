@@ -975,9 +975,10 @@ void MPVCore::setFrameSize(brls::Rect r) {
     if (std::isnan(rect.getWidth()) || std::isnan(rect.getHeight())) return;
 
 #ifdef MPV_SW_RENDER
-    /* Native SW surfaces follow the player rectangle. The AGC NanoVG rectangle
-     * already uses physical output pixels, so do not scale it a second time.
-     * Recreate buffers only when the rectangle size changes. */
+    /* `rect` is NanoVG content coordinates. Application::frame applies
+     * windowScale to the UI vertices; native AGC callers must apply the same
+     * scale before issuing raw scanout commands. Keep the A texture surface
+     * sized from this unscaled rect so NanoVG does not scale it twice. */
 #ifdef BOREALIS_USE_D3D11
     // 使用 dx11 的拷贝交换，否则视频渲染异常
     const static int mpvImageFlags = NVG_IMAGE_STREAMING | NVG_IMAGE_COPY_SWAP;
