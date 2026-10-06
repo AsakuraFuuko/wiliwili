@@ -1809,7 +1809,7 @@ void wiliwili_vdec_p010_to_nv12(const uint8_t *src, int src_pitch_bytes, uint8_t
 }
 
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
-                            int view_h) {
+                            int view_h, int view_mode) {
     VdecPlaySession *s = &g_vdec_play;
     if (!isfinite(playback_time)) {
         pthread_mutex_lock(&s->mutex);
@@ -1900,7 +1900,7 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     const int rc = evo_agc_blit_yuv_rect(y, y_pitch, uv, uv_pitch,
                                          NULL, 0, NULL, 0, frame->width, frame->height,
                                          s->decoder.visible_width, s->decoder.visible_height,
-                                         view_x, view_y, view_w, view_h, 2, 0, 1, 0,
+                                         view_x, view_y, view_w, view_h, view_mode, 0, 1, 0,
                                          frame->pts90k * 1000000 / 90000);
     if (rc != 0) {
         play_fail_locked(s, "agc-blit", rc);
@@ -1939,8 +1939,9 @@ int wiliwili_vdec_play_seek(double seconds) { (void)seconds; return 0; }
 void wiliwili_vdec_play_stop(void) {}
 void wiliwili_vdec_play_pause(int paused) { (void)paused; }
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
-                            int view_h) {
-    (void)playback_time; (void)speed; (void)paused; (void)view_x; (void)view_y; (void)view_w; (void)view_h; return 0;
+                            int view_h, int view_mode) {
+    (void)playback_time; (void)speed; (void)paused; (void)view_x; (void)view_y; (void)view_w; (void)view_h;
+    (void)view_mode; return 0;
 }
 void wiliwili_vdec_play_frame_retire(void) {}
 

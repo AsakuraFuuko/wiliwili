@@ -491,8 +491,9 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 |`/tmp/m5-main10.mp4`|本地 HEVC Main10/P010，640×368，12 s|PPSA99233 `p010=1`，转换到 NV12 后呈现，`accepted/outputs` 连续、`dropped=0/errors=0/order_errors=0`，health 三项 0；这是 SDR 8-bit 转换验证，不是原生 P010 shader/HDR。|
 |`/tmp/m5-4k.mp4`|本地 H.264 3840×2160，8 s|PPSA99233 adaptive `limit=6`，240 AU 全部解码/Flush、`dropped=0/errors=0/order_errors=0`；截图 `/tmp/m5-4k-adaptive-screen.png` 显示色条、弹幕和 OSD，证明本地 4K 源在 1080p scanout 上全屏 present。|
 |`/tmp/m2-nob.mp4`|本地 H.264 640×368、无 B 帧，180 s|PPSA99290，M2 基线通过。|
+|`/tmp/m5-4k-43.mp4`|本地 H.264 2880×2160（4:3），30 s|PPSA99233 adaptive `limit=6`，Fit 与 Crop 均连续 present，`dropped=0/errors=0/order_errors=0`、health 三项 0；截图分别为 `/tmp/m5-99233-4k-43-screen.png` 与 `/tmp/m5-99233-4k-43-crop-screen.png`。|
 
-AGC rect API 已扩展为 `evo_agc_blit_yuv_rect()`，`VideoView::draw()` 将实际 view rect 传入，非全屏时关闭 upscaler 并用 rect aspect/scissor。4K 全屏截图 `/tmp/m5-4k-adaptive-screen.png` 通过；非全屏切档样本因本地服务 seek `rc=-5` 回退 A，截图未形成 native crop/字幕对位证据，非全屏 crop 仍未验收。
+`evo_agc_blit_yuv_rect()` 现在接收 VideoView 实际 rect 和播放器 aspect mode：默认/固定比例为 Fit（黑边），`-2` 为 Stretch，`-3` 为 Crop；非全屏路径关闭 upscaler，并以 rect scissor 绘制。PPSA99233 的 3840×2160 小 rect 截图 `/tmp/m5-99233-4k-switch-screen.png` 通过；4:3 Fit/Crop 截图显示视频尺寸变化与裁切，弹幕/OSD 均在同一 view rect 上绘制，health 三项 0。
 
 **P010/网络/压力状态。** P010 当前走稳定的 P010→NV12 staged 转换，尚未导入 R16/RG16 AGC P010 pipe/tone-map。PPSA99233 静态 P010 smoke 已通过：日志 `agc-m1: enabled static P010 bars+limited-gray`、`P010 range Y64..940 UV512 converted once; first NV12 present accepted`，frame=600…3000 health 三项 0。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：HTTP 服务在约 10 s 后停止，native 先输出约 480 帧，随后 `FALLBACK_A reason=demux-short-packet rc=-9025`，mpv audio active，后续 health 三项仍为 0，无 crash。短样本 Range 压力已完成 seek=20/20、EOF=5/5，`EOF inputs=600 accepted=600 outputs=600`、无 error/order/drop，health 三项 0。三十分钟本地源长测运行约 33 分钟：C 在约 196 s、5883 inputs 后 `FALLBACK_A reason=flush-timeout rc=-9008`，之前 drift 98 个 presented 样本 `min=0 max=82.69 mean=27.38 p95=70.69 ms`，native 直至失败 `direct_mem` 3.35→60.37 MiB、peak 62.47 MiB；失败后 A 继续到 health frame=119400（约 33 分钟），三项仍 0，A 长跑无崩溃。放宽 watchdog 到 1 s 的重试未形成有效 C 长测收据；该 flush 超时保留为 C 剩余风险。
 
@@ -500,7 +501,7 @@ AGC rect API 已扩展为 `evo_agc_blit_yuv_rect()`，`VideoView::draw()` 将实
 
 仍需补齐：
 
-- 非全屏 rect/crop 的独立真机截图、字幕/弹幕对位和不同宽高比；当前仅有 rect API 与 4K 全屏收据。
+- 4K 非全屏 rect、Fit 黑边、Crop 和字幕/弹幕对位已有 PPSA99233 独立截图：`/tmp/m5-99233-4k-switch-screen.png`、`/tmp/m5-99233-4k-43-screen.png`、`/tmp/m5-99233-4k-43-crop-screen.png`；真实 4K/Main10 语料仍未覆盖。
 - 备用 URL 自动切换仍无独立收据；播放中断已验证干净回退 A（`demux-short-packet`）。
 - HEVC Main10 的原生 R16/RG16 AGC P010 pipe/HDR；当前只是 staged P010→NV12 SDR 转换。
 - 随机 seek×20 已通过；EOF replay×5 已通过短样本；三十分钟总长 A 长测完成但 C 在约 196 s flush-timeout 回退，需修复后重做 native 长测与完整漂移分布。
