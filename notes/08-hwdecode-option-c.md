@@ -480,7 +480,7 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 |`BV1J7411374q` / `151345597`|1080p|H.264|普通 MP4|PPSA99514，presented=3000，limit=6/peak=5|通过|
 |`BV1X4411Z71A` / `111316028`|1080p|H.264|普通 MP4|PPSA99518，presented=2880，limit=6/peak=5|通过|
 
-上述 10 条真实 B 站流构成当前自适应重判集：零回退、零顺序异常；其中 1080p DASH H.264/HEVC 已纳入。尚未覆盖真实 60fps、真实 4K、真实 Main10；1080p 以上其他 UP/档位仍需追加。普通 MP4 1080p 反例的根因和修复见 §6.5.4，旧失败不是当前结果。
+上述 10 条真实 B 站流构成原有自适应重判集：零回退、零顺序异常；其中 1080p DASH H.264/HEVC 已纳入。用户确认当前账号无大会员，真实 60fps 与 4K 清晰度不可得；本轮不把 30fps/低档降级流冒充高档。真实 HEVC Main10 也未取得可独立验收的 B 站轨道；对应工程验证与真实语料分开记录。普通 MP4 1080p 反例的根因和修复见 §6.5.4，旧失败不是当前结果。
 
 **默认晋升。** 在上述通过集上，`video_delay`/`has_b_frames` 一致时使用 `delay+4`，无重排 floor=4，未知/不一致仍安全回 4、硬上限 12。由于当前真实集满足零回退/零顺序异常，代码默认改为 adaptive；`WILIWILI_VDEC_FIXED_PENDING=1` 仅保留作反例实验旋钮。双门控关闭时 A 路径不变；失败仍 `FALLBACK_A`。
 
@@ -495,17 +495,16 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 `evo_agc_blit_yuv_rect()` 现在接收 VideoView 实际 rect 和播放器 aspect mode：默认/固定比例为 Fit（黑边），`-2` 为 Stretch，`-3` 为 Crop；非全屏路径关闭 upscaler，并以 rect scissor 绘制。PPSA99233 的 3840×2160 小 rect 截图 `/tmp/m5-99233-4k-switch-screen.png` 通过；4:3 Fit/Crop 截图显示视频尺寸变化与裁切，弹幕/OSD 均在同一 view rect 上绘制，health 三项 0。
 
-**P010/网络/压力状态。** P010 当前走稳定的 P010→NV12 staged 转换，尚未导入 R16/RG16 AGC P010 pipe/tone-map。PPSA99233 静态 P010 smoke 已通过：日志 `agc-m1: enabled static P010 bars+limited-gray`、`P010 range Y64..940 UV512 converted once; first NV12 present accepted`，frame=600…3000 health 三项 0。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：HTTP 服务在约 10 s 后停止，native 先输出约 480 帧，随后 `FALLBACK_A reason=demux-short-packet rc=-9025`，mpv audio active，后续 health 三项仍为 0，无 crash。短样本 Range 压力已完成 seek=20/20、EOF=5/5，`EOF inputs=600 accepted=600 outputs=600`、无 error/order/drop，health 三项 0。三十分钟本地源长测运行约 33 分钟：C 在约 196 s、5883 inputs 后 `FALLBACK_A reason=flush-timeout rc=-9008`，之前 drift 98 个 presented 样本 `min=0 max=82.69 mean=27.38 p95=70.69 ms`，native 直至失败 `direct_mem` 3.35→60.37 MiB、peak 62.47 MiB；失败后 A 继续到 health frame=119400（约 33 分钟），三项仍 0，A 长跑无崩溃。放宽 watchdog 到 1 s 的重试未形成有效 C 长测收据；该 flush 超时保留为 C 剩余风险。
+**P010/网络/压力状态。** P010 SDR 仍走稳定的 P010→NV12 staged 转换。新增 GPL-3.0 `video_yuv_p010_hdr_pipe.h`（来源 `references/EVO-PLAYER-PS5`，由 `tools/build_agc_pipes.py` 生成）并接入 `EVO_AGC_PIPE_VIDEO_HDR`：本地合成 PQ P010 `/tmp/m6-hdr-p010.mp4` 的 `trc=16` 真走原生 R16/RG16 AGC pipe→SDR，`inputs=240 accepted=240 outputs=240`，无 fallback/error/order/drop，health frame=600…6000 三项 0；该 pipe 是 PQ→SDR，不是 HDR10 输出信号。现有静态 P010 smoke 仍走 staged SDR 转换。PPSA99233 默认 adaptive 本地 4K smoke 通过，`policy=adaptive limit=6`、health 三项 0。播放中断收据为 PPSA99233：长源服务中途停止后 `FALLBACK_A reason=demux-error rc=-5`，随后 mpv audio active，health 三项仍为 0，无 crash。短样本 Range 压力已完成 seek=20/20、EOF=5/5，`EOF inputs=600 accepted=600 outputs=600`、无 error/order/drop，health 三项 0。当前 fresh C 长测在约 197 s、5850 inputs 后仍 `FALLBACK_A reason=flush-timeout rc=-9008`；失败前漂移 96 点 `p50=27.83 ms p95=72.02 ms max=84.02 ms mean=30.54 ms`，`direct_mem` 当前 3.19→6.14 MiB、峰值分配 52.65 MiB、health 26 点全 0；C ≥30m 仍不通过，历史 A 长测继续稳定。
 
 ### 6.6 P2：可发布生产
 
 仍需补齐：
 
-- 4K 非全屏 rect、Fit 黑边、Crop 和弹幕/OSD 对位已有 PPSA99233 独立截图：`/tmp/m5-99233-4k-switch-screen.png`、`/tmp/m5-99233-4k-43-screen.png`、`/tmp/m5-99233-4k-43-crop-screen.png`；`SubtitleCore` 使用同一 view rect，但本轮没有独立加载字幕文件的真机收据；真实 4K/Main10 语料仍未覆盖。
-- 备用 URL 自动切换仍无独立收据；播放中断已验证干净回退 A（`demux-short-packet`）。
-- HEVC Main10 的原生 R16/RG16 AGC P010 pipe/HDR；当前只是 staged P010→NV12 SDR 转换。
-- 随机 seek×20 已通过；EOF replay×5 已通过短样本；三十分钟总长 A 长测完成但 C 在约 196 s flush-timeout 回退，需修复后重做 native 长测与完整漂移分布。
-- 真实 B 站 60fps、4K、Main10 语料。
+- 备用 URL 自动切换本身仍无独立切换收据；当前只验收干净回退 A。
+- HDR10 输出元数据/真实 B 站 Main10 仍未验收；本地原生 P010 仅覆盖 PQ→SDR。
+- 随机 seek×20、EOF replay×5 已通过短样本；C 长测在约 197 s flush-timeout 回退，需修复后重做 ≥30m C 长测；A 历史长测稳定。
+- 真实 B 站 60fps/4K 受当前账号无大会员限制不可得，不把低档降级流冒充高档；本地 60fps/4K 只作为工程验证。
 
 生产验收建议：1080p60 和 4K30/4K60 各至少 10 分钟；HEVC Main10 至少 10 分钟；随机 seek/暂停/倍速/清晰度切换；无崩溃、无黑帧/撕裂、A/V 漂移 <100 ms；默认 profile 的 GPU/AGC health 三项 0；native 不支持的样本自动回退 A。
 

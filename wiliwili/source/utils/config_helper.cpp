@@ -370,8 +370,14 @@ void ProgramConfig::setProgramConfig(const ProgramConfig& conf) {
 }
 
 void ProgramConfig::setCookie(const Cookie& data) {
-    this->cookie = data;
-    if (data.empty()) this->refreshToken.clear();
+    if (data.empty()) {
+        // Logout explicitly passes an empty cookie and must clear the session.
+        this->cookie.clear();
+        this->refreshToken.clear();
+    } else {
+        // Login callbacks may contain only the cookies returned by that response; preserve the other session fields.
+        for (const auto& [key, value] : data) this->cookie[key] = value;
+    }
     this->save();
 }
 

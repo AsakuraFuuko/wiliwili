@@ -160,6 +160,7 @@ typedef struct {
     int64_t pending_pts[VDEC_PLAY_PENDING_CAP];
     int pending_count, peak_pending_count;
     int64_t last_output_pts, first_pts, last_pts, timeline_origin_pts, last_clock_pts;
+    int video_color_trc;
     int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen, stress_eof_count;
     double last_logged_speed;
     uint64_t input_count, accepted_count, output_count, presented_count, retired_count, sequence;
@@ -827,7 +828,7 @@ typedef struct {
     AVRational time_base;
     uint32_t codec;
     int has_reorder;
-    int video_delay, has_b_frames;
+    int video_delay, has_b_frames, color_trc;
     int nal_length_size;
     uint64_t packet_index;
     int trace_head, trace_count;
@@ -1143,6 +1144,8 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     }
     AVStream *stream = format->streams[stream_index];
     media->video_delay = stream->codecpar->video_delay;
+    media->color_trc = stream->codecpar->color_trc;
+    s->video_color_trc = media->color_trc > 0 ? media->color_trc : 1;
     media->has_reorder = media->video_delay > 0;
     int probe_has_b_frames = -1;
     int probe_delay = -1;
@@ -1202,10 +1205,13 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
             media->nal_length_size = (stream->codecpar->extradata[length_offset] & 3) + 1;
         if (media->nal_length_size < 1 || media->nal_length_size > 4) media->nal_length_size = 4;
     }
-    play_logf("vdec-play: demux ready stream=%d codec=%u size=%dx%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
+    play_logf("vdec-play: demux ready stream=%d codec=%u size=%dx%d fps=%d/%d profile=%d format=%d bits=%d trc=%d "
+              "timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
               stream_index, media->codec, stream->codecpar->width, stream->codecpar->height,
-              media->time_base.num, media->time_base.den, stream->codecpar->codec_tag,
-              stream->codecpar->extradata_size, media->nal_length_size, filter_name, media->has_reorder);
+              stream->avg_frame_rate.num, stream->avg_frame_rate.den, stream->codecpar->profile, stream->codecpar->format,
+              stream->codecpar->bits_per_raw_sample, media->color_trc, media->time_base.num, media->time_base.den,
+              stream->codecpar->codec_tag, stream->codecpar->extradata_size, media->nal_length_size, filter_name,
+              media->has_reorder);
     return 0;
 }
 static int play_packet_is_complete(const VdecPlayMedia *media, const AVPacket *packet) {
@@ -1639,6 +1645,7 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->pending_limit_override = 0;
     s->adaptive_pending = 1;
     s->p010_enabled = 0;
+    s->video_color_trc = 1;
     s->trace_au = 0;
     s->seek_seconds = 0.0;
     s->seek_generation = 0;
@@ -1884,7 +1891,10 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     const uint8_t *uv = source + (size_t)frame->pitch_bytes * frame->height;
     int y_pitch = frame->pitch_bytes;
     int uv_pitch = frame->pitch_bytes;
-    if (frame->p010) {
+    int ten_bit = 0;
+    int color_trc = 1;
+    const int native_p010_hdr = frame->p010 && (s->video_color_trc == 16 || s->video_color_trc == 18);
+    if (frame->p010 && !native_p010_hdr) {
         if (!s->decoder.p010_pool.address) {
             play_fail_locked(s, "p010-conversion-pool", -9027);
             pthread_mutex_unlock(&s->mutex);
@@ -1896,12 +1906,15 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
         uv = converted + (size_t)frame->pitch * frame->height;
         y_pitch = frame->pitch;
         uv_pitch = frame->pitch;
+    } else if (native_p010_hdr) {
+        ten_bit = 1;
+        color_trc = s->video_color_trc;
     }
     const int rc = evo_agc_blit_yuv_rect(y, y_pitch, uv, uv_pitch,
                                          NULL, 0, NULL, 0, frame->width, frame->height,
                                          s->decoder.visible_width, s->decoder.visible_height,
-                                         view_x, view_y, view_w, view_h, view_mode, 0, 1, 0,
-                                         frame->pts90k * 1000000 / 90000);
+                                         view_x, view_y, view_w, view_h, view_mode, ten_bit, color_trc,
+                                         0, frame->pts90k * 1000000 / 90000);
     if (rc != 0) {
         play_fail_locked(s, "agc-blit", rc);
         pthread_mutex_unlock(&s->mutex);
