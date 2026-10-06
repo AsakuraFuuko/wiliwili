@@ -34,7 +34,8 @@ ufs2="$repo/build-ps5/pkg-experiment/third_party/ufs2tool/linux-x64/linux-x64/UF
 if [[ -n "$options_file" ]]; then
     [[ -f "$options_file" ]] || { echo "no such options file: $options_file" >&2; exit 1; }
     cp "$options_file" "$dist/assets/wiliwili-options.txt"
-    echo "==> options: $(tr '\n' ' ' < "$options_file")"
+    safe_options=$(sed 's/^WILIWILI_TEST_BILI_COOKIE=.*/WILIWILI_TEST_BILI_COOKIE=<redacted>/' "$options_file" | tr '\n' ' ')
+    echo "==> options: $safe_options"
 else
     rm -f "$dist/assets/wiliwili-options.txt"
 fi

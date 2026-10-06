@@ -699,24 +699,31 @@ static void wiliwili_apply_options(void) {
     int fd = open("/app0/assets/wiliwili-options.txt", O_RDONLY, 0);
     if (fd < 0) return;
 
-    char data[1024];
+    char data[4096];
     long size = read(fd, data, sizeof(data) - 1);
     close(fd);
     if (size <= 0) return;
     data[size] = '\0';
 
     char *line = data;
+    const char secret_option[] = "WILIWILI_TEST_BILI_COOKIE=";
     while (*line != '\0') {
         char *end = line;
         while (*end != '\0' && *end != '\n') ++end;
         char saved = *end;
         *end       = '\0';
         if (line[0] != '#' && line[0] != '\0') {
-            char *entry = malloc((size_t)(end - line) + 1);
+            const size_t line_length = (size_t)(end - line);
+            const int secret = line_length >= sizeof(secret_option) - 1 &&
+                                memcmp(line, secret_option, sizeof(secret_option) - 1) == 0;
+            char *entry = malloc(line_length + 1);
             if (entry != 0) {
-                memcpy(entry, line, (size_t)(end - line) + 1);
+                memcpy(entry, line, line_length + 1);
                 putenv(entry);
-                wiliwili_boot_log(entry);
+                if (secret)
+                    wiliwili_boot_log("WILIWILI_TEST_BILI_COOKIE=<redacted>");
+                else
+                    wiliwili_boot_log(entry);
             }
         }
         if (saved == '\0') break;

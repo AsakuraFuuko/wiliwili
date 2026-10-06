@@ -939,7 +939,12 @@ void ProgramConfig::save() {
     const std::string path = this->getConfigDir() + "/wiliwili_config.json";
     // fs is defined in cpr/cpr.h
 #ifndef IOS
-    cpr::fs::create_directories(this->getConfigDir());
+    try {
+        cpr::fs::create_directories(this->getConfigDir());
+    } catch (const std::exception& e) {
+        brls::Logger::error("Cannot create config directory {}: {}", this->getConfigDir(), e.what());
+        return;
+    }
 #endif
     nlohmann::json content(*this);
     std::ofstream writeFile(path);

@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <math.h>
 
 #if defined(PS5_NATIVE_APP) && defined(BOREALIS_USE_AGC)
@@ -119,7 +120,7 @@ typedef struct {
 } VdecPlayFlexibleMemory;
 
 typedef struct {
-    VdecPlayDirectMemory compute, gpu, cpu_gpu, au_pool, frame_pool;
+    VdecPlayDirectMemory compute, gpu, cpu_gpu, au_pool, frame_pool, p010_pool;
     VdecPlayFlexibleMemory cpu;
     uint64_t frame_size;
     void *compute_queue, *decoder;
@@ -136,7 +137,7 @@ typedef enum {
 
 typedef struct {
     VdecPlaySlotState state;
-    int width, height, pitch, pitch_bytes;
+    int width, height, pitch, pitch_bytes, p010;
     int64_t pts90k;
     uint64_t sequence;
 } VdecPlaySlot;
@@ -147,7 +148,7 @@ typedef struct {
     pthread_t thread;
     int thread_started;
     volatile int stop_requested;
-    int timeout_ms, flush_each_decode, trace_au, pending_limit, pending_limit_override, adaptive_pending;
+    int timeout_ms, flush_each_decode, trace_au, pending_limit, pending_limit_override, adaptive_pending, p010_enabled;
     volatile int paused;
     volatile int seek_requested;
     int active, fallback, failure_logged, resources_live, decoder_ready, source_eof, reopen_media;
@@ -271,6 +272,7 @@ static void play_free_flexible(VdecPlayFlexibleMemory *m) {
 static void play_decoder_close(VdecPlayDecoder *d) {
     if (!d) return;
     if (d->decoder) sceVideodec2DeleteDecoder(d->decoder);
+    play_free_direct(&d->p010_pool);
     play_free_direct(&d->frame_pool);
     play_free_direct(&d->au_pool);
     play_free_direct(&d->cpu_gpu);
@@ -436,11 +438,16 @@ static int play_account_output_locked(VdecPlaySession *s, int input_slot, const 
     const uint64_t row_bytes = out->pitch_bytes != 0 ? out->pitch_bytes : out->pitch;
     const uint64_t required = row_bytes * ((uint64_t)out->height + ((uint64_t)out->height + 1u) / 2u);
     const int slot = play_output_slot(s, out);
-    const int invalid = out->error || out->picture_count != 1 || out->codec != s->decoder.codec || p010 ||
+    if (p010 && !s->p010_enabled) {
+        play_release_slot_locked(s, input_slot);
+        play_fail_locked(s, "p010-disabled", -9026);
+        return -1;
+    }
+    const int pitch_invalid = p010 ? out->pitch_bytes != out->pitch * 2u : out->pitch_bytes != out->pitch;
+    const int invalid = out->error || out->picture_count != 1 || out->codec != s->decoder.codec ||
                         out->width < (uint32_t)s->decoder.visible_width ||
-                        out->height < (uint32_t)s->decoder.visible_height || out->pitch < out->width ||
-                        out->pitch_bytes != out->pitch || out->buffer == NULL || out->buffer_size < required ||
-                        slot < 0;
+                        out->height < (uint32_t)s->decoder.visible_height || out->pitch < out->width || pitch_invalid ||
+                        out->buffer == NULL || out->buffer_size < required || slot < 0;
     if (invalid) {
         play_release_slot_locked(s, input_slot);
         play_fail_locked(s, "output-contract", -9002);
@@ -471,6 +478,7 @@ static int play_account_output_locked(VdecPlaySession *s, int input_slot, const 
     s->slots[slot].height = (int)out->height;
     s->slots[slot].pitch = (int)out->pitch;
     s->slots[slot].pitch_bytes = (int)out->pitch_bytes;
+    s->slots[slot].p010 = p010;
     s->slots[slot].pts90k = pts90k;
     s->slots[slot].sequence = ++s->sequence;
     if (s->ready_count >= VDEC_PLAY_SLOTS) {
@@ -579,6 +587,12 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
         !play_alloc_direct(&s->decoder.au_pool, limit, VDEC_PLAY_AU_BYTES * VDEC_PLAY_SLOTS, 0x32) ||
         !play_alloc_direct(&s->decoder.frame_pool, limit, (size_t)s->decoder.frame_size * VDEC_PLAY_SLOTS, 0x32)) {
         play_logf("vdec-play: frame pool allocation failed frame_size=0x%llx",
+                  (unsigned long long)s->decoder.frame_size);
+        return -1;
+    }
+    if (s->p010_enabled && !play_alloc_direct(&s->decoder.p010_pool, limit,
+                                               (size_t)s->decoder.frame_size * VDEC_PLAY_SLOTS, 0x32)) {
+        play_logf("vdec-play: P010 conversion pool allocation failed frame_size=0x%llx",
                   (unsigned long long)s->decoder.frame_size);
         return -1;
     }
@@ -985,6 +999,99 @@ static void play_media_close(VdecPlayMedia *media) {
     memset(media, 0, sizeof(*media));
 }
 
+static int play_bili_media_url(const char *url) {
+    const char *authority = strstr(url, "://");
+    if (authority == NULL) return 0;
+    authority += 3;
+    const char *end = strchr(authority, '/');
+    if (end == NULL) end = authority + strlen(authority);
+    const char *port = memchr(authority, ':', (size_t)(end - authority));
+    if (port != NULL) end = port;
+    const size_t host_length = (size_t)(end - authority);
+    static const char *const suffixes[] = {"bilivideo.com", "bilivideo.cn", "bilibili.com", "hdslb.com"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
+        const size_t suffix_length = strlen(suffixes[i]);
+        if (host_length == suffix_length && strncmp(authority, suffixes[i], suffix_length) == 0) return 1;
+        if (host_length > suffix_length && authority[host_length - suffix_length - 1] == '.' &&
+            strncmp(authority + host_length - suffix_length, suffixes[i], suffix_length) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int play_json_space(char value) {
+    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
+}
+
+static int play_json_string(const char *begin, const char *end, const char *key, char *value, size_t capacity) {
+    char needle[64];
+    const int needle_length = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (needle_length <= 0 || (size_t)needle_length >= sizeof(needle)) return 0;
+    const char *cursor = begin;
+    while (cursor < end) {
+        const char *match = strstr(cursor, needle);
+        if (match == NULL || match >= end) return 0;
+        cursor = match + needle_length;
+        while (cursor < end && play_json_space(*cursor)) ++cursor;
+        if (cursor >= end || *cursor++ != ':') continue;
+        while (cursor < end && play_json_space(*cursor)) ++cursor;
+        if (cursor >= end || *cursor++ != '"') continue;
+        size_t used = 0;
+        while (cursor < end && *cursor != '"') {
+            unsigned char decoded;
+            if (*cursor == '\\') {
+                if (++cursor >= end) return 0;
+                if (*cursor == '"' || *cursor == '\\' || *cursor == '/')
+                    decoded = (unsigned char)*cursor;
+                else
+                    return 0;
+            } else {
+                decoded = (unsigned char)*cursor;
+            }
+            if (decoded == '\r' || decoded == '\n' || used + 1 >= capacity) return 0;
+            value[used++] = (char)decoded;
+            ++cursor;
+        }
+        if (cursor >= end || *cursor != '"') return 0;
+        value[used] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+static int play_load_bili_cookie(char *cookie, size_t capacity) {
+    cookie[0] = '\0';
+    int fd = open("/download0/wiliwili/config/wiliwili_config.json", O_RDONLY, 0);
+    if (fd < 0) return 0;
+    char json[16384];
+    const long size = read(fd, json, sizeof(json) - 1);
+    close(fd);
+    if (size <= 0 || size >= (long)sizeof(json)) return 0;
+    json[size] = '\0';
+    const char *cookie_key = strstr(json, "\"cookie\"");
+    if (cookie_key == NULL) return 0;
+    const char *object = strchr(cookie_key, '{');
+    if (object == NULL) return 0;
+    const char *object_end = strchr(object + 1, '}');
+    if (object_end == NULL) return 0;
+    static const char *const names[] = {"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5",
+                                        "_uuid", "buvid3", "sid"};
+    size_t used = 0;
+    int fields = 0;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        char value[512];
+        if (!play_json_string(object + 1, object_end, names[i], value, sizeof(value)) || value[0] == '\0') continue;
+        const int written = snprintf(cookie + used, capacity - used, "%s%s=%s", fields ? "; " : "", names[i], value);
+        if (written < 0 || (size_t)written >= capacity - used) {
+            cookie[0] = '\0';
+            return -1;
+        }
+        used += (size_t)written;
+        ++fields;
+    }
+    return fields;
+}
+
 static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     AVFormatContext *format = avformat_alloc_context();
     if (!format) {
@@ -1000,7 +1107,21 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     av_dict_set(&options, "reconnect_delay_max", "1", 0);
     av_dict_set(&options, "reconnect_on_network_error", "1", 0);
     av_dict_set(&options, "multiple_requests", "1", 0);
-    av_dict_set(&options, "headers", "Referer: https://www.bilibili.com\r\nUser-Agent: Mozilla/5.0\r\n", 0);
+    char cookie[2048];
+    const int bili_url = play_bili_media_url(s->source_url);
+    const int cookie_fields = bili_url ? play_load_bili_cookie(cookie, sizeof(cookie)) : 0;
+    char headers[4096];
+    const int header_length = snprintf(headers, sizeof(headers),
+                                       "Referer: https://www.bilibili.com\r\nUser-Agent: Mozilla/5.0\r\n%s%s\r\n",
+                                       cookie_fields > 0 ? "Cookie: " : "", cookie_fields > 0 ? cookie : "");
+    if (header_length > 0 && (size_t)header_length < sizeof(headers))
+        av_dict_set(&options, "headers", headers, 0);
+    if (bili_url && cookie_fields > 0)
+        play_logf("vdec-play: bili-cookie=config fields=%d", cookie_fields);
+    else if (bili_url && cookie_fields < 0)
+        play_logf("vdec-play: bili-cookie=config-too-large");
+    else if (bili_url)
+        play_logf("vdec-play: bili-cookie=config-missing");
     int rc = avformat_open_input(&format, s->source_url, NULL, &options);
     av_dict_free(&options);
     if (rc < 0) {
@@ -1507,7 +1628,8 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->flush_each_decode = 1;
     s->pending_limit = VDEC_PLAY_PENDING_LIMIT;
     s->pending_limit_override = 0;
-    s->adaptive_pending = 0;
+    s->adaptive_pending = 1;
+    s->p010_enabled = 0;
     s->trace_au = 0;
     s->seek_seconds = 0.0;
     s->seek_generation = 0;
@@ -1580,7 +1702,10 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     const char *timeout = getenv("WILIWILI_VDEC_TIMEOUT_MS");
     if (timeout && atoi(timeout) > 0) s->timeout_ms = atoi(timeout);
     s->trace_au = play_gate_value("WILIWILI_VDEC_TRACE_AU");
-    s->adaptive_pending = play_gate_value("WILIWILI_VDEC_ADAPTIVE_PENDING");
+    s->adaptive_pending = 1;
+    if (play_gate_value("WILIWILI_VDEC_FIXED_PENDING")) s->adaptive_pending = 0;
+    s->p010_enabled = play_gate_value("WILIWILI_VDEC_P010");
+    play_logf("vdec-play: p010-present=%d", s->p010_enabled);
     const char *pending_limit = getenv("WILIWILI_VDEC_PENDING_LIMIT");
     if (pending_limit != NULL) {
         const int requested_limit = atoi(pending_limit);
@@ -1607,9 +1732,9 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     }
     s->thread_started = 1;
     pthread_mutex_unlock(&s->mutex);
-    play_logf("vdec-play: start source=%s inject=%s timeout_ms=%d pending_limit=%d adaptive_pending=%d start=%d trace_au=%d dts=UINT64_MAX",
+    play_logf("vdec-play: start source=%s inject=%s timeout_ms=%d pending_limit=%d adaptive_pending=%d p010=%d start=%d trace_au=%d dts=UINT64_MAX",
               s->source_url, s->inject[0] ? s->inject : "none", s->timeout_ms, s->pending_limit,
-              s->adaptive_pending, start_seconds, s->trace_au);
+              s->adaptive_pending, s->p010_enabled, start_seconds, s->trace_au);
     return 1;
 }
 
@@ -1647,7 +1772,30 @@ void wiliwili_vdec_play_pause(int paused) {
     pthread_mutex_unlock(&s->mutex);
 }
 
-int wiliwili_vdec_play_draw(double playback_time, double speed, int paused) {
+static uint8_t play_p010_to_u8(uint16_t sample) {
+    const unsigned value = (unsigned)(sample >> 6);
+    const unsigned rounded = (value + 2u) >> 2;
+    return (uint8_t)(rounded > 255u ? 255u : rounded);
+}
+
+static void play_p010_to_nv12(const uint8_t *src, int src_pitch_bytes, uint8_t *dst, int dst_pitch_bytes,
+                              int width, int height) {
+    const uint8_t *src_uv = src + (size_t)src_pitch_bytes * height;
+    uint8_t *dst_uv = dst + (size_t)dst_pitch_bytes * height;
+    for (int row = 0; row < height; ++row) {
+        const uint16_t *src_row = (const uint16_t *)(src + (size_t)row * src_pitch_bytes);
+        uint8_t *dst_row = dst + (size_t)row * dst_pitch_bytes;
+        for (int x = 0; x < width; ++x) dst_row[x] = play_p010_to_u8(src_row[x]);
+    }
+    for (int row = 0; row < (height + 1) / 2; ++row) {
+        const uint16_t *src_row = (const uint16_t *)(src_uv + (size_t)row * src_pitch_bytes);
+        uint8_t *dst_row = dst_uv + (size_t)row * dst_pitch_bytes;
+        for (int x = 0; x < width; ++x) dst_row[x] = play_p010_to_u8(src_row[x]);
+    }
+}
+
+int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
+                            int view_h) {
     VdecPlaySession *s = &g_vdec_play;
     if (!isfinite(playback_time)) {
         pthread_mutex_lock(&s->mutex);
@@ -1716,13 +1864,30 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused) {
         return 1;
     }
     VdecPlaySlot *frame = &s->slots[slot];
-    const uint8_t *y = (const uint8_t *)s->decoder.frame_pool.address +
-                       (size_t)slot * s->decoder.frame_size;
-    const uint8_t *uv = y + (size_t)frame->pitch_bytes * frame->height;
-    const int rc = evo_agc_blit_yuv(y, frame->pitch_bytes, uv, frame->pitch_bytes,
-                                    NULL, 0, NULL, 0, frame->width, frame->height,
-                                    s->decoder.visible_width, s->decoder.visible_height,
-                                    2, 0, 1, 0, frame->pts90k * 1000000 / 90000);
+    const uint8_t *source = (const uint8_t *)s->decoder.frame_pool.address +
+                             (size_t)slot * s->decoder.frame_size;
+    const uint8_t *y = source;
+    const uint8_t *uv = source + (size_t)frame->pitch_bytes * frame->height;
+    int y_pitch = frame->pitch_bytes;
+    int uv_pitch = frame->pitch_bytes;
+    if (frame->p010) {
+        if (!s->decoder.p010_pool.address) {
+            play_fail_locked(s, "p010-conversion-pool", -9027);
+            pthread_mutex_unlock(&s->mutex);
+            return 0;
+        }
+        uint8_t *converted = (uint8_t *)s->decoder.p010_pool.address + (size_t)slot * s->decoder.frame_size;
+        play_p010_to_nv12(source, frame->pitch_bytes, converted, frame->pitch, frame->width, frame->height);
+        y = converted;
+        uv = converted + (size_t)frame->pitch * frame->height;
+        y_pitch = frame->pitch;
+        uv_pitch = frame->pitch;
+    }
+    const int rc = evo_agc_blit_yuv_rect(y, y_pitch, uv, uv_pitch,
+                                         NULL, 0, NULL, 0, frame->width, frame->height,
+                                         s->decoder.visible_width, s->decoder.visible_height,
+                                         view_x, view_y, view_w, view_h, 2, 0, 1, 0,
+                                         frame->pts90k * 1000000 / 90000);
     if (rc != 0) {
         play_fail_locked(s, "agc-blit", rc);
         pthread_mutex_unlock(&s->mutex);
@@ -1760,8 +1925,9 @@ int wiliwili_vdec_play_seek(double seconds) { (void)seconds; return 0; }
 int wiliwili_vdec_play_is_active(void) { return 0; }
 void wiliwili_vdec_play_stop(void) {}
 void wiliwili_vdec_play_pause(int paused) { (void)paused; }
-int wiliwili_vdec_play_draw(double playback_time, double speed, int paused) {
-    (void)playback_time; (void)speed; (void)paused; return 0;
+int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
+                            int view_h) {
+    (void)playback_time; (void)speed; (void)paused; (void)view_x; (void)view_y; (void)view_w; (void)view_h; return 0;
 }
 void wiliwili_vdec_play_frame_retire(void) {}
 
