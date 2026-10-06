@@ -501,7 +501,7 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 仍需补齐：
 
-- 4K 非全屏 rect、Fit 黑边、Crop 和字幕/弹幕对位已有 PPSA99233 独立截图：`/tmp/m5-99233-4k-switch-screen.png`、`/tmp/m5-99233-4k-43-screen.png`、`/tmp/m5-99233-4k-43-crop-screen.png`；真实 4K/Main10 语料仍未覆盖。
+- 4K 非全屏 rect、Fit 黑边、Crop 和弹幕/OSD 对位已有 PPSA99233 独立截图：`/tmp/m5-99233-4k-switch-screen.png`、`/tmp/m5-99233-4k-43-screen.png`、`/tmp/m5-99233-4k-43-crop-screen.png`；`SubtitleCore` 使用同一 view rect，但本轮没有独立加载字幕文件的真机收据；真实 4K/Main10 语料仍未覆盖。
 - 备用 URL 自动切换仍无独立收据；播放中断已验证干净回退 A（`demux-short-packet`）。
 - HEVC Main10 的原生 R16/RG16 AGC P010 pipe/HDR；当前只是 staged P010→NV12 SDR 转换。
 - 随机 seek×20 已通过；EOF replay×5 已通过短样本；三十分钟总长 A 长测完成但 C 在约 196 s flush-timeout 回退，需修复后重做 native 长测与完整漂移分布。
