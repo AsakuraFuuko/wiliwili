@@ -46,6 +46,10 @@ enum {
     VDEC_PLAY_TIMEOUT_MS_DEFAULT = 250,
     VDEC_PLAY_MAX_FLUSH = 32,
     VDEC_PLAY_BACKUP_CAP         = 4,
+    VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS = 500,
+    VDEC_PLAY_PREBUFFER_PACKETS = 48,
+    VDEC_PLAY_PREBUFFER_MAX_MS = 4000,
+    VDEC_PLAY_PREBUFFER_MAX_BYTES = 16 * 1024 * 1024,
     VDEC_PLAY_CODEC_AVC = 1,
     VDEC_PLAY_CODEC_HEVC = 974921,
     VDEC_PLAY_SYSMODULE = 207,
@@ -201,6 +205,8 @@ typedef struct {
     int sequential_seek;
     int64_t sequential_seek_pts90k;
     uint64_t seek_generation;
+    uint64_t seek_request_generation;
+    int seek_in_progress;
     int64_t pending_pts[VDEC_PLAY_PENDING_CAP];
     int pending_count, peak_pending_count;
     int64_t last_output_pts, first_pts, last_pts, timeline_origin_pts, last_clock_pts;
@@ -1257,6 +1263,9 @@ typedef struct {
     uint64_t packet_index;
     int trace_head, trace_count;
     VdecPlayPacketTrace trace[VDEC_PLAY_TRACE_PACKET_CAP];
+    AVPacket *prebuffer[VDEC_PLAY_PREBUFFER_PACKETS];
+    int prebuffer_count;
+    size_t prebuffer_bytes;
 } VdecPlayMedia;
 
 static int play_find_start_code(const uint8_t *data, int size, int from, int *prefix) {
@@ -1417,8 +1426,16 @@ static int play_interrupt(void *opaque) {
            (__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE) && s->decoder_ready);
 }
 
+static void play_media_clear_prebuffer(VdecPlayMedia *media) {
+    if (!media) return;
+    for (int i = 0; i < media->prebuffer_count; ++i) av_packet_free(&media->prebuffer[i]);
+    media->prebuffer_count = 0;
+    media->prebuffer_bytes = 0;
+}
+
 static void play_media_close(VdecPlayMedia *media) {
     if (!media) return;
+    play_media_clear_prebuffer(media);
     if (media->bsf) av_bsf_free(&media->bsf);
     if (media->format) avformat_close_input(&media->format);
     memset(media, 0, sizeof(*media));
@@ -1442,6 +1459,10 @@ static int play_bili_media_url(const char *url) {
             return 1;
     }
     return 0;
+}
+
+static int play_network_media_url(const char *url) {
+    return url != NULL && (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0);
 }
 
 static int play_json_space(char value) {
@@ -1638,6 +1659,65 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
               media->has_reorder);
     return 0;
 }
+static int play_prebuffer_network(VdecPlaySession *s, VdecPlayMedia *media, AVPacket *input) {
+    if (!s || !media || !input || !play_network_media_url(s->source_url)) return 0;
+    pthread_mutex_lock(&s->mutex);
+    const uint64_t seek_generation = s->seek_generation;
+    pthread_mutex_unlock(&s->mutex);
+    /* The first network open benefits from a packet cushion. After a seek the
+     * demuxer already has a decoder reset/IDR contract; retaining pre-seek
+     * packets would reintroduce old PTS into the new generation. */
+    if (seek_generation > 1) return 0;
+    if (media->prebuffer_count != 0) return 0;
+    const uint64_t begin_us = play_now_us();
+    const uint64_t deadline_us = begin_us + (uint64_t)VDEC_PLAY_PREBUFFER_MAX_MS * 1000u;
+    const int stream_index = media->stream->index;
+    play_logf("vdec-play: network-prebuffer begin target=%d max_ms=%d", VDEC_PLAY_PREBUFFER_PACKETS,
+              VDEC_PLAY_PREBUFFER_MAX_MS);
+    while (media->prebuffer_count < VDEC_PLAY_PREBUFFER_PACKETS &&
+           media->prebuffer_bytes < (size_t)VDEC_PLAY_PREBUFFER_MAX_BYTES) {
+        if (play_stop_requested(s)) break;
+        if (__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
+            play_media_clear_prebuffer(media);
+            return VDEC_PLAY_RESULT_SEEK;
+        }
+        if (play_now_us() >= deadline_us) break;
+        av_packet_unref(input);
+        const int rc = av_read_frame(media->format, input);
+        if (rc < 0) {
+            if (__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
+                play_media_clear_prebuffer(media);
+                return VDEC_PLAY_RESULT_SEEK;
+            }
+            play_log_av_error("network-prebuffer-read", rc);
+            break;
+        }
+        if (input->stream_index != stream_index) {
+            av_packet_unref(input);
+            continue;
+        }
+        const size_t packet_bytes = input->size > 0 ? (size_t)input->size : 0;
+        if (packet_bytes > (size_t)VDEC_PLAY_PREBUFFER_MAX_BYTES - media->prebuffer_bytes &&
+            media->prebuffer_count > 0) {
+            av_packet_unref(input);
+            break;
+        }
+        AVPacket *queued = av_packet_alloc();
+        if (!queued) {
+            av_packet_unref(input);
+            play_media_clear_prebuffer(media);
+            return -1;
+        }
+        av_packet_move_ref(queued, input);
+        media->prebuffer[media->prebuffer_count++] = queued;
+        media->prebuffer_bytes += packet_bytes;
+    }
+    const uint64_t elapsed_ms = (play_now_us() - begin_us) / 1000u;
+    play_logf("vdec-play: network-prebuffer ready packets=%d bytes=%zu elapsed_ms=%llu", media->prebuffer_count,
+              media->prebuffer_bytes, (unsigned long long)elapsed_ms);
+    return 0;
+}
+
 static int play_auto_capable(const VdecPlayMedia *media, char *reason, size_t capacity) {
     if (!media || !media->stream || !media->stream->codecpar || !reason || capacity == 0) return 0;
     const AVCodecParameters *par = media->stream->codecpar;
@@ -1849,6 +1929,18 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
         return -1;
     }
     int result = VDEC_PLAY_RESULT_OK;
+    const int prebuffer_result = play_prebuffer_network(s, media, input);
+    if (prebuffer_result == VDEC_PLAY_RESULT_SEEK) {
+        av_packet_free(&input);
+        av_packet_free(&filtered);
+        return VDEC_PLAY_RESULT_SEEK;
+    }
+    if (prebuffer_result < 0) {
+        play_fail(s, "network-prebuffer", -9018);
+        av_packet_free(&input);
+        av_packet_free(&filtered);
+        return -1;
+    }
     while (!play_stop_requested(s)) {
         play_wait_if_paused(s);
         if (play_stop_requested(s)) break;
@@ -1856,17 +1948,31 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             result = VDEC_PLAY_RESULT_SEEK;
             break;
         }
-        const uint64_t read_begin = play_now_us();
-        const int read_rc = av_read_frame(media->format, input);
-        const uint64_t read_us    = play_now_us() - read_begin;
-        pthread_mutex_lock(&s->mutex);
-        s->last_demux_wait_us = read_us;
-        if (read_us > s->max_demux_wait_us) s->max_demux_wait_us = read_us;
-        ++s->demux_read_count;
-        if (s->trace_latency && read_us >= 50000)
-            play_logf("vdec-play: demux-wait us=%llu rc=%d input=%llu eof=%d seek=%d", (unsigned long long)read_us,
-                      read_rc, (unsigned long long)s->input_count, s->source_eof, s->seek_requested);
-        pthread_mutex_unlock(&s->mutex);
+        int read_rc = 0;
+        uint64_t read_us = 0;
+        if (media->prebuffer_count > 0) {
+            AVPacket *queued = media->prebuffer[0];
+            const size_t queued_bytes = queued != NULL && queued->size > 0 ? (size_t)queued->size : 0;
+            for (int i = 1; i < media->prebuffer_count; ++i) media->prebuffer[i - 1] = media->prebuffer[i];
+            --media->prebuffer_count;
+            if (media->prebuffer_bytes >= queued_bytes) media->prebuffer_bytes -= queued_bytes;
+            av_packet_unref(input);
+            av_packet_move_ref(input, queued);
+            av_packet_free(&queued);
+        } else {
+            const uint64_t read_begin = play_now_us();
+            read_rc = av_read_frame(media->format, input);
+            read_us = play_now_us() - read_begin;
+            pthread_mutex_lock(&s->mutex);
+            s->last_demux_wait_us = read_us;
+            if (read_us > s->max_demux_wait_us) s->max_demux_wait_us = read_us;
+            ++s->demux_read_count;
+            if (s->trace_latency && read_us >= 50000)
+                play_logf("vdec-play: demux-wait us=%llu rc=%d input=%llu eof=%d seek=%d",
+                          (unsigned long long)read_us, read_rc, (unsigned long long)s->input_count, s->source_eof,
+                          s->seek_requested);
+            pthread_mutex_unlock(&s->mutex);
+        }
         if (read_rc == AVERROR_EOF) {
             pthread_mutex_lock(&s->mutex);
             s->source_eof = 1;
@@ -1996,23 +2102,65 @@ static void play_wait_if_paused(VdecPlaySession *s) {
     pthread_mutex_unlock(&s->mutex);
 }
 
+static int play_wait_for_present_locked(VdecPlaySession *s) {
+    const uint64_t deadline_us = play_now_us() + (uint64_t)VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS * 1000u;
+    while (s->present_pending && !play_stop_requested(s) && !s->fallback) {
+        uint64_t now_us = play_now_us();
+        if (now_us >= deadline_us) return 1;
+        uint64_t wait_us = deadline_us - now_us;
+        if (wait_us > 50000) wait_us = 50000;
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += (time_t)(wait_us / 1000000u);
+        deadline.tv_nsec += (long)((wait_us % 1000000u) * 1000u);
+        if (deadline.tv_nsec >= 1000000000L) {
+            ++deadline.tv_sec;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&s->condition, &s->mutex, &deadline);
+    }
+    return s->present_pending ? 1 : 0;
+}
+
 static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     double seconds = 0.0;
     int reopen_media = 0;
     int64_t current_pts90k = INT64_MIN;
     pthread_mutex_lock(&s->mutex);
+    const uint64_t request_generation = s->seek_request_generation;
+    s->seek_in_progress = 1;
     seconds = s->seek_seconds;
     reopen_media = s->source_eof || s->reopen_media;
     if (s->output_count > 0 || s->input_count > 0) current_pts90k = s->last_pts - s->timeline_origin_pts;
     const int64_t requested_target90k = (int64_t)llround(seconds * 90000.0);
     if (current_pts90k != INT64_MIN && requested_target90k < current_pts90k) reopen_media = 1;
     s->reopen_media = 0;
-    s->seek_requested = 0;
-    while (s->present_pending && !play_stop_requested(s) && !s->fallback)
-        pthread_cond_wait(&s->condition, &s->mutex);
+    const int present_stalled = play_wait_for_present_locked(s);
     const int cancelled = play_stop_requested(s) || s->fallback;
     pthread_mutex_unlock(&s->mutex);
     if (cancelled) return -1;
+    if (present_stalled) {
+        /* A scrub/seek can leave the borrowed AGC frame without its retire callback.
+         * Wait for the GPU fence before reclaiming it; never reset a slot still in flight. */
+        play_logf("vdec-play: seek present wait timeout; waiting for AGC idle");
+        evo_agc_runtime_wait_idle(VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS);
+        pthread_mutex_lock(&s->mutex);
+        if (!play_stop_requested(s) && !s->fallback && s->present_pending) {
+            s->present_pending = 0;
+            s->present_pending_since_us = 0;
+            ++s->retired_count;
+            pthread_cond_broadcast(&s->condition);
+            play_logf("vdec-play: seek present reclaimed after AGC idle");
+        }
+        pthread_mutex_unlock(&s->mutex);
+    }
+    pthread_mutex_lock(&s->mutex);
+    const int superseded_before_reset = s->seek_request_generation != request_generation;
+    if (!superseded_before_reset) s->seek_requested = 0;
+    pthread_mutex_unlock(&s->mutex);
+    if (superseded_before_reset) return 0;
+
+
 
     int32_t rc = sceVideodec2Reset(s->decoder.decoder);
     play_logf("vdec-play: seek reset target=%.3f rc=%d reopen=%d", seconds, rc, reopen_media);
@@ -2040,7 +2188,7 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     }
     const int64_t target90k = (int64_t)llround(seconds * 90000.0);
     const int64_t target = av_rescale_q(target90k, (AVRational){1, 90000}, media->time_base);
-    int sequential_seek = 0;
+    int sequential_seek = target90k > 0;
     if (!reopen_media || target90k != 0) {
         rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, target, target, 0);
         if (rc < 0) {
@@ -2065,7 +2213,10 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
         s->first_pts = s->timeline_origin_pts;
         s->timeline_origin_set = 1;
     }
+    const int superseded = s->seek_request_generation != request_generation;
+    if (!superseded) s->seek_requested = 0;
     ++s->seek_generation;
+    s->seek_in_progress = 0;
     s->source_eof = 0;
     s->sequential_seek = sequential_seek;
     s->sequential_seek_pts90k = sequential_seek ? target90k : 0;
@@ -2094,8 +2245,8 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     pthread_cond_broadcast(&s->condition);
     const uint64_t generation = s->seek_generation;
     pthread_mutex_unlock(&s->mutex);
-    play_logf("vdec-play: seek ready generation=%llu target=%.3f target90k=%lld; awaiting true IDR",
-              (unsigned long long)generation, seconds, (long long)target90k);
+    play_logf("vdec-play: seek ready generation=%llu target=%.3f target90k=%lld superseded=%d; awaiting true IDR",
+              (unsigned long long)generation, seconds, (long long)target90k, superseded);
     return 0;
 }
 static void *play_thread_main(void *opaque) {
@@ -2187,6 +2338,7 @@ static void *play_thread_main(void *opaque) {
                 s->seek_seconds = 0.0;
                 s->reopen_media = 1;
                 s->seek_requested = 1;
+                ++s->seek_request_generation;
                 play_logf("m5-stress: eof=%d/5", s->stress_eof_count);
             }
             while (!play_stop_requested(s) && !s->fallback && !s->seek_requested)
@@ -2234,6 +2386,8 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->trace_latency            = 0;
     s->seek_seconds = 0.0;
     s->seek_generation = 0;
+    s->seek_request_generation = 0;
+    s->seek_in_progress = 0;
     s->stress_eof_count = 0;
     s->pending_count = 0;
     s->peak_pending_count = 0;
@@ -2383,6 +2537,7 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     }
     if (start_seconds > 0) {
         s->seek_requested = 1;
+        ++s->seek_request_generation;
         s->seek_seconds = start_seconds;
     }
     s->active = 1;
@@ -2427,6 +2582,7 @@ int wiliwili_vdec_play_seek(double seconds) {
     s->last_clock_input_us = 0;
     s->clock_prediction_valid = 0;
     s->seek_requested = 1;
+    ++s->seek_request_generation;
     pthread_cond_broadcast(&s->condition);
     pthread_mutex_unlock(&s->mutex);
     play_logf("vdec-play: seek requested target=%.3f", seconds);
@@ -2534,12 +2690,13 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     /* mpv may reload its separate audio file at EOF and reset playback-time; restart the
      * native timeline instead of leaving the decoder blocked behind stale READY frames. */
     if (s->last_clock_pts != INT64_MIN && llabs(clock_pts90k - s->last_clock_pts) > VDEC_PLAY_CLOCK_JUMP_90K &&
-        !s->seek_requested) {
+        !s->seek_requested && !s->seek_in_progress) {
         const int64_t previous_clock = s->last_clock_pts;
         s->seek_seconds = playback_time;
         if (clock_pts90k < previous_clock && clock_pts90k <= VDEC_PLAY_CLOCK_JUMP_90K)
             s->reopen_media = 1;
         s->seek_requested = 1;
+        ++s->seek_request_generation;
         s->last_clock_pts = INT64_MIN;
         pthread_cond_broadcast(&s->condition);
         s->last_clock_input_pts = INT64_MIN;

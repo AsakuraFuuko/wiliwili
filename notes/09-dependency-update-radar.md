@@ -215,6 +215,15 @@
 - **触发条件：** C 路径需要 10-bit SDR 直接采样、起播网络抖动需更大 cushion、或出现与 EVO 同形的 seek starvation/deadlock。
 - **选择性移植工作量（推断）：** P010 SDR pipe 约 1–3 个开发日（生成、shader metadata、native branch、host/静态收据）；预缓冲/跨队列策略约 2–4 个开发日，必须用现有真实语料做回归。完整 EVO media/runtime 同步风险高，不建议。
 
+### 3.4 2026-10-08 选择性移植记录
+
+没有整仓同步 EVO，也没有直接复制 GPL 源码。`3bf37f0` 的音频队列 overshoot/audio throttle 不适用于当前 C：本工程音频仍由 mpv 管理，C 只有一个 FFmpeg demux/decode 线程和三槽 AGC 发布队列，不存在 EVO 的 audio packet queue ↔ video packet queue 闭环。按同一思路在 `native_vdec_play.c` 自研了三项防护：seek request generation 防止新 seek 被旧 reset 清掉；seek 期间对 borrowed AGC frame 最多等待 500 ms，随后先等 AGC idle fence 再回收 stale present；所有非零 seek 在发布前等待目标后的 true IDR，防止 pre-roll 旧 PTS 进入新 generation。
+
+`0751788` 的适用条件是网络源起播抖动；已映射为 C 的网络 URL 48 个视频 packet、最多 4 s、16 MiB 上限的有限 prebuffer。local file 不走该路径；seek generation >1 不重复保留旧 packet，seek 会中断并清空 prebuffer，EOF/超时/分配失败释放 hold。C 没有独立 audio decode queue，因此没有照抄 EVO 的 `pb_prebuffer_hold`，避免让 mpv audio 在 native video 尚未发布时提前跑钟。
+
+`eb407c6` 的 P010 SDR pipe 对应 `EVO_AGC_PIPE_VIDEO_P010_SDR=71`、BT.709 limited-range R16/RG16 shader；本轮不导入。当前正式路径只承诺 8-bit auto，P010 仍是显式实验并已有 P010→NV12 staged 方案；替换还需要 AGC runtime pipe 注册、native branch 和真实 Main10 SDR 收据，当前没有足够实测收益抵消新增 shader/artifact 风险。现有 GPL-3.0 artifact 清单不增加新文件。
+最终收据：boilerplate RELRO host tests、native build 后，seek stress `/tmp/m12-evo-seek-stress-cycle3.log` 为 20/20，无 fallback/img，健康 20 点全0；failover `/tmp/m12-evo-failover-cycle.log` 为 primary 短包/503 → backup success，无 fallback/img；四项注入均 fail-closed 到 A，reset 使用 `/tmp/m12-evo-inject-reset-cycle4.log` 确认 `injected-reset-failure rc=-9017` 且 order_errors=0。最终 `/tmp/m12-evo-final-cycle.log` 约 1804 s，89 窗口，末端 `presented=11040 inputs=5527 accepted=5526 outputs=5526 dropped=0 errors=0 order_errors=0`，180 个 health 点全0，无 `FALLBACK_A`/`img-net: failed`。
+
 ---
 
 ## 4. 低优先上游跟踪
