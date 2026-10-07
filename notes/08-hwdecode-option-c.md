@@ -545,6 +545,14 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 四项默认自动故障注入均 fail-closed 到 A：`/tmp/m10-auto-inject-bad-cycle.log`=`FALLBACK_A reason=injected-bad-stream rc=-9015`；`/tmp/m10-auto-inject-reset-cycle.log`=`injected-reset-failure rc=-9017`；`/tmp/m10-auto-inject-window-cycle.log`=`pending-window-injected rc=-9016`；`/tmp/m10-auto-inject-timeout-cycle.log`=`decode-timeout rc=-9008`。每项均有 mpv audio active、health 三项/timeouts/vo_rc 全 0、无 `img-net: failed`/crash。
 
 
+#### 6.5.10 M11：A/V 漂移来源诊断与 C 时钟预测（2026-10-07）
+
+来源拆解收据 `/tmp/m11-drift-source-cycle.log`：raw mpv `playback-time` 采样 wall interval p50≈16.68 ms、p95≈16.73 ms，但相邻 raw clock step p50=0、p95≈85.3 ms、p99≈90.9 ms，说明 UI 采样频率正常而 mpv 属性值更新呈阶梯/抖动；旧发布策略的 `publish_age` p95≈80 ms，C drift p95≈74.7–76.0 ms。audio-pts 相对 playback clock phase 仅 p95≈0.2–0.4 ms，排除音频时钟相位是主因。AGC timing 诊断为 GPU fence wait≈1.0–1.2 ms、flip wait≈14.4–14.8 ms、frame total≈15.5–15.9 ms，health 的 `flip_waits=600`、`timeouts=0`，它是单个 VSYNC 预算但不是 75 ms 尾部主因。
+
+修复：C 路径在 raw playback-time 样本之间按 wall elapsed×speed 做最多 250 ms 的轻量预测；raw 大跳、seek、暂停或重开时清空预测状态。预测只改变 native C 的发布 clock，A 的 mpv SW 取帧/时钟路径未改。短测 `/tmp/m11-drift-predicted-cycle.log` 的稳态 drift p95≈30.7–32.0 ms、p99≈32.1–32.8 ms，publish age p95≈15.8–16.0 ms；`presented/dropped/errors/order_errors` 保持连续且 health 全 0。raw update 阶梯仍记录在 `vdec-clock step_*`，用于后续回归。
+
+最终同口径长测 `/tmp/m11-drift-final-cycle.log` 监听约 1804 s、89 个 clock/latency 窗口；排除起播窗口后 publish-age p95 `15.400–16.055 ms`、p99 `17.355–19.722 ms`，C drift p95 `30.755–32.044 ms`、p99 `32.066–32.966 ms`；audio phase p95 `0.333–0.433 ms`。AGC 179 个 timing 样本 GPU wait `1.048–1.159 ms`、flip wait `14.151–14.903 ms`、frame total `15.302–16.036 ms`。末端 `presented=107760 inputs=53931 accepted=53930 outputs=53930 dropped=0 errors=0 order_errors=0`，health 180 点至 frame=107400 三项/timeouts/vo_rc 全0；无 `FALLBACK_A`、无 `img-net: failed`。
+
 ### 6.6 P2：可发布生产
 
 仍需补齐：
