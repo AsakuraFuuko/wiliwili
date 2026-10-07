@@ -503,7 +503,11 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 修复位于 `wiliwili/source/view/video_view.cpp`：仅 native AGC 调用前将 VideoView content rect 乘 `brls::Application::windowScale`，再传入 `wiliwili_vdec_play_draw()`；新增一次性 rect 诊断行，记录 logical/physical/scale/mode。A 路径仍把未缩放 rect 交给 `MPVCore::draw()`，未改变。`evo_agc_blit_yuv_rect()` 原本就按 scanout viewport/scissor 工作，Fit(0)/Crop(1)/Stretch(2) 的比例计算也按目标 rect 工作，无需再次换算；AGC 注释现明确该物理坐标契约。
 
-回归归因：真正引入 rect 参数的是 root `cdf0a0a` 与 borealis `81e0f0df` 的 native destination-rect 接线；`a04bc92` 只增加 Fit/Stretch/Crop mode 参数，不是尺寸缩小的引入点。修复构建 marker 为 `Oct  7 2026 07:01:11`；同用户 options 的 `test-cycle.sh PPSA99233 20 /tmp/c-enabled-opts.txt` 已成功替换正式包并启动，boot log 确认两个开关、marker、AGC 1920×1080 初始化和 health=0。该命令本身没有输入注入，故详情页小窗/按叉全屏的后修复截图需在真机进入播放器后取得；当前保留用户的 pre-fix `/tmp/pos-now.png` 作为回归收据，不把未取得的后修复画面冒充验收。
+回归归因：真正引入 rect 参数的是 root `cdf0a0a` 与 borealis `81e0f0df` 的 native destination-rect 接线；`a04bc92` 只增加 Fit/Stretch/Crop mode 参数，不是尺寸缩小的引入点。rect 缩放修复后，后续真机复现又确认全屏 clone 的 native 状态/decoder 所有权需要单独修复，详见下两段；最终包保留 hw 双门控。
+
+本轮针对用户报告的“主页选卡片无反应”做了干净重启和对照：`/tmp/m7-c-home.png` 显示主界面正常；稳定输入 `right → down → cross` 后，最终 hw 包取得 `/tmp/m7-final3-small.png`，并在日志中进入 `vdec-play: start`/`decoder ready`。A 对照 `/tmp/m7-a-after-cross.png` 与仅开 `WILIWILI_VDEC_PLAY` 的门控对照 `/tmp/m7-play-only-after-cross.png` 也都能打开详情。第一次未进入的截图发生在被中断的 PeaSyo 输入会话中，后续干净会话可稳定复现成功；未发现 `setUrl`/`mpvCore->reset()` 重入或重试风暴，未改该链。
+
+同一复现进一步暴露了真实的全屏回归：`setFullScreen(true)` 新建第二个 `VideoView`，其 `native_vdec_mpv_suppressed` 默认为 false，而共享 mpv 当前仍是 `vid=no`，所以 pre-fix `/tmp/m7-final-hw-full.png` 全黑并伴随 `mpv-sw: surface=81`。修复在 `video_view.cpp` 将 native 抑制状态复制给全屏 clone，并用 `native_vdec_play_owner` 防止 clone 析构停止原始 singleton decoder，同时保持 A clone 的旧 stop 语义。post-fix `/tmp/m7-final3-full.png` 全屏有画面，`/tmp/m7-fixed-exit-small.png` 退出全屏后仍继续 native 播放；日志收据为小窗 `logical=10,10 800x450 → physical=15,15 1200x675`、全屏 `logical=0,0 1280x720 → physical=0,0 1920x1080`，health 三项持续 0、FPS 约 60。最终交付包 build marker 为 `Oct 7 2026 08:31:41`。
 
 ### 6.6 P2：可发布生产
 

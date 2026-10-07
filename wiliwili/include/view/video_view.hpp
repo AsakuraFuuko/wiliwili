@@ -368,6 +368,8 @@ private:
 
     MPVCore* mpvCore;
     bool native_vdec_mpv_suppressed = false;
+    // Fullscreen clones share the singleton decoder; only the original player view stops it.
+    bool native_vdec_play_owner = true;
     bool native_vdec_autotest = false;
     bool native_vdec_autotest_switch_done = false;
     int native_vdec_autotest_stage = 0;

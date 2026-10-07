@@ -700,7 +700,7 @@ void VideoView::runNativeVdecStress() {
 VideoView::~VideoView() {
     brls::Logger::debug("trying delete VideoView...");
 #if defined(PS5_NATIVE_APP)
-    wiliwili_vdec_play_stop();
+    if (this->native_vdec_play_owner) wiliwili_vdec_play_stop();
 #endif
     this->unRegisterMpvEvent();
     APP_E->unsubscribe(customEventSubscribeID);
@@ -1391,6 +1391,12 @@ void VideoView::setFullScreen(bool fs) {
         this->unRegisterMpvEvent();
         auto container = new brls::Box();
         auto video     = new VideoView();
+#if defined(PS5_NATIVE_APP)
+        /* Fullscreen creates a second VideoView around the singleton decoder; retain the native draw path, but let the
+         * original player view own decoder shutdown when the fullscreen clone is popped. */
+        video->native_vdec_mpv_suppressed = this->native_vdec_mpv_suppressed;
+        video->native_vdec_play_owner     = !this->native_vdec_mpv_suppressed;
+#endif
         float width    = brls::Application::contentWidth;
         float height   = brls::Application::contentHeight;
 
