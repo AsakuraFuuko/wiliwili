@@ -6,7 +6,7 @@
 
 ## 一句话结论
 
-**现在不做全量升级；选择性借鉴 EVO 的 P010 SDR pipe、预缓冲/seek 死锁修复思路，待真正需要 4K/120 Hz 或 GL 路径更新时再升级 ps5-opengl；boilerplate 2f672d1 值得在下一次原生工具链维护窗口纳入，cpr/borealis/Vulkan 暂不动。**
+**现在不做全量升级；boilerplate 只纳入 RELRO 关键修复，删除 wiliwili 自己的重复 converter patch；ZIP/Ninja/ccache/全局符号策略经路径审查暂不整体同步。EVO 的 seek/预缓冲/P010 仍按独立阶段选择性评估。**
 
 ### 当前比较对象
 
@@ -157,6 +157,14 @@
 
 **工作量/风险（推断）：** 低到中等，约一个 host-tool 维护窗口；最大风险是本地 RELRO/heap/app-symbols 改动与上游新 Make/build contract 叠加，而不是 FSELF 格式本身。
 
+### 2.4 2026-10-08 选择性纳入记录
+
+已 `git fetch origin` 并核对 `2f672d1` 的历史。用户给出的短号 `81d423f` 在远端实际解析为同主题提交 `81d4235`（`Fix RELRO load-segment congruence (#3)`）；该提交已 cherry-pick 到本地 boilerplate，提交为 `cb0d95e`。它把 RELRO file offset 锚定到 RELRO 起始 section（兼容 lld 丢弃空 `.data.rel.ro` 的形状），并增加 16 KiB mapped-LOAD congruence 检查及 host regression。
+
+本地仍需要的 256 MiB heap policy 从旧重复 patch 中拆出，作为独立 boilerplate 提交 `11b0b64` 保留；RELRO 的旧本地实现不再存在。`wiliwili-native/scripts/ps5/native/sce_module_writer-native-app.patch` 已删除，`build-native.sh` 不再提示手工 apply。这样 converter 只有上游 RELRO 实现一份，heap policy 仍是本工程明确的本地约束。
+
+没有整体 fast-forward 到 `2f672d1`：上游 ZIP `0777` 只服务 boilerplate release ZIP，正式线使用自己的 `install-ffpkg.sh`/UFS2Tool；Ninja/ccache 只影响 boilerplate 示例构建，正式线由 `native_build.py` 读取 compile database、使用预构建 SDL 前缀；上游 `tooling/native/app-symbols.map` 也不是正式链接输入，正式线使用 `wiliwili-native/scripts/ps5/native/app-symbols.map`。因此这些变更不进入本轮工具链路径，避免引入 92 文件的无关构建契约变化。
+验证收据：boilerplate `tests/test_executable_writer.py` 两个布局用例均通过（含 `.data.rel.ro` 与 lld 丢弃该 section 的 plain PIE）。删除旧 patch 后完整清空 `build-ps5/native` 重建，289/289 translation units 编译，重新生成 converter/FSELF/dist；构建 marker `Oct 8 2026 00:28:29`。`/tmp/m12-relro-smoke.log` 无模式 env 启动 `user mode=0`、health 9 点三项/timeouts/vo_rc 全0、无 `FALLBACK_A`/`img-net: failed`；`/tmp/m12-relro-auto-play.log` 无 `WILIWILI_VDEC_PLAY`，`auto-gate=pass`、`decoder ready`、持续 present 至 `presented=8160 inputs=4086 accepted=4085 outputs=4085 dropped=0 errors=0 order_errors=0`，health 全0，无回退/图片失败。变更未触及 `wiliwili-payload/` 公共脚本，payload 线无需因本次 native-only 修改重建。
 ---
 
 ## 3. `references/EVO-PLAYER-PS5`：140b803 → 21524a4

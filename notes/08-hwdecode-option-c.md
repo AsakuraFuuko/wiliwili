@@ -553,6 +553,10 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 最终同口径长测 `/tmp/m11-drift-final-cycle.log` 监听约 1804 s、89 个 clock/latency 窗口；排除起播窗口后 publish-age p95 `15.400–16.055 ms`、p99 `17.355–19.722 ms`，C drift p95 `30.755–32.044 ms`、p99 `32.066–32.966 ms`；audio phase p95 `0.333–0.433 ms`。AGC 179 个 timing 样本 GPU wait `1.048–1.159 ms`、flip wait `14.151–14.903 ms`、frame total `15.302–16.036 ms`。末端 `presented=107760 inputs=53931 accepted=53930 outputs=53930 dropped=0 errors=0 order_errors=0`，health 180 点至 frame=107400 三项/timeouts/vo_rc 全0；无 `FALLBACK_A`、无 `img-net: failed`。
 
+#### 6.5.11 M12：boilerplate RELRO 选择性迁移（2026-10-08）
+
+原生 converter 采用 boilerplate 上游 `81d4235`（用户提供的 `81d423f` 短号在远端对应此同主题对象），删除 `wiliwili-native/scripts/ps5/native/sce_module_writer-native-app.patch` 的重复 RELRO 实现；本地 256 MiB heap 作为独立 boilerplate policy 保留。完整重建后 `/tmp/m12-relro-auto-play.log` 在不设置硬解模式 env 时记录 `user mode=0`、`auto-gate=pass`、`decoder ready`，末端 `presented=8160 inputs=4086 accepted=4085 outputs=4085 dropped=0 errors=0 order_errors=0`，health 三项/timeouts/vo_rc 全0，无 fallback 或 `img-net: failed`。画面收据为 `/tmp/m12-relro-auto-play.png`。
+
 ### 6.6 P2：可发布生产
 
 仍需补齐：
