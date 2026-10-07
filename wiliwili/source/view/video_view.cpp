@@ -42,6 +42,7 @@
 #if defined(PS5_NATIVE_APP)
 extern "C" int wiliwili_vdec_play_enabled(void);
 extern "C" int wiliwili_vdec_play_start(const char *url, int start_seconds);
+extern "C" void wiliwili_vdec_play_add_backup_url(const char *url);
 extern "C" int wiliwili_vdec_play_is_active(void);
 extern "C" void wiliwili_vdec_play_stop(void);
 extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
@@ -981,6 +982,7 @@ void VideoView::setBackupUrl(const std::string& url, int start, int end, const s
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
     std::string extra = genExtraUrlParam(start, end, audios);
 #if defined(PS5_NATIVE_APP)
+    if (wiliwili_vdec_play_enabled()) wiliwili_vdec_play_add_backup_url(url.c_str());
     if (this->native_vdec_mpv_suppressed) extra += ",vid=no";
 #endif
     mpvCore->setBackupUrl(url, extra);

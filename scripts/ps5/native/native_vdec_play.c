@@ -41,8 +41,10 @@ enum {
     VDEC_PLAY_PENDING_CAP = 12,
     VDEC_PLAY_CLOCK_JUMP_90K = 90000,
     VDEC_PLAY_AU_BYTES = 0x800000,
+    /* Decode/Flush watchdogs are per ABI call; slot waits, demux, and diagnostic UDP logs stay outside it. */
     VDEC_PLAY_TIMEOUT_MS_DEFAULT = 250,
     VDEC_PLAY_MAX_FLUSH = 32,
+    VDEC_PLAY_BACKUP_CAP         = 4,
     VDEC_PLAY_CODEC_AVC = 1,
     VDEC_PLAY_CODEC_HEVC = 974921,
     VDEC_PLAY_SYSMODULE = 207,
@@ -142,13 +144,41 @@ typedef struct {
     uint64_t sequence;
 } VdecPlaySlot;
 
+enum {
+    VDEC_PLAY_LATENCY_WINDOW = 600,
+    VDEC_PLAY_CONTEXT_CAP    = 8,
+    VDEC_PLAY_STAGE_NONE     = 0,
+    VDEC_PLAY_STAGE_DECODE   = 1,
+    VDEC_PLAY_STAGE_FLUSH    = 2,
+};
+
+typedef struct {
+    uint32_t decode_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t flush_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t drift_us[VDEC_PLAY_LATENCY_WINDOW];
+    int decode_count;
+    int flush_count;
+    int drift_count;
+    uint64_t segment;
+} VdecPlayLatencyWindow;
+
+typedef struct {
+    uint64_t index;
+    int64_t raw_pts, raw_dts, pts90k;
+    int keyframe, idr, cra;
+    int pending_before, pending_after;
+    int input_slot, output_slot;
+    VdecPlaySlotState slot_state;
+} VdecPlayAuContext;
+
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t condition;
     pthread_t thread;
     int thread_started;
     volatile int stop_requested;
-    int timeout_ms, flush_each_decode, trace_au, pending_limit, pending_limit_override, adaptive_pending, p010_enabled;
+    int timeout_ms, flush_each_decode, trace_au, trace_latency, pending_limit, pending_limit_override, adaptive_pending,
+        p010_enabled;
     volatile int paused;
     volatile int seek_requested;
     int active, fallback, failure_logged, resources_live, decoder_ready, source_eof, reopen_media;
@@ -165,9 +195,22 @@ typedef struct {
     double last_logged_speed;
     uint64_t input_count, accepted_count, output_count, presented_count, retired_count, sequence;
     uint64_t advanced_count, dropped_count, error_count, order_error_count;
+    uint64_t direct_mem_peak;
+    uint64_t last_demux_wait_us, max_demux_wait_us, demux_read_count;
+    uint64_t last_slot_wait_us, max_slot_wait_us, slot_wait_count;
+    uint64_t present_pending_since_us, max_present_wait_us;
+    int last_call_stage, last_call_slot, last_call_flush_index, last_call_rc, last_call_valid, last_call_error,
+        last_call_accepted, last_call_did_flush;
+    uint64_t last_call_au_index, last_call_decode_us, last_call_flush_us, last_call_elapsed_us;
+    uint64_t failover_count;
     char source_url[2048];
+    char backup_urls[VDEC_PLAY_BACKUP_CAP][2048];
+    int backup_count, backup_index;
     char inject[64];
     VdecPlaySlot slots[VDEC_PLAY_SLOTS];
+    VdecPlayAuContext au_context[VDEC_PLAY_CONTEXT_CAP];
+    int au_context_head, au_context_count;
+    VdecPlayLatencyWindow latency;
     VdecPlayDecoder decoder;
 } VdecPlaySession;
 
@@ -220,6 +263,167 @@ static void play_logf(const char *format, ...) {
     vsnprintf(line, sizeof(line), format, args);
     va_end(args);
     wiliwili_boot_log(line);
+}
+static uint64_t play_direct_mem_bytes(const VdecPlaySession *s) {
+    if (!s) return 0;
+    return (uint64_t)s->decoder.compute.bytes + (uint64_t)s->decoder.gpu.bytes + (uint64_t)s->decoder.cpu_gpu.bytes +
+           (uint64_t)s->decoder.au_pool.bytes + (uint64_t)s->decoder.frame_pool.bytes +
+           (uint64_t)s->decoder.p010_pool.bytes;
+}
+
+static int play_percentile_index(int count, int percentage) {
+    if (count <= 0) return 0;
+    int index = (count - 1) * percentage / 100;
+    if (index < 0) index = 0;
+    if (index >= count) index = count - 1;
+    return index;
+}
+
+static void play_latency_report(VdecPlaySession *s, const char *label) {
+    if (!s || !s->trace_latency ||
+        (s->latency.decode_count == 0 && s->latency.flush_count == 0 && s->latency.drift_count == 0))
+        return;
+    uint32_t decode[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t flush[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t drift[VDEC_PLAY_LATENCY_WINDOW];
+    const int decode_count = s->latency.decode_count;
+    const int flush_count  = s->latency.flush_count;
+    const int drift_count  = s->latency.drift_count;
+    memcpy(decode, s->latency.decode_us, (size_t)decode_count * sizeof(decode[0]));
+    memcpy(flush, s->latency.flush_us, (size_t)flush_count * sizeof(flush[0]));
+    memcpy(drift, s->latency.drift_us, (size_t)drift_count * sizeof(drift[0]));
+    for (int i = 1; i < decode_count; ++i) {
+        const uint32_t value = decode[i];
+        int j                = i;
+        while (j > 0 && decode[j - 1] > value) {
+            decode[j] = decode[j - 1];
+            --j;
+        }
+        decode[j] = value;
+    }
+    for (int i = 1; i < flush_count; ++i) {
+        const uint32_t value = flush[i];
+        int j                = i;
+        while (j > 0 && flush[j - 1] > value) {
+            flush[j] = flush[j - 1];
+            --j;
+        }
+        flush[j] = value;
+    }
+    for (int i = 1; i < drift_count; ++i) {
+        const uint32_t value = drift[i];
+        int j                = i;
+        while (j > 0 && drift[j - 1] > value) {
+            drift[j] = drift[j - 1];
+            --j;
+        }
+        drift[j] = value;
+    }
+    const int decode_p50 = play_percentile_index(decode_count, 50);
+    const int decode_p95 = play_percentile_index(decode_count, 95);
+    const int decode_p99 = play_percentile_index(decode_count, 99);
+    const int flush_p50  = play_percentile_index(flush_count, 50);
+    const int flush_p95  = play_percentile_index(flush_count, 95);
+    const int flush_p99  = play_percentile_index(flush_count, 99);
+    const int drift_p50  = play_percentile_index(drift_count, 50);
+    const int drift_p95  = play_percentile_index(drift_count, 95);
+    const int drift_p99  = play_percentile_index(drift_count, 99);
+    play_logf(
+        "vdec-lat segment=%llu label=%s decode_n=%d p50_us=%u p95_us=%u p99_us=%u max_us=%u "
+        "flush_n=%d p50_us=%u p95_us=%u p99_us=%u max_us=%u "
+        "drift_n=%d p50_us=%u p95_us=%u p99_us=%u max_us=%u direct_mem=%llu "
+        "slot_wait_max_us=%llu present_wait_max_us=%llu demux_max_us=%llu",
+        (unsigned long long)s->latency.segment++, label ? label : "window", decode_count,
+        decode_count ? decode[decode_p50] : 0, decode_count ? decode[decode_p95] : 0,
+        decode_count ? decode[decode_p99] : 0, decode_count ? decode[decode_count - 1] : 0, flush_count,
+        flush_count ? flush[flush_p50] : 0, flush_count ? flush[flush_p95] : 0, flush_count ? flush[flush_p99] : 0,
+        flush_count ? flush[flush_count - 1] : 0, drift_count, drift_count ? drift[drift_p50] : 0,
+        drift_count ? drift[drift_p95] : 0, drift_count ? drift[drift_p99] : 0,
+        drift_count ? drift[drift_count - 1] : 0, (unsigned long long)play_direct_mem_bytes(s),
+        (unsigned long long)s->max_slot_wait_us, (unsigned long long)s->max_present_wait_us,
+        (unsigned long long)s->max_demux_wait_us);
+    s->latency.decode_count = 0;
+    s->latency.flush_count  = 0;
+    s->latency.drift_count  = 0;
+}
+
+static void play_latency_record_drift(VdecPlaySession *s, uint64_t drift_us) {
+    if (!s || !s->trace_latency || s->latency.drift_count >= VDEC_PLAY_LATENCY_WINDOW) return;
+    const uint32_t value                          = drift_us > UINT32_MAX ? UINT32_MAX : (uint32_t)drift_us;
+    s->latency.drift_us[s->latency.drift_count++] = value;
+}
+static void play_latency_record(VdecPlaySession *s, int is_flush, uint64_t elapsed_us) {
+    if (!s || !s->trace_latency) return;
+    if (!is_flush && s->latency.decode_count >= VDEC_PLAY_LATENCY_WINDOW) play_latency_report(s, "window");
+    const uint32_t value = elapsed_us > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_us;
+    if (is_flush) {
+        if (s->latency.flush_count < VDEC_PLAY_LATENCY_WINDOW) s->latency.flush_us[s->latency.flush_count++] = value;
+    } else {
+        s->latency.decode_us[s->latency.decode_count++] = value;
+    }
+}
+
+static const char *play_slot_state_name(VdecPlaySlotState state) {
+    switch (state) {
+        case VDEC_PLAY_SLOT_FREE:
+            return "FREE";
+        case VDEC_PLAY_SLOT_INFLIGHT:
+            return "INFLIGHT";
+        case VDEC_PLAY_SLOT_READY:
+            return "READY";
+        case VDEC_PLAY_SLOT_CURRENT:
+            return "CURRENT";
+        default:
+            return "?";
+    }
+}
+
+static VdecPlayAuContext *play_context_for_index_locked(VdecPlaySession *s, uint64_t index) {
+    for (int i = 0; i < s->au_context_count; ++i) {
+        const int position = (s->au_context_head + VDEC_PLAY_CONTEXT_CAP - 1 - i) % VDEC_PLAY_CONTEXT_CAP;
+        if (s->au_context[position].index == index) return &s->au_context[position];
+    }
+    return NULL;
+}
+
+static void play_log_failure_context_locked(VdecPlaySession *s, const char *reason, int rc) {
+    play_latency_report(s, "failure");
+    play_logf(
+        "vdec-play: failure-context reason=%s rc=%d stage=%d au=%llu slot=%d flush_index=%d "
+        "decode_us=%llu flush_us=%llu call_us=%llu call_rc=%d valid=%d error=%d accepted=%d "
+        "pending=%d seek=%d eof=%d reopen=%d direct_mem=%llu demux_last_us=%llu demux_max_us=%llu "
+        "slot_last_us=%llu slot_max_us=%llu present_max_us=%llu",
+        reason ? reason : "?", rc, s->last_call_stage, (unsigned long long)s->last_call_au_index, s->last_call_slot,
+        s->last_call_flush_index, (unsigned long long)s->last_call_decode_us, (unsigned long long)s->last_call_flush_us,
+        (unsigned long long)s->last_call_elapsed_us, s->last_call_rc, s->last_call_valid, s->last_call_error,
+        s->last_call_accepted, s->pending_count, s->seek_requested, s->source_eof, s->reopen_media,
+        (unsigned long long)play_direct_mem_bytes(s), (unsigned long long)s->last_demux_wait_us,
+        (unsigned long long)s->max_demux_wait_us, (unsigned long long)s->last_slot_wait_us,
+        (unsigned long long)s->max_slot_wait_us, (unsigned long long)s->max_present_wait_us);
+    for (int i = 0; i < s->au_context_count; ++i) {
+        const int position =
+            (s->au_context_head + VDEC_PLAY_CONTEXT_CAP - s->au_context_count + i) % VDEC_PLAY_CONTEXT_CAP;
+        const VdecPlayAuContext *context = &s->au_context[position];
+        play_logf(
+            "vdec-play: failure-au index=%llu pts=%lld dts=%lld pts90k=%lld key=%d idr=%d cra=%d "
+            "pending=%d->%d slots=%d/%d state=%s",
+            (unsigned long long)context->index, (long long)context->raw_pts, (long long)context->raw_dts,
+            (long long)context->pts90k, context->keyframe, context->idr, context->cra, context->pending_before,
+            context->pending_after, context->input_slot, context->output_slot,
+            play_slot_state_name(context->slot_state));
+    }
+}
+/* Keep transport backups separate from decoder recovery: a demux failure may switch URL, while a VDEC/AGC failure still
+ * fails closed to A. */
+static int play_add_backup_url_locked(VdecPlaySession *s, const char *url) {
+    if (!s || !url || url[0] == '\0' || strlen(url) >= sizeof(s->backup_urls[0]) || strcmp(url, s->source_url) == 0 ||
+        s->backup_count >= VDEC_PLAY_BACKUP_CAP)
+        return 0;
+    for (int i = 0; i < s->backup_count; ++i)
+        if (strcmp(s->backup_urls[i], url) == 0) return 0;
+    snprintf(s->backup_urls[s->backup_count], sizeof(s->backup_urls[0]), "%s", url);
+    ++s->backup_count;
+    return 1;
 }
 
 static void play_log_av_error(const char *stage, int rc) {
@@ -354,11 +558,13 @@ static void play_fail_locked(VdecPlaySession *s, const char *reason, int rc) {
     s->active = 0;
     s->stop_requested = 1;
     if (!s->failure_logged) {
-        play_logf("vdec-play: FALLBACK_A reason=%s rc=%d pending=%d limit=%d peak=%d inputs=%llu accepted=%llu outputs=%llu errors=%llu order_errors=%llu",
-                  reason, rc, s->pending_count, s->pending_limit, s->peak_pending_count,
-                  (unsigned long long)s->input_count, (unsigned long long)s->accepted_count,
-                  (unsigned long long)s->output_count, (unsigned long long)s->error_count,
-                  (unsigned long long)s->order_error_count);
+        play_log_failure_context_locked(s, reason, rc);
+        play_logf(
+            "vdec-play: FALLBACK_A reason=%s rc=%d pending=%d limit=%d peak=%d inputs=%llu accepted=%llu outputs=%llu "
+            "errors=%llu order_errors=%llu",
+            reason, rc, s->pending_count, s->pending_limit, s->peak_pending_count, (unsigned long long)s->input_count,
+            (unsigned long long)s->accepted_count, (unsigned long long)s->output_count,
+            (unsigned long long)s->error_count, (unsigned long long)s->order_error_count);
         s->failure_logged = 1;
     }
     pthread_cond_broadcast(&s->condition);
@@ -495,11 +701,20 @@ static int play_account_output_locked(VdecPlaySession *s, int input_slot, const 
 
 static int play_wait_for_frame_slot(VdecPlaySession *s) {
     pthread_mutex_lock(&s->mutex);
+    const uint64_t wait_begin = play_now_us();
     int slot = play_find_free_slot_locked(s);
     while (slot < 0 && !play_stop_requested(s) && !s->fallback && !s->seek_requested) {
         pthread_cond_wait(&s->condition, &s->mutex);
         slot = play_find_free_slot_locked(s);
     }
+    const uint64_t waited_us = play_now_us() - wait_begin;
+    s->last_slot_wait_us     = waited_us;
+    if (waited_us > s->max_slot_wait_us) s->max_slot_wait_us = waited_us;
+    if (waited_us != 0) ++s->slot_wait_count;
+    if (s->trace_latency && waited_us >= 50000)
+        play_logf("vdec-play: slot-wait us=%llu states=%s/%s/%s pending=%d present=%d", (unsigned long long)waited_us,
+                  play_slot_state_name(s->slots[0].state), play_slot_state_name(s->slots[1].state),
+                  play_slot_state_name(s->slots[2].state), s->pending_count, s->present_pending);
     if (slot >= 0 && !play_stop_requested(s) && !s->fallback && !s->seek_requested)
         s->slots[slot].state = VDEC_PLAY_SLOT_INFLIGHT;
     else if (s->seek_requested && !play_stop_requested(s) && !s->fallback)
@@ -605,18 +820,20 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
     s->decoder.visible_width = visible_width;
     s->decoder.visible_height = visible_height;
     s->resources_live = 1;
-    play_logf("vdec-play: decoder ready visible=%dx%d frame_size=0x%llx",
-              visible_width, visible_height, (unsigned long long)s->decoder.frame_size);
+    s->direct_mem_peak = play_direct_mem_bytes(s);
+    play_logf("vdec-play: decoder ready visible=%dx%d frame_size=0x%llx direct_mem=%llu",
+              visible_width, visible_height, (unsigned long long)s->decoder.frame_size,
+              (unsigned long long)s->direct_mem_peak);
     return 0;
 }
 
 #endif
 
 #if defined(PS5_NATIVE_APP) && defined(BOREALIS_USE_AGC)
-static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, int size,
-                            int64_t pts90k, int is_flush, int flush_index) {
-    uint8_t *au = (uint8_t *)s->decoder.au_pool.address +
-                  (size_t)(s->input_count % VDEC_PLAY_SLOTS) * VDEC_PLAY_AU_BYTES;
+static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, int size, int64_t pts90k, int is_flush,
+                            int flush_index, uint64_t au_index) {
+    uint8_t *au =
+        (uint8_t *)s->decoder.au_pool.address + (size_t)(s->input_count % VDEC_PLAY_SLOTS) * VDEC_PLAY_AU_BYTES;
     if (!is_flush) {
         if (!data || size <= 0 || (uint64_t)size > VDEC_PLAY_AU_BYTES) {
             pthread_mutex_lock(&s->mutex);
@@ -645,27 +862,69 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
     memset(&output, 0, sizeof(output));
     output.size = sizeof(output);
 
+    const uint64_t call_begin = play_now_us();
+    uint64_t decode_us        = 0;
+    uint64_t flush_us         = 0;
+    int32_t rc                = 0;
+    if (is_flush) {
     const uint64_t begin = play_now_us();
-    if (!is_flush && strcmp(s->inject, "timeout") == 0)
-        sceKernelUsleep((unsigned int)(s->timeout_ms + 1) * 1000u);
-    int32_t rc = is_flush ? sceVideodec2Flush(s->decoder.decoder, &frame, &output)
-                          : sceVideodec2Decode(s->decoder.decoder, &input, &frame, &output);
+        rc                   = sceVideodec2Flush(s->decoder.decoder, &frame, &output);
+        flush_us             = play_now_us() - begin;
+        play_latency_record(s, 1, flush_us);
+    } else {
+        const uint64_t begin = play_now_us();
+        if (strcmp(s->inject, "timeout") == 0) sceKernelUsleep((unsigned int)(s->timeout_ms + 1) * 1000u);
+        rc        = sceVideodec2Decode(s->decoder.decoder, &input, &frame, &output);
+        decode_us = play_now_us() - begin;
+        play_latency_record(s, 0, decode_us);
+    }
     int did_flush = 0;
-    if (!is_flush && rc == 0 && !output.valid &&
-        (s->flush_each_decode || s->pending_count >= s->pending_limit)) {
+    if (!is_flush && rc == 0 && !output.valid && (s->flush_each_decode || s->pending_count >= s->pending_limit)) {
         memset(&output, 0, sizeof(output));
         output.size = sizeof(output);
+        const uint64_t begin = play_now_us();
         rc = sceVideodec2Flush(s->decoder.decoder, &frame, &output);
+        flush_us             = play_now_us() - begin;
+        play_latency_record(s, 1, flush_us);
         did_flush = 1;
     }
+    const uint64_t operation_elapsed = decode_us + flush_us;
+    s->last_call_stage               = (is_flush || did_flush) ? VDEC_PLAY_STAGE_FLUSH : VDEC_PLAY_STAGE_DECODE;
+    s->last_call_au_index            = au_index;
+    s->last_call_slot                = slot;
+    s->last_call_flush_index         = flush_index;
+    s->last_call_rc                  = rc;
+    s->last_call_valid               = output.valid;
+    s->last_call_error               = output.error;
+    s->last_call_accepted            = frame.accepted;
+    s->last_call_did_flush           = did_flush;
+    s->last_call_decode_us           = decode_us;
+    s->last_call_flush_us            = flush_us;
+    s->last_call_elapsed_us          = operation_elapsed;
     if (s->trace_au)
-        play_logf("vdec-play: output raw valid=%d error=%d picture_count=%d accepted=%u flush=%d",
-                  output.valid, output.error, output.picture_count, frame.accepted, is_flush || did_flush);
-    const uint64_t elapsed = play_now_us() - begin;
-    if (elapsed > (uint64_t)s->timeout_ms * 1000u) {
+        play_logf(
+            "vdec-play: output raw valid=%d error=%d picture_count=%d accepted=%u flush=%d decode_us=%llu "
+            "flush_us=%llu operation_us=%llu",
+            output.valid, output.error, output.picture_count, frame.accepted, is_flush || did_flush,
+            (unsigned long long)decode_us, (unsigned long long)flush_us, (unsigned long long)operation_elapsed);
+    const uint64_t call_elapsed = play_now_us() - call_begin;
+    s->last_call_elapsed_us     = call_elapsed;
+    if (s->trace_au && call_elapsed > (uint64_t)s->timeout_ms * 1000u && decode_us <= (uint64_t)s->timeout_ms * 1000u &&
+        flush_us <= (uint64_t)s->timeout_ms * 1000u)
+        play_logf("vdec-play: combined-watchdog-would-fire call_us=%llu operation_us=%llu decode_us=%llu flush_us=%llu",
+                  (unsigned long long)call_elapsed, (unsigned long long)operation_elapsed,
+                  (unsigned long long)decode_us, (unsigned long long)flush_us);
+    if (decode_us > (uint64_t)s->timeout_ms * 1000u) {
         pthread_mutex_lock(&s->mutex);
         play_release_slot_locked(s, slot);
-        play_fail_locked(s, (is_flush || did_flush) ? "flush-timeout" : "decode-timeout", -9008);
+        play_fail_locked(s, "decode-timeout", -9008);
+        pthread_mutex_unlock(&s->mutex);
+        return -1;
+    }
+    if (flush_us > (uint64_t)s->timeout_ms * 1000u) {
+        pthread_mutex_lock(&s->mutex);
+        play_release_slot_locked(s, slot);
+        play_fail_locked(s, "flush-timeout", -9008);
         pthread_mutex_unlock(&s->mutex);
         return -1;
     }
@@ -674,8 +933,9 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
         play_release_slot_locked(s, slot);
         play_fail_locked(s, (is_flush || did_flush) ? "flush-error" : "decode-error", rc);
         pthread_mutex_unlock(&s->mutex);
-        play_logf("vdec-play: %s index=%d rc=%d accepted=%u", (is_flush || did_flush) ? "flush" : "decode",
-                  is_flush ? flush_index : (int)s->input_count, rc, frame.accepted);
+        play_logf("vdec-play: %s index=%d rc=%d accepted=%u decode_us=%llu flush_us=%llu",
+                  (is_flush || did_flush) ? "flush" : "decode", is_flush ? flush_index : (int)au_index, rc,
+                  frame.accepted, (unsigned long long)decode_us, (unsigned long long)flush_us);
         return -1;
     }
     if (!is_flush && strcmp(s->inject, "bad-stream") == 0 && s->input_count == 1) {
@@ -691,16 +951,23 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
     if (!is_flush) ++s->accepted_count;
     int output_slot = -1;
     const int account = play_account_output_locked(s, slot, &output, &output_slot);
+    VdecPlayAuContext *context = play_context_for_index_locked(s, au_index);
+    if (context) {
+        context->pending_after = s->pending_count;
+        context->output_slot   = output_slot;
+        context->slot_state    = s->slots[slot].state;
+    }
     if (s->trace_au && output.valid)
-        play_logf("vdec-play: output seq=%llu pts90k=%lld valid=%d error=%d picture_count=%d slot=%d flush=%d pending=%d",
+        play_logf(
+            "vdec-play: output seq=%llu pts90k=%lld valid=%d error=%d picture_count=%d slot=%d flush=%d pending=%d",
                   (unsigned long long)s->sequence, (long long)s->last_output_pts, output.valid, output.error,
                   output.picture_count, output_slot, is_flush || did_flush, s->pending_count);
     pthread_mutex_unlock(&s->mutex);
     if (account < 0) return -1;
     if (output.valid && (s->sequence == 1 || (s->sequence % 120u) == 0u))
         play_logf("vdec-play: output seq=%llu pts90k=%lld slot=%d flush=%d limit=%d peak=%d error=%d picture_count=%d",
-                  (unsigned long long)s->sequence, (long long)s->last_output_pts, output_slot,
-                  is_flush || did_flush, s->pending_limit, s->peak_pending_count, output.error, output.picture_count);
+                  (unsigned long long)s->sequence, (long long)s->last_output_pts, output_slot, is_flush || did_flush,
+                  s->pending_limit, s->peak_pending_count, output.error, output.picture_count);
     return output.valid ? 1 : 0;
 }
 
@@ -709,7 +976,7 @@ static int play_flush(VdecPlaySession *s) {
         const int slot = play_wait_for_frame_slot(s);
         if (slot == -2) return VDEC_PLAY_RESULT_SEEK;
         if (slot < 0) return -1;
-        const int result = play_decode_call(s, slot, NULL, 0, 0, 1, i);
+        const int result = play_decode_call(s, slot, NULL, 0, 0, 1, i, UINT64_MAX);
         if (result == VDEC_PLAY_RESULT_SEEK) return VDEC_PLAY_RESULT_SEEK;
         if (result < 0) return -1;
         if (result == 0) {
@@ -753,9 +1020,11 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
         const int true_idr = keyframe && nal.idr && play_true_idr(data, size, s->decoder.codec);
         if (!true_idr) {
             if (s->trace_au)
-                play_logf("vdec-play: AU skip-until-IDR index=%llu pts=%lld dts=%lld key=%d idr=%d cra=%d new_vps=%d new_sps=%d new_pps=%d size=%d",
-                          (unsigned long long)s->input_count, (long long)raw_pts, (long long)raw_dts, keyframe,
-                          nal.idr, nal.cra, new_vps, new_sps, new_pps, size);
+                play_logf(
+                    "vdec-play: AU skip-until-IDR index=%llu pts=%lld dts=%lld key=%d idr=%d cra=%d new_vps=%d "
+                    "new_sps=%d new_pps=%d size=%d",
+                    (unsigned long long)s->input_count, (long long)raw_pts, (long long)raw_dts, keyframe, nal.idr,
+                    nal.cra, new_vps, new_sps, new_pps, size);
             pthread_mutex_unlock(&s->mutex);
             return VDEC_PLAY_RESULT_OK;
         }
@@ -775,15 +1044,34 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
         return -1;
     }
     if (s->trace_au)
-        play_logf("vdec-play: AU index=%llu pts=%lld dts=%lld pts90k=%lld key=%d idr=%d cra=%d new_vps=%d new_sps=%d new_pps=%d size=%d pending=%d",
-                  (unsigned long long)s->input_count, (long long)raw_pts, (long long)raw_dts, (long long)pts90k,
-                  keyframe, nal.idr, nal.cra, new_vps, new_sps, new_pps, size, s->pending_count);
+        play_logf(
+            "vdec-play: AU index=%llu pts=%lld dts=%lld pts90k=%lld key=%d idr=%d cra=%d new_vps=%d new_sps=%d "
+            "new_pps=%d size=%d pending=%d",
+            (unsigned long long)s->input_count, (long long)raw_pts, (long long)raw_dts, (long long)pts90k, keyframe,
+            nal.idr, nal.cra, new_vps, new_sps, new_pps, size, s->pending_count);
     s->last_pts = source_pts;
+    const int pending_before = s->pending_count;
     if (play_pending_push_locked(s, pts90k) != 0) {
         pthread_mutex_unlock(&s->mutex);
         return -1;
     }
     const uint64_t input_index = s->input_count++;
+    VdecPlayAuContext *context = &s->au_context[s->au_context_head];
+    memset(context, 0, sizeof(*context));
+    context->index          = input_index;
+    context->raw_pts        = raw_pts;
+    context->raw_dts        = raw_dts;
+    context->pts90k         = pts90k;
+    context->keyframe       = keyframe;
+    context->idr            = nal.idr;
+    context->cra            = nal.cra;
+    context->pending_before = pending_before;
+    context->pending_after  = s->pending_count;
+    context->input_slot     = -1;
+    context->output_slot    = -1;
+    context->slot_state     = VDEC_PLAY_SLOT_FREE;
+    s->au_context_head      = (s->au_context_head + 1) % VDEC_PLAY_CONTEXT_CAP;
+    if (s->au_context_count < VDEC_PLAY_CONTEXT_CAP) ++s->au_context_count;
     pthread_mutex_unlock(&s->mutex);
 
     if (strcmp(s->inject, "window") == 0 && input_index == 0) {
@@ -802,7 +1090,14 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
     const int slot = play_wait_for_frame_slot(s);
     if (slot == -2) return VDEC_PLAY_RESULT_SEEK;
     if (slot < 0) return -1;
-    return play_decode_call(s, slot, data, size, pts90k, 0, -1) < 0 ? -1 : VDEC_PLAY_RESULT_OK;
+    pthread_mutex_lock(&s->mutex);
+    context = play_context_for_index_locked(s, input_index);
+    if (context) {
+        context->input_slot = slot;
+        context->slot_state = s->slots[slot].state;
+    }
+    pthread_mutex_unlock(&s->mutex);
+    return play_decode_call(s, slot, data, size, pts90k, 0, -1, input_index) < 0 ? -1 : VDEC_PLAY_RESULT_OK;
 }
 
 enum {
@@ -1214,6 +1509,105 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
               media->has_reorder);
     return 0;
 }
+static int play_switch_to_backup(VdecPlaySession *s, VdecPlayMedia *media, int failure_rc) {
+    if (!s || !media) return 0;
+    for (;;) {
+        char backup[sizeof(s->backup_urls[0])];
+        int backup_index  = -1;
+        int64_t target90k = 0;
+        pthread_mutex_lock(&s->mutex);
+        if (s->backup_index >= s->backup_count || play_stop_requested(s) || s->fallback) {
+            pthread_mutex_unlock(&s->mutex);
+            return 0;
+        }
+        backup_index = s->backup_index++;
+        snprintf(backup, sizeof(backup), "%s", s->backup_urls[backup_index]);
+        if (s->last_output_pts != INT64_MIN) target90k = s->last_output_pts;
+        s->decoder_ready = 0;
+        while (s->present_pending && !play_stop_requested(s) && !s->fallback)
+            pthread_cond_wait(&s->condition, &s->mutex);
+        if (play_stop_requested(s) || s->fallback) {
+            pthread_mutex_unlock(&s->mutex);
+            return 0;
+        }
+        snprintf(s->source_url, sizeof(s->source_url), "%s", backup);
+        ++s->failover_count;
+        pthread_mutex_unlock(&s->mutex);
+        play_logf("vdec-play: backup-switch begin index=%d rc=%d target90k=%lld failovers=%llu", backup_index,
+                  failure_rc, (long long)target90k, (unsigned long long)s->failover_count);
+
+        const int32_t reset_rc = sceVideodec2Reset(s->decoder.decoder);
+        if (reset_rc != 0) {
+            play_logf("vdec-play: backup-switch reset failed index=%d rc=%d", backup_index, reset_rc);
+            continue;
+        }
+        play_media_close(media);
+        if (play_media_open(s, media) != 0) {
+            play_logf("vdec-play: backup-switch open failed index=%d", backup_index);
+            continue;
+        }
+        if (media->codec != s->decoder.codec || media->stream->codecpar->width != s->decoder.visible_width ||
+            media->stream->codecpar->height != s->decoder.visible_height) {
+            play_logf("vdec-play: backup-switch format mismatch index=%d codec=%u size=%dx%d", backup_index,
+                      media->codec, media->stream->codecpar->width, media->stream->codecpar->height);
+            play_media_close(media);
+            continue;
+        }
+        const int64_t origin90k =
+            media->stream->start_time != AV_NOPTS_VALUE
+                ? av_rescale_q(media->stream->start_time, media->time_base, (AVRational){1, 90000})
+                : 0;
+        const int64_t target = av_rescale_q(origin90k + target90k, (AVRational){1, 90000}, media->time_base);
+        int seek_rc          = 0;
+        int sequential_seek  = 0;
+        if (target90k > 0) {
+            seek_rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, target, target, 0);
+            if (seek_rc < 0) {
+                avformat_flush(media->format);
+                sequential_seek = 1;
+            }
+        }
+        av_bsf_flush(media->bsf);
+        pthread_mutex_lock(&s->mutex);
+        if (play_stop_requested(s) || s->fallback) {
+            pthread_mutex_unlock(&s->mutex);
+            play_media_close(media);
+            return 0;
+        }
+        s->timeline_origin_pts      = origin90k;
+        s->first_pts                = origin90k;
+        s->timeline_origin_set      = 1;
+        s->last_output_pts          = INT64_MIN;
+        s->last_pts                 = origin90k + target90k;
+        s->last_clock_pts           = INT64_MIN;
+        s->pending_count            = 0;
+        s->current_slot             = -1;
+        s->ready_count              = 0;
+        s->present_pending          = 0;
+        s->present_pending_since_us = 0;
+        s->awaiting_idr             = 1;
+        s->sps_seen                 = 0;
+        s->pps_seen                 = 0;
+        s->vps_seen                 = 0;
+        s->source_eof               = 0;
+        s->reopen_media             = 0;
+        s->sequential_seek          = sequential_seek;
+        s->sequential_seek_pts90k   = target90k;
+        s->seek_requested           = 0;
+        memset(s->pending_pts, 0, sizeof(s->pending_pts));
+        memset(s->ready_queue, 0, sizeof(s->ready_queue));
+        memset(s->slots, 0, sizeof(s->slots));
+        memset(s->au_context, 0, sizeof(s->au_context));
+        s->au_context_head  = 0;
+        s->au_context_count = 0;
+        s->decoder_ready    = 1;
+        pthread_cond_broadcast(&s->condition);
+        pthread_mutex_unlock(&s->mutex);
+        play_logf("vdec-play: backup-switch success index=%d seek_rc=%d sequential=%d target90k=%lld", backup_index,
+                  seek_rc, sequential_seek, (long long)target90k);
+        return 1;
+    }
+}
 static int play_packet_is_complete(const VdecPlayMedia *media, const AVPacket *packet) {
     if (!media || !packet || (media->codec != VDEC_PLAY_CODEC_AVC && media->codec != VDEC_PLAY_CODEC_HEVC)) return 1;
     VdecPlayPacketTrace trace;
@@ -1308,7 +1702,17 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             result = VDEC_PLAY_RESULT_SEEK;
             break;
         }
+        const uint64_t read_begin = play_now_us();
         const int read_rc = av_read_frame(media->format, input);
+        const uint64_t read_us    = play_now_us() - read_begin;
+        pthread_mutex_lock(&s->mutex);
+        s->last_demux_wait_us = read_us;
+        if (read_us > s->max_demux_wait_us) s->max_demux_wait_us = read_us;
+        ++s->demux_read_count;
+        if (s->trace_latency && read_us >= 50000)
+            play_logf("vdec-play: demux-wait us=%llu rc=%d input=%llu eof=%d seek=%d", (unsigned long long)read_us,
+                      read_rc, (unsigned long long)s->input_count, s->source_eof, s->seek_requested);
+        pthread_mutex_unlock(&s->mutex);
         if (read_rc == AVERROR_EOF) {
             pthread_mutex_lock(&s->mutex);
             s->source_eof = 1;
@@ -1325,6 +1729,8 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
                 break;
             }
             if (play_stop_requested(s)) break;
+            av_packet_unref(input);
+            if (play_switch_to_backup(s, media, read_rc)) continue;
             play_log_av_error("read-frame", read_rc);
             play_fail(s, "demux-error", read_rc);
             result = -1;
@@ -1336,10 +1742,13 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
         }
         play_packet_trace_record(media, input);
         if (!play_packet_is_complete(media, input)) {
-            play_packet_trace_log("packet-short", &media->trace[(media->trace_head + VDEC_PLAY_TRACE_PACKET_CAP - 1) %
-                                                                 VDEC_PLAY_TRACE_PACKET_CAP]);
+            play_packet_trace_log(
+                "packet-short",
+                &media->trace[(media->trace_head + VDEC_PLAY_TRACE_PACKET_CAP - 1) % VDEC_PLAY_TRACE_PACKET_CAP]);
             if (play_recover_packet(s, media, input) != 0) {
                 play_packet_trace_dump(media);
+                av_packet_unref(input);
+                if (play_switch_to_backup(s, media, -9025)) continue;
                 play_fail(s, "demux-short-packet", -9025);
                 result = -1;
                 break;
@@ -1639,6 +2048,7 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->sequential_seek_pts90k = 0;
     s->ready_count = 0;
     s->present_pending = 0;
+    s->present_pending_since_us = 0;
     s->timeout_ms = VDEC_PLAY_TIMEOUT_MS_DEFAULT;
     s->flush_each_decode = 1;
     s->pending_limit = VDEC_PLAY_PENDING_LIMIT;
@@ -1647,6 +2057,7 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->p010_enabled = 0;
     s->video_color_trc = 1;
     s->trace_au = 0;
+    s->trace_latency            = 0;
     s->seek_seconds = 0.0;
     s->seek_generation = 0;
     s->stress_eof_count = 0;
@@ -1663,6 +2074,27 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->pps_seen = 0;
     s->vps_seen = 0;
     s->last_logged_speed = -1.0;
+    s->direct_mem_peak          = 0;
+    s->last_demux_wait_us       = 0;
+    s->max_demux_wait_us        = 0;
+    s->demux_read_count         = 0;
+    s->last_slot_wait_us        = 0;
+    s->max_slot_wait_us         = 0;
+    s->slot_wait_count          = 0;
+    s->max_present_wait_us      = 0;
+    s->last_call_stage          = VDEC_PLAY_STAGE_NONE;
+    s->last_call_slot           = -1;
+    s->last_call_flush_index    = -1;
+    s->last_call_rc             = 0;
+    s->last_call_valid          = 0;
+    s->last_call_error          = 0;
+    s->last_call_accepted       = 0;
+    s->last_call_did_flush      = 0;
+    s->last_call_au_index       = UINT64_MAX;
+    s->last_call_decode_us      = 0;
+    s->last_call_flush_us       = 0;
+    s->last_call_elapsed_us     = 0;
+    s->failover_count           = 0;
     s->input_count = 0;
     s->accepted_count = 0;
     s->output_count = 0;
@@ -1674,7 +2106,14 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     memset(s->ready_queue, 0, sizeof(s->ready_queue));
     memset(s->pending_pts, 0, sizeof(s->pending_pts));
     memset(s->slots, 0, sizeof(s->slots));
+    memset(s->au_context, 0, sizeof(s->au_context));
+    s->au_context_head  = 0;
+    s->au_context_count = 0;
+    memset(&s->latency, 0, sizeof(s->latency));
     memset(s->source_url, 0, sizeof(s->source_url));
+    memset(s->backup_urls, 0, sizeof(s->backup_urls));
+    s->backup_count = 0;
+    s->backup_index = 0;
     memset(s->inject, 0, sizeof(s->inject));
 }
 
@@ -1692,6 +2131,15 @@ void wiliwili_vdec_play_stop(void) {
     if (s->resources_live) evo_agc_runtime_wait_idle(500);
 #endif
     pthread_mutex_lock(&s->mutex);
+    play_logf(
+        "vdec-play: stop summary inputs=%llu accepted=%llu outputs=%llu presented=%llu retired=%llu dropped=%llu "
+        "errors=%llu order_errors=%llu failovers=%llu direct_mem=%llu",
+        (unsigned long long)s->input_count, (unsigned long long)s->accepted_count, (unsigned long long)s->output_count,
+        (unsigned long long)s->presented_count, (unsigned long long)s->retired_count,
+        (unsigned long long)s->dropped_count, (unsigned long long)s->error_count,
+        (unsigned long long)s->order_error_count, (unsigned long long)s->failover_count,
+        (unsigned long long)play_direct_mem_bytes(s));
+    if (s->trace_latency) play_latency_report(s, "stop");
     if (s->resources_live) play_decoder_close(&s->decoder);
     s->thread_started = 0;
     play_reset_state_locked(s);
@@ -1714,11 +2162,15 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     }
     play_reset_state_locked(s);
     snprintf(s->source_url, sizeof(s->source_url), "%s", source);
+    const char *backup_url = getenv("WILIWILI_VDEC_BACKUP_URL");
+    if (backup_url != NULL && backup_url[0] != '\0' && !play_add_backup_url_locked(s, backup_url))
+        play_logf("vdec-play: backup URL rejected");
     const char *inject = getenv("WILIWILI_VDEC_INJECT");
     if (inject) snprintf(s->inject, sizeof(s->inject), "%s", inject);
     const char *timeout = getenv("WILIWILI_VDEC_TIMEOUT_MS");
     if (timeout && atoi(timeout) > 0) s->timeout_ms = atoi(timeout);
     s->trace_au = play_gate_value("WILIWILI_VDEC_TRACE_AU");
+    s->trace_latency    = play_gate_value("WILIWILI_VDEC_TRACE_LATENCY");
     s->adaptive_pending = 1;
     if (play_gate_value("WILIWILI_VDEC_FIXED_PENDING")) s->adaptive_pending = 0;
     s->p010_enabled = play_gate_value("WILIWILI_VDEC_P010");
@@ -1749,10 +2201,21 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     }
     s->thread_started = 1;
     pthread_mutex_unlock(&s->mutex);
-    play_logf("vdec-play: start source=%s inject=%s timeout_ms=%d pending_limit=%d adaptive_pending=%d p010=%d start=%d trace_au=%d dts=UINT64_MAX",
-              s->source_url, s->inject[0] ? s->inject : "none", s->timeout_ms, s->pending_limit,
-              s->adaptive_pending, s->p010_enabled, start_seconds, s->trace_au);
+    play_logf(
+        "vdec-play: start source=%s inject=%s timeout_ms=%d pending_limit=%d adaptive_pending=%d p010=%d start=%d "
+        "trace_au=%d trace_latency=%d backups=%d dts=UINT64_MAX",
+        s->source_url, s->inject[0] ? s->inject : "none", s->timeout_ms, s->pending_limit, s->adaptive_pending,
+        s->p010_enabled, start_seconds, s->trace_au, s->trace_latency, s->backup_count);
     return 1;
+}
+
+void wiliwili_vdec_play_add_backup_url(const char *url) {
+    if (!wiliwili_vdec_play_enabled() || url == NULL || url[0] == '\0') return;
+    VdecPlaySession *s = &g_vdec_play;
+    pthread_mutex_lock(&s->mutex);
+    if (s->active && play_add_backup_url_locked(s, url))
+        play_logf("vdec-play: backup URL registered index=%d", s->backup_count - 1);
+    pthread_mutex_unlock(&s->mutex);
 }
 
 int wiliwili_vdec_play_seek(double seconds) {
@@ -1910,20 +2373,28 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
         ten_bit = 1;
         color_trc = s->video_color_trc;
     }
-    const int rc = evo_agc_blit_yuv_rect(y, y_pitch, uv, uv_pitch,
-                                         NULL, 0, NULL, 0, frame->width, frame->height,
-                                         s->decoder.visible_width, s->decoder.visible_height,
-                                         view_x, view_y, view_w, view_h, view_mode, ten_bit, color_trc,
-                                         0, frame->pts90k * 1000000 / 90000);
+    const int rc = evo_agc_blit_yuv_rect(y, y_pitch, uv, uv_pitch, NULL, 0, NULL, 0, frame->width, frame->height,
+                                         s->decoder.visible_width, s->decoder.visible_height, view_x, view_y, view_w,
+                                         view_h, view_mode, ten_bit, color_trc, 0, frame->pts90k * 1000000 / 90000);
     if (rc != 0) {
         play_fail_locked(s, "agc-blit", rc);
         pthread_mutex_unlock(&s->mutex);
         return 0;
     }
+    if (s->presented_count >= 5) {
+        const uint64_t drift90k = frame->pts90k >= clock_pts90k ? (uint64_t)(frame->pts90k - clock_pts90k)
+                                                                : (uint64_t)(clock_pts90k - frame->pts90k);
+        play_latency_record_drift(s, drift90k * 1000000u / 90000u);
+    }
+    if (!s->present_pending) s->present_pending_since_us = play_now_us();
     s->present_pending = 1;
+    const uint64_t direct_mem = play_direct_mem_bytes(s);
+    if (direct_mem > s->direct_mem_peak) s->direct_mem_peak = direct_mem;
     ++s->presented_count;
     if (s->presented_count == 1 || s->presented_count % 120 == 0)
-        play_logf("vdec-play: presented=%llu pts90k=%lld clock90k=%lld slot=%d retired=%llu advanced=%llu dropped=%llu eof=%d limit=%d peak=%d pending=%d inputs=%llu accepted=%llu outputs=%llu errors=%llu order_errors=%llu",
+        play_logf(
+            "vdec-play: presented=%llu pts90k=%lld clock90k=%lld slot=%d retired=%llu advanced=%llu dropped=%llu "
+            "eof=%d limit=%d peak=%d pending=%d inputs=%llu accepted=%llu outputs=%llu errors=%llu order_errors=%llu",
                   (unsigned long long)s->presented_count, (long long)frame->pts90k, (long long)clock_pts90k, slot,
                   (unsigned long long)s->retired_count, (unsigned long long)s->advanced_count,
                   (unsigned long long)s->dropped_count, s->source_eof, s->pending_limit, s->peak_pending_count,
@@ -1938,6 +2409,12 @@ void wiliwili_vdec_play_frame_retire(void) {
     VdecPlaySession *s = &g_vdec_play;
     pthread_mutex_lock(&s->mutex);
     if (s->present_pending) {
+        const uint64_t wait_us = s->present_pending_since_us != 0 ? play_now_us() - s->present_pending_since_us : 0;
+        if (wait_us > s->max_present_wait_us) s->max_present_wait_us = wait_us;
+        if (s->trace_latency && wait_us >= 50000)
+            play_logf("vdec-play: present-wait us=%llu retired=%llu", (unsigned long long)wait_us,
+                      (unsigned long long)s->retired_count);
+        s->present_pending_since_us = 0;
         s->present_pending = 0;
         ++s->retired_count;
         pthread_cond_broadcast(&s->condition);
@@ -1947,14 +2424,29 @@ void wiliwili_vdec_play_frame_retire(void) {
 
 #else
 
-int wiliwili_vdec_play_start(const char *url, int start_seconds) { (void)url; (void)start_seconds; return 0; }
-int wiliwili_vdec_play_seek(double seconds) { (void)seconds; return 0; }
+int wiliwili_vdec_play_start(const char *url, int start_seconds) {
+    (void)url;
+    (void)start_seconds;
+    return 0;
+}
+void wiliwili_vdec_play_add_backup_url(const char *url) { (void)url; }
+int wiliwili_vdec_play_seek(double seconds) {
+    (void)seconds;
+    return 0;
+}
 void wiliwili_vdec_play_stop(void) {}
 void wiliwili_vdec_play_pause(int paused) { (void)paused; }
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
                             int view_h, int view_mode) {
-    (void)playback_time; (void)speed; (void)paused; (void)view_x; (void)view_y; (void)view_w; (void)view_h;
-    (void)view_mode; return 0;
+    (void)playback_time;
+    (void)speed;
+    (void)paused;
+    (void)view_x;
+    (void)view_y;
+    (void)view_w;
+    (void)view_h;
+    (void)view_mode;
+    return 0;
 }
 void wiliwili_vdec_play_frame_retire(void) {}
 

@@ -414,7 +414,7 @@ P1 验收：连续 60 秒，视频 PTS 与 `playback-time` 漂移 <100 ms；无 
 |`PPSA99291`|`WILIWILI_VDEC_INJECT=bad-stream`|`FALLBACK_A reason=injected-bad-stream rc=-9015`；mpv audio active。|
 |`PPSA99292`|`...=reset`|30 帧后 `injected midstream reset rc=0`，随后 `FALLBACK_A reason=injected-reset-failure rc=-9017`。|
 |`PPSA99293`|`...=window`|`FALLBACK_A reason=pending-window-injected rc=-9016`。|
-|`PPSA99294`|`...=timeout`, `WILIWILI_VDEC_TIMEOUT_MS=10`|`FALLBACK_A reason=flush-timeout rc=-9008`；mpv audio active。|
+|`PPSA99294`|`...=timeout`, `WILIWILI_VDEC_TIMEOUT_MS=10`|`FALLBACK_A reason=decode-timeout rc=-9008`；mpv audio active。|
 
 #### 6.5.2 M3：时钟、交互与真实 B4（2026-10-06）
 
@@ -508,14 +508,26 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 本轮针对用户报告的“主页选卡片无反应”做了干净重启和对照：`/tmp/m7-c-home.png` 显示主界面正常；稳定输入 `right → down → cross` 后，最终 hw 包取得 `/tmp/m7-final3-small.png`，并在日志中进入 `vdec-play: start`/`decoder ready`。A 对照 `/tmp/m7-a-after-cross.png` 与仅开 `WILIWILI_VDEC_PLAY` 的门控对照 `/tmp/m7-play-only-after-cross.png` 也都能打开详情。第一次未进入的截图发生在被中断的 PeaSyo 输入会话中，后续干净会话可稳定复现成功；未发现 `setUrl`/`mpvCore->reset()` 重入或重试风暴，未改该链。
 
 同一复现进一步暴露了真实的全屏回归：`setFullScreen(true)` 新建第二个 `VideoView`，其 `native_vdec_mpv_suppressed` 默认为 false，而共享 mpv 当前仍是 `vid=no`，所以 pre-fix `/tmp/m7-final-hw-full.png` 全黑并伴随 `mpv-sw: surface=81`。修复在 `video_view.cpp` 将 native 抑制状态复制给全屏 clone，并用 `native_vdec_play_owner` 防止 clone 析构停止原始 singleton decoder，同时保持 A clone 的旧 stop 语义。post-fix `/tmp/m7-final3-full.png` 全屏有画面，`/tmp/m7-fixed-exit-small.png` 退出全屏后仍继续 native 播放；日志收据为小窗 `logical=10,10 800x450 → physical=15,15 1200x675`、全屏 `logical=0,0 1280x720 → physical=0,0 1920x1080`，health 三项持续 0、FPS 约 60。最终交付包 build marker 为 `Oct 7 2026 08:31:41`。
+#### 6.5.7 M8：C watchdog 遥测、长跑与备用切换（2026-10-07）
+
+**根因判定。** M6 的失败包选项含 `WILIWILI_VDEC_TRACE_AU=1`；旧实现把 `Decode + Flush + 诊断 UDP 日志` 的组合时间一起与 250 ms 比较，并把超时归因为 `flush-timeout`。新 `/tmp/m7-c-trace-cycle.log` 在相同 trace_au 压力下运行约 260 s、无 `FALLBACK_A`：`combined-watchdog-would-fire` 的 `call_us` 为约 0.52–0.95 s，但 `operation_us` 仅约 1.3–4.3 ms，Decode/Flush 各自均远低于 250 ms；这是真实的 watchdog 计时边界/日志阻塞假象，不是 VDEC、槽位、AGC fence 或 demux 卡住。默认超时保持 250 ms，不用增大掩盖问题。
+
+**遥测与修复。** `native_vdec_play.c` 现在分开统计 Decode 与 Flush 的 p50/p95/p99/max，每 600 次 Decode 输出一行；失败时记录前后 8 个 AU 的 pts/dts/IDR/pending/槽位、direct_mem、seek/EOF/reopen、demux/槽位/fence 等待。watchdog 只检查单次 ABI Decode 或单次 ABI Flush；slot wait、demux、`play_logf` 均不在该门槛内。`WILIWILI_VDEC_TRACE_LATENCY=1` 额外输出 PTS-clock 漂移和 direct_mem。
+
+**失败上下文收据。** `/tmp/m7-failover-v2-cycle.log` 的受控中途断流先触发短包失败：`reason=demux-short-packet rc=-9025`，失败上下文为 `au=2215 slot=1 pending=0 demux_last_us=1004235 demux_max_us=1004235 direct_mem=48857088 slot_max_us=1740991 present_max_us=22194`；前后 AU 2208…2215 的 pts90k 为 `154674000…154695000`，均非 IDR、槽位按 `READY` 周期复用。它证明 demux/短包失败会被干净记录并回 A；旧 197 s flush-timeout 本身没有这些字段，新的 trace_au 回归运行则只出现上述 combined-watchdog 诊断而没有回退。
+
+**失败驱动备用 URL。** `VideoView::setBackupUrl()` 现在把视频 backup URL 注册到 C；也支持 `WILIWILI_VDEC_BACKUP_URL`。demux read/短包失败时，C 等待 present retire、Reset、重开 backup、按旧 target90k seek 并等待新 IDR；解码器/AGC 失败仍 fail-closed 到 A。`/tmp/m7-failover-v3-cycle.log` 使用服务 `/tmp/m7-failover-server-v3.log`：primary 在 8 MiB 后断流并返回 503，日志为 `backup-switch begin index=0 rc=-9025 target90k=173325000` → `success ... seek_rc=0`，之后继续 C present 至 6000+，无 `FALLBACK_A`；health 三项/timeout 全 0。
+
+**30 分钟 C 长测。** `/tmp/m7-c-30m-cycle.log` 使用本地 `/tmp/m5-33m.mp4`、`WILIWILI_VDEC_TRACE_LATENCY=1`，监听 1794 s（约 29.9 min），build marker `Oct 7 2026 13:09:31`。89 个完整延迟窗口中 Decode 为 p50 `1.312–1.340 ms`、p95 `1.765–1.878 ms`、p99 `4.061–4.196 ms`、max `4.133–5.463 ms`；Flush 为 p50 `0.082–0.084 ms`、p95 `0.089–0.092 ms`、p99 `0.094–0.103 ms`、max `0.100–0.135 ms`。漂移稳态 p50 约 `23.6–26.7 ms`、p95 `74.7–76.0 ms`、p99 `82.7–84.0 ms`、max `86.7–90.7 ms`；首个 seek warm-up 窗口 max `862 ms` 单独保留，不代表稳态。C decoder direct_mem `48857088` bytes 全程不变；AGC health direct_mem `3.19→8.48 MiB`，端点斜率约 `0.177 MiB/min`，health peak `52.67 MiB`。末端 `presented=107280 inputs=53726 accepted=53725 outputs=53725 dropped=0 errors=0 order_errors=0`；180 个 health 样本 `dcb_full/ring_fail/tex_fail/timeouts/vo_rc` 全 0，无 `FALLBACK_A`、无 `img-net: failed`、无 combined-watchdog。
+
 
 ### 6.6 P2：可发布生产
 
 仍需补齐：
 
-- 备用 URL 自动切换本身仍无独立切换收据；当前只验收干净回退 A。
+- 备用 URL 自动切换已有中途断流收据：primary 8 MiB 后 503，C `backup-switch ... seek_rc=0` 后继续 present，无回退。
 - HDR10 输出元数据/真实 B 站 Main10 仍未验收；本地原生 P010 仅覆盖 PQ→SDR。
-- 随机 seek×20、EOF replay×5 已通过短样本；C 长测在约 197 s flush-timeout 回退，需修复后重做 ≥30m C 长测；A 历史长测稳定。
+- 随机 seek×20、EOF replay×5 与 C ≥30m 长测均已通过；C 长测无 `FALLBACK_A`，A 历史长测稳定。
 - 真实 B 站 60fps/4K 受当前账号无大会员限制不可得，不把低档降级流冒充高档；本地 60fps/4K 只作为工程验证。
 
 生产验收建议：1080p60 和 4K30/4K60 各至少 10 分钟；HEVC Main10 至少 10 分钟；随机 seek/暂停/倍速/清晰度切换；无崩溃、无黑帧/撕裂、A/V 漂移 <100 ms；默认 profile 的 GPU/AGC health 三项 0；native 不支持的样本自动回退 A。
