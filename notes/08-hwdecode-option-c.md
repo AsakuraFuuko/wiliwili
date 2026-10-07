@@ -521,6 +521,14 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 **30 分钟 C 长测。** `/tmp/m7-c-30m-cycle.log` 使用本地 `/tmp/m5-33m.mp4`、`WILIWILI_VDEC_TRACE_LATENCY=1`，监听 1794 s（约 29.9 min），build marker `Oct 7 2026 13:09:31`。89 个完整延迟窗口中 Decode 为 p50 `1.312–1.340 ms`、p95 `1.765–1.878 ms`、p99 `4.061–4.196 ms`、max `4.133–5.463 ms`；Flush 为 p50 `0.082–0.084 ms`、p95 `0.089–0.092 ms`、p99 `0.094–0.103 ms`、max `0.100–0.135 ms`。漂移稳态 p50 约 `23.6–26.7 ms`、p95 `74.7–76.0 ms`、p99 `82.7–84.0 ms`、max `86.7–90.7 ms`；首个 seek warm-up 窗口 max `862 ms` 单独保留，不代表稳态。C decoder direct_mem `48857088` bytes 全程不变；AGC health direct_mem `3.19→8.48 MiB`，端点斜率约 `0.177 MiB/min`，health peak `52.67 MiB`。末端 `presented=107280 inputs=53726 accepted=53725 outputs=53725 dropped=0 errors=0 order_errors=0`；180 个 health 样本 `dcb_full/ring_fail/tex_fail/timeouts/vo_rc` 全 0，无 `FALLBACK_A`、无 `img-net: failed`、无 combined-watchdog。
 
 
+#### 6.5.8 M9：C 小窗 UI 视口/混合状态回归（2026-10-07）
+
+同一视频 `BV1b1e86XE3S`、同一详情页的对照收据：纯 A `/tmp/sw-a-same-video2.png` 右栏评论、UP 信息、按钮均正常；旧 C `/tmp/sw-c-same-video.png` 的视频本身正常，但右栏空白，标题/按钮/评论几何被压进视频矩形，底部控件与页面内容重叠。C 的 `/tmp/sw-c-same-video-cycle.log` 已记录详情请求的 `http: code=200`、JSON parse 与 `callback done`，并持续输出 health/present；不是评论接口未完成或 UI 线程被 native decoder 阻塞。
+
+根因是 `evo_agc_blit_yuv_rect()` 在 VideoView 的 native raw draw 中把 AGC viewport/scissor 改成视频物理 rect，并将 blend 设为 `EVO_AGC_BLEND_NONE`；同一帧后续 NanoVG UI draw 只重新写 scissor、绑定 UI pipeline，没有重新写 viewport 和 premultiplied-alpha blend。于是完整页面坐标被映射到视频 rect，右栏落在视频 rect 外，alpha 字体/半透明层也变成黑色块。不是 `VideoView::draw()` 提前 return，也不是活动栈/评论回调丢失。
+
+修复：AGC 增加 `evo_agc_runtime_restore_ui_state()`，按当前 target 恢复完整 viewport/scissor 与 `EVO_AGC_BLEND_PREMULTIPLIED`；native VideoView raw draw 后只在 C 分支调用 `wiliwili_vdec_play_restore_ui_state()`，A 的 `MPVCore::draw()` 路径未改。修复后 `/tmp/sw-c-same-video-fixed2.png` 右栏、标题、UP 信息、按钮和底部控件均恢复正常，字幕停留在视频 rect 内且不压控件；`/tmp/sw-c-same-video-cycle-fixed2.log` 的 `http` 回调完成、health 三项/timeouts/vo_rc 全 0。
+
 ### 6.6 P2：可发布生产
 
 仍需补齐：

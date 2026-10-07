@@ -47,6 +47,7 @@ extern "C" int wiliwili_vdec_play_is_active(void);
 extern "C" void wiliwili_vdec_play_stop(void);
 extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
                                         int view_h, int view_mode);
+extern "C" void wiliwili_vdec_play_restore_ui_state(void);
 extern "C" void wiliwili_boot_log(const char *message);
 #endif
 
@@ -752,6 +753,7 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
         }
         nativeVideo = wiliwili_vdec_play_draw(mpvCore->getPlaybackTime(), mpvCore->getSpeed(), mpvCore->isPaused(),
                                                nativeX, nativeY, nativeWidth, nativeHeight, view_mode) != 0;
+        wiliwili_vdec_play_restore_ui_state();
     }
 #endif
     if (!nativeVideo) mpvCore->draw(brls::Rect(x, y, width, height), alpha);

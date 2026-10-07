@@ -2405,6 +2405,10 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     return 1;
 }
 
+void wiliwili_vdec_play_restore_ui_state(void) {
+    evo_agc_runtime_restore_ui_state();
+}
+
 void wiliwili_vdec_play_frame_retire(void) {
     VdecPlaySession *s = &g_vdec_play;
     pthread_mutex_lock(&s->mutex);
