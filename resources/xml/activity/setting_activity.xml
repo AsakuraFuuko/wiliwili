@@ -51,6 +51,8 @@
 
                             <brls:BooleanCell
                                     id="setting/video/hwdec"/>
+                            <SelectorCell
+                                    id="setting/video/native_vdec"/>
 
                             <SelectorCell
                                     id="setting/video/inmemory"/>

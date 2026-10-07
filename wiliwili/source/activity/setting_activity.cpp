@@ -35,6 +35,10 @@
 #endif
 
 using namespace brls::literals;
+#if defined(PS5_NATIVE_APP)
+extern "C" void wiliwili_vdec_play_set_mode(int mode);
+#endif
+
 
 const std::string_view OPENSOURCE =
     "--------------------------------\n"
@@ -678,10 +682,25 @@ void SettingActivity::onContentAvailable() {
         },
         "wiliwili/setting/app/network/proxy_hint"_i18n, "wiliwili/setting/app/network/proxy_hint"_i18n, 64);
 
-/// Hardware decode
-#if defined(PS4) || defined(PS5) || defined(__PSV__) && defined(BOREALIS_USE_OPENGL)
+#if defined(PS5_NATIVE_APP)
     btnHWDEC->setVisibility(brls::Visibility::GONE);
+    auto nativeVdecOption = conf.getOptionData(SettingItem::PLAYER_NATIVE_VDEC_MODE);
+    selectorNativeVdec->init(
+        "wiliwili/setting/app/playback/native_vdec"_i18n,
+        {"wiliwili/setting/app/playback/native_vdec_auto"_i18n,
+         "wiliwili/setting/app/playback/native_vdec_on"_i18n,
+         "wiliwili/setting/app/playback/native_vdec_off"_i18n},
+        conf.getStringOptionIndex(SettingItem::PLAYER_NATIVE_VDEC_MODE), [nativeVdecOption](int data) {
+            auto& config = ProgramConfig::instance();
+            config.setSettingItem(SettingItem::PLAYER_NATIVE_VDEC_MODE, nativeVdecOption.optionList[data]);
+            wiliwili_vdec_play_set_mode(data);
+            return true;
+        });
+#elif defined(PS4) || defined(PS5) || (defined(__PSV__) && defined(BOREALIS_USE_OPENGL))
+    btnHWDEC->setVisibility(brls::Visibility::GONE);
+    selectorNativeVdec->setVisibility(brls::Visibility::GONE);
 #else
+    selectorNativeVdec->setVisibility(brls::Visibility::GONE);
     btnHWDEC->init("wiliwili/setting/app/playback/hwdec"_i18n, conf.getBoolOption(SettingItem::PLAYER_HWDEC),
                    [](bool value) {
                        ProgramConfig::instance().setSettingItem(SettingItem::PLAYER_HWDEC, value);

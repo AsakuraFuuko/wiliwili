@@ -2,8 +2,8 @@
  * P1 M2 native video prototype: FFmpeg demux/BSF -> sceVideodec2 -> NV12 -> AGC.
  *
  * This file owns the video thread and never feeds compressed video to mpv. mpv remains
- * responsible for audio, playback-time, pause and UI state. The path is gated by both
- * WILIWILI_TEST_VDEC=1 and WILIWILI_VDEC_PLAY=1.
+ * responsible for audio, playback-time, pause and UI state. The production path defaults
+ * to AUTO capability gating; test environment variables can force it on or off.
  *
  * The Videodec2 ABI structs below match the already verified local probe. OutputInfo
  * has no PTS/frame id; output slots are identified only by frame-pool address and
@@ -29,6 +29,7 @@
 #include <libavutil/avutil.h>
 #include <libavutil/dict.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/pixdesc.h>
 #include <borealis/extern/nanovg/agc/evo_agc_runtime.h>
 #endif
 
@@ -49,6 +50,13 @@ enum {
     VDEC_PLAY_CODEC_HEVC = 974921,
     VDEC_PLAY_SYSMODULE = 207,
 };
+enum {
+    VDEC_PLAY_MODE_AUTO = 0,
+    VDEC_PLAY_MODE_ON = 1,
+    VDEC_PLAY_MODE_OFF = 2,
+};
+
+static volatile int g_vdec_user_mode = VDEC_PLAY_MODE_AUTO;
 enum {
     VDEC_PLAY_RESULT_OK = 0,
     VDEC_PLAY_RESULT_SEEK = -2,
@@ -254,6 +262,23 @@ static int play_stop_requested(const VdecPlaySession *s) {
 static int play_gate_value(const char *name) {
     const char *value = getenv(name);
     return value != NULL && strcmp(value, "1") == 0;
+}
+static int play_env_flag(const char *name) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') return -1;
+    if (strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    return -1;
+}
+
+static int play_effective_mode(void) {
+    const int test = play_env_flag("WILIWILI_TEST_VDEC");
+    const int play = play_env_flag("WILIWILI_VDEC_PLAY");
+    if (test == 0 || play == 0) return VDEC_PLAY_MODE_OFF;
+    if (play == 1) return VDEC_PLAY_MODE_ON;
+    /* Keep the historical probe-only TEST_VDEC=1 mode from starting playback. */
+    if (test == 1) return VDEC_PLAY_MODE_OFF;
+    return __atomic_load_n(&g_vdec_user_mode, __ATOMIC_ACQUIRE);
 }
 
 static void play_logf(const char *format, ...) {
@@ -611,7 +636,7 @@ static int play_pending_pop_min_locked(VdecPlaySession *s, int64_t *pts90k) {
 
 int wiliwili_vdec_play_enabled(void) {
 #if defined(PS5_NATIVE_APP) && defined(BOREALIS_USE_AGC)
-    return play_gate_value("WILIWILI_TEST_VDEC") && play_gate_value("WILIWILI_VDEC_PLAY");
+    return play_effective_mode() != VDEC_PLAY_MODE_OFF;
 #else
     return 0;
 #endif
@@ -1509,6 +1534,31 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
               media->has_reorder);
     return 0;
 }
+static int play_auto_capable(const VdecPlayMedia *media, char *reason, size_t capacity) {
+    if (!media || !media->stream || !media->stream->codecpar || !reason || capacity == 0) return 0;
+    const AVCodecParameters *par = media->stream->codecpar;
+    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC) {
+        snprintf(reason, capacity, "codec=%d", par->codec_id);
+        return 0;
+    }
+    if (par->width <= 0 || par->height <= 0 || par->width > 1920 || par->height > 1080) {
+        snprintf(reason, capacity, "size=%dx%d", par->width, par->height);
+        return 0;
+    }
+    if (par->bits_per_raw_sample > 8) {
+        snprintf(reason, capacity, "raw-bits=%d", par->bits_per_raw_sample);
+        return 0;
+    }
+    const AVPixFmtDescriptor *format = par->format >= 0 ? av_pix_fmt_desc_get((enum AVPixelFormat)par->format) : NULL;
+    if (format && format->comp[0].depth > 8) {
+        snprintf(reason, capacity, "pixel-format=%s depth=%d", format->name, format->comp[0].depth);
+        return 0;
+    }
+    snprintf(reason, capacity, "codec=%u size=%dx%d raw_bits=%d coded_bits=%d reorder=%d", media->codec, par->width,
+             par->height, par->bits_per_raw_sample, par->bits_per_coded_sample, media->has_reorder);
+    return 1;
+}
+
 static int play_switch_to_backup(VdecPlaySession *s, VdecPlayMedia *media, int failure_rc) {
     if (!s || !media) return 0;
     for (;;) {
@@ -1950,22 +2000,42 @@ static void *play_thread_main(void *opaque) {
     memset(&media, 0, sizeof(media));
     int result = -1;
     const int media_ok = play_media_open(s, &media) == 0;
+    int auto_gate_ok = 1;
     if (media_ok) {
-        const char *policy_reason = "fixed-safe-default";
-        pthread_mutex_lock(&s->mutex);
-        if (!s->pending_limit_override && s->adaptive_pending)
-            s->pending_limit = play_choose_pending_limit(&media, &policy_reason);
-        const int policy_limit = s->pending_limit;
-        const int policy_override = s->pending_limit_override;
-        const int policy_adaptive = s->adaptive_pending;
-        pthread_mutex_unlock(&s->mutex);
-        play_logf("vdec-play: pending policy=%s limit=%d video_delay=%d has_b_frames=%d peak=%d reason=%s",
-                  policy_override ? "override" : policy_adaptive ? "adaptive" : "fixed", policy_limit,
-                  media.video_delay, media.has_b_frames, 0, policy_reason);
-        s->flush_each_decode = !media.has_reorder;
-        play_logf("vdec-play: flush_each_decode=%d", s->flush_each_decode);
+        const int mode = play_effective_mode();
+        if (mode == VDEC_PLAY_MODE_AUTO) {
+            char reason[128];
+            auto_gate_ok = play_auto_capable(&media, reason, sizeof(reason));
+            if (auto_gate_ok) {
+                play_logf("vdec-play: auto-gate=pass %s", reason);
+            } else {
+                play_logf("vdec-play: auto-gate=A reason=%s", reason);
+                pthread_mutex_lock(&s->mutex);
+                s->active = 0;
+                s->stop_requested = 1;
+                pthread_cond_broadcast(&s->condition);
+                pthread_mutex_unlock(&s->mutex);
+            }
+        } else {
+            play_logf("vdec-play: capability gate bypassed mode=on");
+        }
+        if (auto_gate_ok) {
+            const char *policy_reason = "fixed-safe-default";
+            pthread_mutex_lock(&s->mutex);
+            if (!s->pending_limit_override && s->adaptive_pending)
+                s->pending_limit = play_choose_pending_limit(&media, &policy_reason);
+            const int policy_limit = s->pending_limit;
+            const int policy_override = s->pending_limit_override;
+            const int policy_adaptive = s->adaptive_pending;
+            pthread_mutex_unlock(&s->mutex);
+            play_logf("vdec-play: pending policy=%s limit=%d video_delay=%d has_b_frames=%d peak=%d reason=%s",
+                      policy_override ? "override" : policy_adaptive ? "adaptive" : "fixed", policy_limit,
+                      media.video_delay, media.has_b_frames, 0, policy_reason);
+            s->flush_each_decode = !media.has_reorder;
+            play_logf("vdec-play: flush_each_decode=%d", s->flush_each_decode);
+        }
     }
-    const int decoder_ok = media_ok && !play_stop_requested(s) && !s->fallback &&
+    const int decoder_ok = media_ok && auto_gate_ok && !play_stop_requested(s) && !s->fallback &&
                            play_setup_decoder(s, media.stream->codecpar) == 0;
     if (!decoder_ok) {
         if (!play_stop_requested(s) && !s->fallback) play_fail(s, "startup-failure", -9020);
@@ -2145,6 +2215,21 @@ void wiliwili_vdec_play_stop(void) {
     play_reset_state_locked(s);
     pthread_mutex_unlock(&s->mutex);
 }
+void wiliwili_vdec_play_set_mode(int mode) {
+    if (mode < VDEC_PLAY_MODE_AUTO || mode > VDEC_PLAY_MODE_OFF) mode = VDEC_PLAY_MODE_AUTO;
+    __atomic_store_n(&g_vdec_user_mode, mode, __ATOMIC_RELEASE);
+#if defined(PS5_NATIVE_APP) && defined(BOREALIS_USE_AGC)
+    if (mode == VDEC_PLAY_MODE_OFF) {
+        VdecPlaySession *s = &g_vdec_play;
+        pthread_mutex_lock(&s->mutex);
+        const int active = s->active;
+        pthread_mutex_unlock(&s->mutex);
+        if (active) wiliwili_vdec_play_stop();
+    }
+    play_logf("vdec-play: user mode=%d", mode);
+#endif
+}
+
 
 int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     if (!wiliwili_vdec_play_enabled() || requested_url == NULL || requested_url[0] == '\0') return 0;

@@ -529,6 +529,22 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 修复：AGC 增加 `evo_agc_runtime_restore_ui_state()`，按当前 target 恢复完整 viewport/scissor 与 `EVO_AGC_BLEND_PREMULTIPLIED`；native VideoView raw draw 后只在 C 分支调用 `wiliwili_vdec_play_restore_ui_state()`，A 的 `MPVCore::draw()` 路径未改。修复后 `/tmp/sw-c-same-video-fixed2.png` 右栏、标题、UP 信息、按钮和底部控件均恢复正常，字幕停留在视频 rect 内且不压控件；`/tmp/sw-c-same-video-cycle-fixed2.log` 的 `http` 回调完成、health 三项/timeouts/vo_rc 全 0。
 
+#### 6.5.9 M10：C 路径产品化与默认自动模式（2026-10-07）
+
+新增持久化设置 `player_native_vdec_mode`，选项为 `auto/on/off`，默认 `auto`；PS5 原生设置页显示为“原生硬解”，其余平台隐藏。ProgramConfig 只读写 `setting` 子对象，不替换 cookie；启动时把配置传给 native C，设置改变后 `off` 会停止当前 C 会话，下一条视频按新模式选择。A 的 `MPVCore` 配置（包括 `sws-fast=yes`、1920×1080 SW 面）未改。
+
+正式模式的 env 优先级：无 env 时使用 ProgramConfig；`WILIWILI_VDEC_PLAY=1` 强制 C，`WILIWILI_TEST_VDEC=1` 与它同时存在仍兼容旧测试写法；任一相关 env 明确为 `0` 强制 A；只有 `WILIWILI_TEST_VDEC=1` 时保持历史 decoder-probe-only，不启动 C。这样旧测试覆盖保留，但普通安装不再依赖双 env。
+
+`auto` 只把已验证范围交给 C：H.264/HEVC、可识别的 8-bit、可见尺寸不超过 1920×1080；B 帧/重排继续走现有 adaptive pending、IDR、PTS、slot/fence、Decode/Flush watchdog 和 AGC blit gates。`on` 绕过这一层能力预筛，但所有运行时契约仍保留，任何失败仍回 A；auto 拒绝记录 `vdec-play: auto-gate=A reason=...` 并恢复 mpv A。
+
+初测收据：无 C env、配置默认 auto 的 `/tmp/m10-auto-video-cycle-fixed.log` 出现 `user mode=0`、HEVC 1920×1080 `auto-gate=pass`、`decoder ready`、连续 `presented`，health 三项/timeouts/vo_rc 全 0；A 对照 `/tmp/m10-a-cycle.log` 只有 mpv SW `file loaded`/audio active、无 `vdec-play: start`。默认自动小窗/全屏/退出全屏截图为 `/tmp/m10-auto-detail-small.png`、`/tmp/m10-auto-full2.png`、`/tmp/m10-auto-exit-full.png`；A 对照为 `/tmp/m10-a-detail-small.png`、`/tmp/m10-a-full.png`、`/tmp/m10-a-exit-full-clean.png`。设置页三态收据为 `/tmp/m10-native-vdec-options.png`，关闭后 `/tmp/m10-native-vdec-off-setting2.png` 与 `/tmp/m10-setting-off-cycle.log`，恢复自动为 `/tmp/m10-native-vdec-auto-setting2.png`。
+默认自动 C 长测 `/tmp/m10-auto-30m-cycle.log` 实际监听约 1804 s（20:01:39→20:31:43），共 90 个 latency 窗口；稳态（排除首个 warm-up 窗口）drift p50 `22.688–25.366 ms`、p95 `74.688–76.022 ms`、p99 `81.355–84.022 ms`，常规 max 约 `88–91 ms`。末端 `presented=76560 inputs=38319 accepted=38318 outputs=38318 dropped=0 errors=0 order_errors=0`；181 个 health 检查点至 frame=108000 均 `dcb_full/ring_fail/tex_fail/timeouts/vo_rc=0`，无 `FALLBACK_A`、无 `img-net: failed`。日志保留一个 segment=26 的异常 `max_us=1979733333`，后续 M11 漂移拆解必须单独处理，不用该单点代表稳态。
+
+备用 URL 收据 `/tmp/m10-auto-failover-cycle2.log` 使用 `/tmp/m7-failover-server.py`：primary 在约 8 MiB 后短包/503，C 记录 `short-packet retry` → `backup-switch begin index=0 rc=-9025` → `backup-switch success ... seek_rc=0`，随后继续 present；无 `FALLBACK_A`/`img-net: failed`，health 全 0。第一次服务未启动的 `/tmp/m10-auto-failover-cycle.log` 仅作失败环境记录，不计入通过样本。
+
+四项默认自动故障注入均 fail-closed 到 A：`/tmp/m10-auto-inject-bad-cycle.log`=`FALLBACK_A reason=injected-bad-stream rc=-9015`；`/tmp/m10-auto-inject-reset-cycle.log`=`injected-reset-failure rc=-9017`；`/tmp/m10-auto-inject-window-cycle.log`=`pending-window-injected rc=-9016`；`/tmp/m10-auto-inject-timeout-cycle.log`=`decode-timeout rc=-9008`。每项均有 mpv audio active、health 三项/timeouts/vo_rc 全 0、无 `img-net: failed`/crash。
+
+
 ### 6.6 P2：可发布生产
 
 仍需补齐：
@@ -568,10 +584,10 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 ## 8. 明确推荐
 
-1. **现在不改正式 A 路径，不把 C 合入默认播放。**
-2. **C 可以继续进入 M3**：M2 已打通固定 8-bit HTTP MP4 的 FFmpeg demux/BSF → `sceVideodec2` → 三槽 NV12 → AGC scanout，并验证正式 VideoView 层级和 A fallback；M3 负责 playback-time、pause/speed、seek/切档与长测。
-3. P1 不做 VideoOut YUV plane、Main10/HDR 或 4K60 present 承诺；HDR/planar pipe 仍未导入。
-4. 默认策略保持 A：native decoder 按 codec/profile/size 探测，失败、PTS watchdog 触发、起播不是 IDR 或 present 不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。
+- **正式默认**：不改 A 的 `sws-fast=yes`/1920×1080 SW 面；`player_native_vdec_mode=auto` 已进入正式 PPSA99233，命中 H.264/HEVC 8-bit ≤1080p 的已验证能力范围时走 C，未知/超范围/任何运行时失败回到 A。`on/off` 与测试 env 仅改变 C 选择，不改变 A。
+- **C 产品化收据**：默认 auto 的详情页小窗/全屏/退出全屏、≥30 min 长测、备用 URL 自动切换、四项故障注入均已在 M10 收口；下一阶段只处理 A/V 漂移与残留标题清理。
+- P1 不做 VideoOut YUV plane、Main10/HDR 或 4K60 present 承诺；auto 不把 P010/高位格式交给 C，`on` 可用于工程覆盖但仍受运行时 fail-closed 保护。
+- 默认策略为 auto capability gate：native decoder 按 codec/profile/size/pixel format 探测，失败、PTS watchdog 触发、起播不是 IDR 或 present 不满足门槛就回到 `sws-fast=yes` 的 mpv SW 链路。
 
 ## 9. 临时实验清理
 

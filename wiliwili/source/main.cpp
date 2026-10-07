@@ -65,6 +65,7 @@ extern "C" void wiliwili_osmesa_probe_now(void);
 
 #if defined(PS5_NATIVE_APP)
 extern "C" void wiliwili_video_test_start(const char *url);
+extern "C" void wiliwili_vdec_play_set_mode(int mode);
 
 /* 诊断探针：确认 ffmpeg 在原生标题沙箱里可用（demux → 解码 → swscale）。
  * 由 assets/wiliwili-options.txt 的 WILIWILI_TEST_FFMPEG=<url> 触发。 */
@@ -211,6 +212,10 @@ int main(int argc, char *argv[]) {
 
     // Load cookies and settings
     ProgramConfig::instance().init();
+#if defined(PS5_NATIVE_APP)
+    wiliwili_vdec_play_set_mode(
+        (int)ProgramConfig::instance().getStringOptionIndex(SettingItem::PLAYER_NATIVE_VDEC_MODE));
+#endif
 
     // Init the app and i18n
     if (!brls::Application::init()) {
