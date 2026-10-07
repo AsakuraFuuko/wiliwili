@@ -222,7 +222,9 @@
 `0751788` 的适用条件是网络源起播抖动；已映射为 C 的网络 URL 48 个视频 packet、最多 4 s、16 MiB 上限的有限 prebuffer。local file 不走该路径；seek generation >1 不重复保留旧 packet，seek 会中断并清空 prebuffer，EOF/超时/分配失败释放 hold。C 没有独立 audio decode queue，因此没有照抄 EVO 的 `pb_prebuffer_hold`，避免让 mpv audio 在 native video 尚未发布时提前跑钟。
 
 `eb407c6` 的 P010 SDR pipe 对应 `EVO_AGC_PIPE_VIDEO_P010_SDR=71`、BT.709 limited-range R16/RG16 shader；本轮不导入。当前正式路径只承诺 8-bit auto，P010 仍是显式实验并已有 P010→NV12 staged 方案；替换还需要 AGC runtime pipe 注册、native branch 和真实 Main10 SDR 收据，当前没有足够实测收益抵消新增 shader/artifact 风险。现有 GPL-3.0 artifact 清单不增加新文件。
-最终收据：boilerplate RELRO host tests、native build 后，seek stress `/tmp/m12-evo-seek-stress-cycle3.log` 为 20/20，无 fallback/img，健康 20 点全0；failover `/tmp/m12-evo-failover-cycle.log` 为 primary 短包/503 → backup success，无 fallback/img；四项注入均 fail-closed 到 A，reset 使用 `/tmp/m12-evo-inject-reset-cycle4.log` 确认 `injected-reset-failure rc=-9017` 且 order_errors=0。最终 `/tmp/m12-evo-final-cycle.log` 约 1804 s，89 窗口，末端 `presented=11040 inputs=5527 accepted=5526 outputs=5526 dropped=0 errors=0 order_errors=0`，180 个 health 点全0，无 `FALLBACK_A`/`img-net: failed`。
+最终收据：boilerplate RELRO host tests、native build 后，最终代码 seek stress `/tmp/m12-evo-seek-stress-final.log` 为 20/20、29 seek-ready、无 fallback/img，健康 20 点全0；failover `/tmp/m12-evo-failover-cycle.log` 为 primary 短包/503 → backup success，无 fallback/img；四项注入均 fail-closed 到 A，reset 使用 `/tmp/m12-evo-inject-reset-cycle4.log` 确认 `injected-reset-failure rc=-9017` 且 order_errors=0。最终 `/tmp/m12-evo-final-cycle.log` 约 1804 s，89 窗口，末端 `presented=11040 inputs=5527 accepted=5526 outputs=5526 dropped=0 errors=0 order_errors=0`，180 个 health 点全0，无 `FALLBACK_A`/`img-net: failed`。
+
+最终包收据：`/tmp/m12-evo-final-auto-cycle.log` marker `Oct 8 2026 01:56:03`、`user mode=0`，FTP `/data/homebrew/` 只有 `PPSA99233.ffpkg`，没有新增临时 title。
 
 ---
 

@@ -561,9 +561,11 @@ M4 的实验集历史上是 4 条通过/1 条回退，因此当时不晋升；M5
 
 参考 `3bf37f0` 的 seek starvation/deadlock 思路，但没有复制其 audio queue；C 的音频仍由 mpv 管理。实现为 seek generation 去重、500 ms bounded borrowed-frame wait + AGC idle fence reclaim，以及每次非零 seek 等待目标后的 true IDR。参考 `0751788` 的 network prebuffer 映射为 HTTP(S) 起播 48 video packets、最多 4 s/16 MiB；local file 和 seek generation>1 不重复预取，seek/EOF/分配失败会释放队列。`eb407c6` 的 P010 SDR pipe 未导入：当前 auto 仍只承诺 8-bit，P010→NV12 staged 方案已有收据，缺少真实 Main10 SDR 的验证收益不足以引入新 AGC pipe。
 
-seek 压力 `/tmp/m12-evo-seek-stress-cycle3.log` 完成 `m5-stress seek=20/20`，21 个 seek-ready、21 次 prebuffer，末端 `presented=9960 inputs=5018 accepted=5017 outputs=5017 dropped=0 errors=0 order_errors=0`，20 个 health 检查点全0，无 fallback/img failure。failover `/tmp/m12-evo-failover-cycle.log` 记录 primary 短包/503 后 `backup-switch success`，无 fallback/img failure；四项注入日志为 `/tmp/m12-evo-inject-{bad,reset,window,timeout}-cycle.log`，分别干净回 A，reset 复测使用无历史进度 BVID 的 `/tmp/m12-evo-inject-reset-cycle4.log`，rc=`-9017`、order_errors=0。
+seek 压力 `/tmp/m12-evo-seek-stress-final.log` 完成 `m5-stress seek=20/20`，29 个 seek-ready、起播 1 次 prebuffer，末端 `presented=10080 inputs=5048 accepted=5047 outputs=5047 dropped=0 errors=0 order_errors=0`，20 个 health 检查点全0，无 fallback/img failure/seek timeout。failover `/tmp/m12-evo-failover-cycle.log` 记录 primary 短包/503 后 `backup-switch success`，无 fallback/img failure；四项注入日志为 `/tmp/m12-evo-inject-{bad,reset,window,timeout}-cycle.log`，分别干净回 A，reset 复测使用无历史进度 BVID 的 `/tmp/m12-evo-inject-reset-cycle4.log`，rc=`-9017`、order_errors=0。
 
 最终自动长测 `/tmp/m12-evo-final-cycle.log` 约 1804 s、89 个窗口；排除起播窗口后 drift p95 `30.733–32.033 ms`、p99 `32.055–32.977 ms`，publish-age p95 `15.411–16.055 ms`、p99 `17.355–20.022 ms`。末端 `presented=11040 inputs=5527 accepted=5526 outputs=5526 dropped=0 errors=0 order_errors=0`，180 个 health 检查点三项/timeouts/vo_rc 全0，无 `FALLBACK_A`/`img-net: failed`。
+
+最终安装收据 `/tmp/m12-evo-final-auto-cycle.log` marker `Oct 8 2026 01:56:03`、`user mode=0`，主机 FTP `/data/homebrew/` 仅 `PPSA99233.ffpkg`，最终画面 `/tmp/m12-evo-final-auto-home.png` 正常。
 
 ### 6.6 P2：可发布生产
 
