@@ -682,6 +682,9 @@ void MPVCore::init() {
     check_error(mpvObserveProperty(mpv, 19, "saturation", MPV_FORMAT_DOUBLE));
     check_error(mpvObserveProperty(mpv, 20, "gamma", MPV_FORMAT_DOUBLE));
     check_error(mpvObserveProperty(mpv, 21, "hue", MPV_FORMAT_DOUBLE));
+#if defined(PS5_NATIVE_APP)
+    check_error(mpvObserveProperty(mpv, 22, "audio-pts", MPV_FORMAT_DOUBLE));
+#endif
 
     // init renderer params
 #if defined(PS5_NATIVE_APP)
@@ -1542,6 +1545,11 @@ void MPVCore::eventMainLoop() {
                     case 21:
                         if (data) video_hue = *(double *)data;
                         break;
+#if defined(PS5_NATIVE_APP)
+                    case 22:
+                        if (data) audio_pts = *(double *)data;
+                        break;
+#endif
                     default:
                         break;
                 }

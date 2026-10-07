@@ -164,6 +164,12 @@ typedef struct {
     uint32_t decode_us[VDEC_PLAY_LATENCY_WINDOW];
     uint32_t flush_us[VDEC_PLAY_LATENCY_WINDOW];
     uint32_t drift_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t publish_age_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t publish_future_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t clock_step_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t clock_interval_us[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t audio_phase_us[VDEC_PLAY_LATENCY_WINDOW];
+    int publish_age_count, publish_future_count, clock_step_count, clock_interval_count, audio_phase_count;
     int decode_count;
     int flush_count;
     int drift_count;
@@ -198,6 +204,11 @@ typedef struct {
     int64_t pending_pts[VDEC_PLAY_PENDING_CAP];
     int pending_count, peak_pending_count;
     int64_t last_output_pts, first_pts, last_pts, timeline_origin_pts, last_clock_pts;
+    int64_t last_sample_clock_pts;
+    uint64_t last_sample_wall_us;
+    int64_t last_clock_input_pts;
+    uint64_t last_clock_input_us;
+    int clock_prediction_valid;
     int video_color_trc;
     int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen, stress_eof_count;
     double last_logged_speed;
@@ -304,9 +315,73 @@ static int play_percentile_index(int count, int percentage) {
     return index;
 }
 
+static void play_trace_sort(uint32_t *values, int count) {
+    for (int i = 1; i < count; ++i) {
+        const uint32_t value = values[i];
+        int j = i;
+        while (j > 0 && values[j - 1] > value) {
+            values[j] = values[j - 1];
+            --j;
+        }
+        values[j] = value;
+    }
+}
+
+static void play_trace_report(VdecPlaySession *s, const char *label) {
+    if (!s || !s->trace_latency) return;
+    uint32_t age[VDEC_PLAY_LATENCY_WINDOW], future[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t step[VDEC_PLAY_LATENCY_WINDOW], interval[VDEC_PLAY_LATENCY_WINDOW];
+    uint32_t phase[VDEC_PLAY_LATENCY_WINDOW];
+    const int age_count = s->latency.publish_age_count;
+    const int future_count = s->latency.publish_future_count;
+    const int step_count = s->latency.clock_step_count;
+    const int interval_count = s->latency.clock_interval_count;
+    const int phase_count = s->latency.audio_phase_count;
+    if (age_count == 0 && future_count == 0 && step_count == 0 && interval_count == 0 && phase_count == 0) return;
+    memcpy(age, s->latency.publish_age_us, (size_t)age_count * sizeof(age[0]));
+    memcpy(future, s->latency.publish_future_us, (size_t)future_count * sizeof(future[0]));
+    memcpy(step, s->latency.clock_step_us, (size_t)step_count * sizeof(step[0]));
+    memcpy(interval, s->latency.clock_interval_us, (size_t)interval_count * sizeof(interval[0]));
+    memcpy(phase, s->latency.audio_phase_us, (size_t)phase_count * sizeof(phase[0]));
+    play_trace_sort(age, age_count);
+    play_trace_sort(future, future_count);
+    play_trace_sort(step, step_count);
+    play_trace_sort(interval, interval_count);
+    play_trace_sort(phase, phase_count);
+    const int age_p50 = play_percentile_index(age_count, 50), age_p95 = play_percentile_index(age_count, 95);
+    const int age_p99 = play_percentile_index(age_count, 99);
+    const int future_p50 = play_percentile_index(future_count, 50), future_p95 = play_percentile_index(future_count, 95);
+    const int future_p99 = play_percentile_index(future_count, 99);
+    const int step_p50 = play_percentile_index(step_count, 50), step_p95 = play_percentile_index(step_count, 95);
+    const int step_p99 = play_percentile_index(step_count, 99);
+    const int interval_p50 = play_percentile_index(interval_count, 50), interval_p95 = play_percentile_index(interval_count, 95);
+    const int interval_p99 = play_percentile_index(interval_count, 99);
+    const int phase_p50 = play_percentile_index(phase_count, 50), phase_p95 = play_percentile_index(phase_count, 95);
+    const int phase_p99 = play_percentile_index(phase_count, 99);
+    play_logf(
+        "vdec-clock segment=%llu label=%s publish_n=%d age_p50_us=%u age_p95_us=%u age_p99_us=%u age_max_us=%u "
+        "future_n=%d future_p50_us=%u future_p95_us=%u future_p99_us=%u future_max_us=%u "
+        "step_n=%d step_p50_us=%u step_p95_us=%u step_p99_us=%u step_max_us=%u "
+        "sample_n=%d sample_p50_us=%u sample_p95_us=%u sample_p99_us=%u sample_max_us=%u "
+        "audio_n=%d audio_p50_us=%u audio_p95_us=%u audio_p99_us=%u audio_max_us=%u",
+        (unsigned long long)s->latency.segment, label ? label : "window", age_count,
+        age_count ? age[age_p50] : 0, age_count ? age[age_p95] : 0, age_count ? age[age_p99] : 0,
+        age_count ? age[age_count - 1] : 0, future_count, future_count ? future[future_p50] : 0,
+        future_count ? future[future_p95] : 0, future_count ? future[future_p99] : 0,
+        future_count ? future[future_count - 1] : 0, step_count, step_count ? step[step_p50] : 0,
+        step_count ? step[step_p95] : 0, step_count ? step[step_p99] : 0, step_count ? step[step_count - 1] : 0,
+        interval_count, interval_count ? interval[interval_p50] : 0, interval_count ? interval[interval_p95] : 0,
+        interval_count ? interval[interval_p99] : 0, interval_count ? interval[interval_count - 1] : 0,
+        phase_count, phase_count ? phase[phase_p50] : 0, phase_count ? phase[phase_p95] : 0,
+        phase_count ? phase[phase_p99] : 0, phase_count ? phase[phase_count - 1] : 0);
+}
+
 static void play_latency_report(VdecPlaySession *s, const char *label) {
     if (!s || !s->trace_latency ||
-        (s->latency.decode_count == 0 && s->latency.flush_count == 0 && s->latency.drift_count == 0))
+        (s->latency.decode_count == 0 && s->latency.flush_count == 0 && s->latency.drift_count == 0 &&
+         s->latency.publish_age_count == 0 && s->latency.publish_future_count == 0 &&
+         s->latency.clock_step_count == 0 && s->latency.clock_interval_count == 0 &&
+         s->latency.audio_phase_count == 0))
         return;
     uint32_t decode[VDEC_PLAY_LATENCY_WINDOW];
     uint32_t flush[VDEC_PLAY_LATENCY_WINDOW];
@@ -367,9 +442,15 @@ static void play_latency_report(VdecPlaySession *s, const char *label) {
         drift_count ? drift[drift_count - 1] : 0, (unsigned long long)play_direct_mem_bytes(s),
         (unsigned long long)s->max_slot_wait_us, (unsigned long long)s->max_present_wait_us,
         (unsigned long long)s->max_demux_wait_us);
+    play_trace_report(s, label);
     s->latency.decode_count = 0;
     s->latency.flush_count  = 0;
     s->latency.drift_count  = 0;
+    s->latency.publish_age_count = 0;
+    s->latency.publish_future_count = 0;
+    s->latency.clock_step_count = 0;
+    s->latency.clock_interval_count = 0;
+    s->latency.audio_phase_count = 0;
 }
 
 static void play_latency_record_drift(VdecPlaySession *s, uint64_t drift_us) {
@@ -386,6 +467,29 @@ static void play_latency_record(VdecPlaySession *s, int is_flush, uint64_t elaps
     } else {
         s->latency.decode_us[s->latency.decode_count++] = value;
     }
+}
+static void play_latency_record_publish(VdecPlaySession *s, uint64_t age_us, uint64_t future_us) {
+    if (!s || !s->trace_latency) return;
+    if (s->latency.publish_age_count < VDEC_PLAY_LATENCY_WINDOW)
+        s->latency.publish_age_us[s->latency.publish_age_count++] =
+            age_us > UINT32_MAX ? UINT32_MAX : (uint32_t)age_us;
+    if (future_us != 0 && s->latency.publish_future_count < VDEC_PLAY_LATENCY_WINDOW)
+        s->latency.publish_future_us[s->latency.publish_future_count++] =
+            future_us > UINT32_MAX ? UINT32_MAX : (uint32_t)future_us;
+}
+
+static void play_latency_record_clock(VdecPlaySession *s, uint64_t step_us, uint64_t interval_us,
+                                      uint64_t audio_phase_us) {
+    if (!s || !s->trace_latency) return;
+    if (s->latency.clock_step_count < VDEC_PLAY_LATENCY_WINDOW)
+        s->latency.clock_step_us[s->latency.clock_step_count++] =
+            step_us > UINT32_MAX ? UINT32_MAX : (uint32_t)step_us;
+    if (s->latency.clock_interval_count < VDEC_PLAY_LATENCY_WINDOW)
+        s->latency.clock_interval_us[s->latency.clock_interval_count++] =
+            interval_us > UINT32_MAX ? UINT32_MAX : (uint32_t)interval_us;
+    if (audio_phase_us != UINT64_MAX && s->latency.audio_phase_count < VDEC_PLAY_LATENCY_WINDOW)
+        s->latency.audio_phase_us[s->latency.audio_phase_count++] =
+            audio_phase_us > UINT32_MAX ? UINT32_MAX : (uint32_t)audio_phase_us;
 }
 
 static const char *play_slot_state_name(VdecPlaySlotState state) {
@@ -2180,6 +2284,11 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->au_context_head  = 0;
     s->au_context_count = 0;
     memset(&s->latency, 0, sizeof(s->latency));
+    s->last_sample_clock_pts = INT64_MIN;
+    s->last_sample_wall_us = 0;
+    s->last_clock_input_pts = INT64_MIN;
+    s->last_clock_input_us = 0;
+    s->clock_prediction_valid = 0;
     memset(s->source_url, 0, sizeof(s->source_url));
     memset(s->backup_urls, 0, sizeof(s->backup_urls));
     s->backup_count = 0;
@@ -2314,6 +2423,9 @@ int wiliwili_vdec_play_seek(double seconds) {
     }
     s->seek_seconds = seconds;
     s->last_clock_pts = INT64_MIN;
+    s->last_clock_input_pts = INT64_MIN;
+    s->last_clock_input_us = 0;
+    s->clock_prediction_valid = 0;
     s->seek_requested = 1;
     pthread_cond_broadcast(&s->condition);
     pthread_mutex_unlock(&s->mutex);
@@ -2364,7 +2476,7 @@ void wiliwili_vdec_p010_to_nv12(const uint8_t *src, int src_pitch_bytes, uint8_t
 }
 
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
-                            int view_h, int view_mode) {
+                            int view_h, int view_mode, double audio_pts) {
     VdecPlaySession *s = &g_vdec_play;
     if (!isfinite(playback_time)) {
         pthread_mutex_lock(&s->mutex);
@@ -2372,8 +2484,9 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
         pthread_mutex_unlock(&s->mutex);
         return 0;
     }
-    if (playback_time < 0.0) playback_time = 0.0;
-    const int64_t clock_pts90k = (int64_t)llround(playback_time * 90000.0);
+    const int64_t raw_clock_pts90k = (int64_t)llround(playback_time * 90000.0);
+    int64_t clock_pts90k = raw_clock_pts90k;
+    const uint64_t clock_now_us = play_now_us();
     pthread_mutex_lock(&s->mutex);
     if (!s->active || s->fallback) {
         pthread_mutex_unlock(&s->mutex);
@@ -2383,9 +2496,40 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
         pthread_mutex_unlock(&s->mutex);
         return 1;
     }
+    if (s->last_clock_input_pts == INT64_MIN) {
+        s->last_clock_input_pts = raw_clock_pts90k;
+        s->last_clock_input_us = clock_now_us;
+        s->clock_prediction_valid = 0;
+    } else if (raw_clock_pts90k != s->last_clock_input_pts) {
+        s->clock_prediction_valid = llabs(raw_clock_pts90k - s->last_clock_input_pts) <= VDEC_PLAY_CLOCK_JUMP_90K;
+        s->last_clock_input_pts = raw_clock_pts90k;
+        s->last_clock_input_us = clock_now_us;
+    }
+    if (!paused && speed > 0.0 && s->clock_prediction_valid && clock_now_us >= s->last_clock_input_us) {
+        uint64_t elapsed_us = clock_now_us - s->last_clock_input_us;
+        if (elapsed_us > 250000) elapsed_us = 250000;
+        clock_pts90k = raw_clock_pts90k + (int64_t)llround((double)elapsed_us * speed * 90000.0 / 1000000.0);
+    }
     if (s->trace_au && (s->last_logged_speed < 0.0 || fabs(s->last_logged_speed - speed) > 0.0001)) {
         play_logf("vdec-play: clock playback=%.3f speed=%.3f paused=%d", playback_time, speed, paused != 0);
         s->last_logged_speed = speed;
+    }
+    if (s->trace_latency) {
+        const uint64_t sample_wall_us = clock_now_us;
+        const uint64_t interval_us = s->last_sample_wall_us != 0 && sample_wall_us >= s->last_sample_wall_us
+                                         ? sample_wall_us - s->last_sample_wall_us
+                                         : 0;
+        const uint64_t step_us = s->last_sample_clock_pts != INT64_MIN
+                                     ? (uint64_t)(llabs(raw_clock_pts90k - s->last_sample_clock_pts) * 1000000LL / 90000LL)
+                                     : 0;
+        uint64_t audio_phase_us = UINT64_MAX;
+        if (isfinite(audio_pts) && audio_pts >= 0.0) {
+            const int64_t audio_pts90k = (int64_t)llround(audio_pts * 90000.0);
+            audio_phase_us = (uint64_t)(llabs(raw_clock_pts90k - audio_pts90k) * 1000000LL / 90000LL);
+        }
+        if (s->last_sample_wall_us != 0) play_latency_record_clock(s, step_us, interval_us, audio_phase_us);
+        s->last_sample_clock_pts = raw_clock_pts90k;
+        s->last_sample_wall_us = sample_wall_us;
     }
     /* mpv may reload its separate audio file at EOF and reset playback-time; restart the
      * native timeline instead of leaving the decoder blocked behind stale READY frames. */
@@ -2398,6 +2542,9 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
         s->seek_requested = 1;
         s->last_clock_pts = INT64_MIN;
         pthread_cond_broadcast(&s->condition);
+        s->last_clock_input_pts = INT64_MIN;
+        s->last_clock_input_us = 0;
+        s->clock_prediction_valid = 0;
         play_logf("vdec-play: clock discontinuity old90k=%lld new90k=%lld; seek requested target=%.3f reopen=%d",
                   (long long)previous_clock, (long long)clock_pts90k, playback_time, s->reopen_media);
         pthread_mutex_unlock(&s->mutex);
@@ -2412,6 +2559,21 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
             break;
         }
     }
+    int64_t selected_pts = INT64_MIN;
+    int64_t future_pts = INT64_MIN;
+    if (candidate >= 0) {
+        selected_pts = s->slots[s->ready_queue[candidate]].pts90k;
+        if (candidate + 1 < s->ready_count) future_pts = s->slots[s->ready_queue[candidate + 1]].pts90k;
+    }
+    if (candidate >= 0 && s->trace_latency) {
+            const uint64_t age_us = selected_pts != INT64_MIN && selected_pts <= clock_pts90k
+                                        ? (uint64_t)((clock_pts90k - selected_pts) * 1000000LL / 90000LL)
+                                        : 0;
+            const uint64_t future_us = future_pts != INT64_MIN && future_pts > clock_pts90k
+                                           ? (uint64_t)((future_pts - clock_pts90k) * 1000000LL / 90000LL)
+                                           : 0;
+            play_latency_record_publish(s, age_us, future_us);
+        }
     if (candidate >= 0) {
         for (int i = 0; i < candidate; ++i) {
             play_release_slot_locked(s, s->ready_queue[i]);
@@ -2526,7 +2688,7 @@ int wiliwili_vdec_play_seek(double seconds) {
 void wiliwili_vdec_play_stop(void) {}
 void wiliwili_vdec_play_pause(int paused) { (void)paused; }
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
-                            int view_h, int view_mode) {
+                            int view_h, int view_mode, double audio_pts) {
     (void)playback_time;
     (void)speed;
     (void)paused;
@@ -2535,6 +2697,7 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     (void)view_w;
     (void)view_h;
     (void)view_mode;
+    (void)audio_pts;
     return 0;
 }
 void wiliwili_vdec_play_frame_retire(void) {}

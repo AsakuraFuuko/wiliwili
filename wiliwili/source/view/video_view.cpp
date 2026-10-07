@@ -46,7 +46,7 @@ extern "C" void wiliwili_vdec_play_add_backup_url(const char *url);
 extern "C" int wiliwili_vdec_play_is_active(void);
 extern "C" void wiliwili_vdec_play_stop(void);
 extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
-                                        int view_h, int view_mode);
+                                        int view_h, int view_mode, double audio_pts);
 extern "C" void wiliwili_vdec_play_restore_ui_state(void);
 extern "C" void wiliwili_boot_log(const char *message);
 #endif
@@ -752,7 +752,8 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
             std::memcpy(lastRect, rect, sizeof(rect));
         }
         nativeVideo = wiliwili_vdec_play_draw(mpvCore->getPlaybackTime(), mpvCore->getSpeed(), mpvCore->isPaused(),
-                                               nativeX, nativeY, nativeWidth, nativeHeight, view_mode) != 0;
+                                               nativeX, nativeY, nativeWidth, nativeHeight, view_mode,
+                                               mpvCore->audio_pts) != 0;
         wiliwili_vdec_play_restore_ui_state();
     }
 #endif

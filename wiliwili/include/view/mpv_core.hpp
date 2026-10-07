@@ -336,6 +336,7 @@ public:
     bool video_eof         = false;
     float video_aspect     = -1;
     double playback_time   = 0;
+    double audio_pts = -1.0;
     double percent_pos     = 0;
     int64_t video_progress = 0;
     int mpv_error_code     = 0;
