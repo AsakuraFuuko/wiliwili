@@ -568,9 +568,13 @@ seek 压力 `/tmp/m12-evo-seek-stress-final.log` 完成 `m5-stress seek=20/20`�
 最终安装收据 `/tmp/m12-evo-final-auto-cycle.log` marker `Oct 8 2026 01:56:03`、`user mode=0`，主机 FTP `/data/homebrew/` 仅 `PPSA99233.ffpkg`，最终画面 `/tmp/m12-evo-final-auto-home.png` 正常。
 #### 6.5.13 M15：native 首帧 loading 生命周期（2026-10-08）
 
-静态定位（尚无本轮真机事件收据）：native 播放把 mpv 设置为 `vid=no`，视频帧由 C/AGC 绘制；源码中 `START_FILE` 发出 `LOADING_START`，`FILE_LOADED` 自动播放分支发出 `MPV_RESUME`，`PLAYBACK_RESTART` 发出 `LOADING_END`。后两者原本直接隐藏 spinner。[INFERENCE] 若音频事件在 C 首帧前到达，spinner 会提前消失；不能据此宣称 `vid=no` 下这些事件均已实测到达或 `VIDEO_RECONFIG` 不会到达。代码提交 `205c310`、全屏 clone 修正提交 `8d96eac`：native `setUrl()` 立即调用既有 `showLoading()`；C 在第一次成功 `evo_agc_blit_yuv_rect()` 后记录 `first-presented`，VideoView draw 查询该状态并隐藏 spinner；启动失败、`FALLBACK_A`、停止和 native→A 切换均加入 loading 清理。native pending 时屏蔽 mpv 的 resume/loading-end 隐藏，A 保持原分支，全屏 clone 同步 loading 状态且不会被旧 OSD 分支覆盖；这些行为尚待真机验证。
+实际真机收据（2026-10-08）：源码推断已由 trace 补成运行证据。诊断包仍是正式 eboot、`vdec-play: user mode=0`（自动），仅额外写入 `WILIWILI_TEST_BV=BV1GJ411x7h7`、`WILIWILI_TEST_BV_DELAY=5`、`WILIWILI_TRACE_LOADING=1`、`WILIWILI_TRACE_MPV_EVENTS=1`。`/tmp/m15-auto-marker-cycle.log` 中 `native-loading: start` 后出现 `mpv: start file`、`ui: loading show`；C `vdec-play: first-presented elapsed_ms=257`，随后 `ui: loading hide` 与 `native-loading: first-frame elapsed_ms=282`，再后才是 `mpv: file loaded`/`mpv: playback restart`。因此本次首帧口径为 setUrl/start→首次成功 AGC present=282 ms；48 packet 预缓冲实际 `target=48`、`ready packets=48`、`elapsed_ms=1`，未把首帧阻塞到4 s。trace 同时记录了仍会到达的 `file loaded`、`playback restart`，以及未处理 event id=11/5/18；不能把 event id 直接等同于 `VIDEO_RECONFIG`。
 
-一次性诊断由 `WILIWILI_TRACE_LOADING=1`、`WILIWILI_TRACE_MPV_EVENTS=1` 开启，日志包含 `native-loading: start us=...`、`first-frame elapsed_ms=...`、A 的 loading 起点、spinner show/hide 和未处理 MPV event id。计时探针口径是 `setUrl/start→首次成功 AGC blit`，不是用户按键→物理首帧；后者仍须结合实际交互与画面验证。诊断版已完成 289/289 TU 编译，但未上传新包；再次执行指定唤醒命令仍报 `session_request_unknown`，ping 无回复、8084 连接超时。点开→首帧数字、中间态截图、A 设置强制关硬解对照、health/img/fallback 和无闪烁/残留检查均未完成，验收标记为外部阻塞而非通过。未改变 48 packet/4 s 预缓冲语义。
+默认无选项包的手动点开收据：`/tmp/m15-auto-loading.png`（右下角 12:01:13，既有 spinner 可见）→`/tmp/m15-auto-first.png`（12:01:14，首帧且 spinner 消失），截图时钟分辨率下为≤1 s；A 对照 `WILIWILI_VDEC_PLAY=0` 的 `/tmp/m15-a-loading.png`（12:20:45）→`/tmp/m15-a-first.png`（12:20:46），同样为≤1 s、同位置同样式。A 日志 `/tmp/m15-a-replay.log` 有 `mpv: file loaded`、`mpv: playback restart`、AAC/SDL active，无 `FALLBACK_A`；启动日志明确 `WILIWILI_VDEC_PLAY=0`。两组推荐内容因重新请求首页发生变化，故截图时间数字是同一“首页首卡→播放器”操作的 UI 对照，不宣称是同一 BVID。
+
+全屏：自动诊断包播放成功后进入全屏 `/tmp/m15-auto-marker-fullscreen.png`，退出并取消退出对话框后的原播放器页面为 `/tmp/m15-auto-marker-exit-clean.png`；视频、右侧评论和 OSD 均恢复，两个状态均无 spinner 残留。默认自动包另取 `/tmp/m15-auto-final-fallback-stable.png`：1920×1080 样本因 `agc-blit rc=-1` 记录 `FALLBACK_A`，随后 A 画面稳定且无 spinner，收口干净。
+
+自动诊断运行至 `agc health frame=6600`，`dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0 vo_rc=0`，无 `FALLBACK_A`/`img-net: failed`；强制 A cycle 同样持续 health 全0。最终用无 options 的 `test-cycle.sh PPSA99233 90` 恢复默认包，启动日志 `user mode=0`，dist 无 `assets/wiliwili-options.txt`；FTP `/data/homebrew/` 仅 `PPSA99233.ffpkg`（95,768,576 B）。
 
 
 ### 6.6 P2：可发布生产
