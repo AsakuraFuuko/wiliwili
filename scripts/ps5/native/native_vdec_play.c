@@ -219,6 +219,8 @@ typedef struct {
     int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen, stress_eof_count;
     double last_logged_speed;
     uint64_t input_count, accepted_count, output_count, presented_count, retired_count, sequence;
+    uint64_t start_wall_us, first_present_us;
+    int first_presented;
     uint64_t advanced_count, dropped_count, error_count, order_error_count;
     uint64_t direct_mem_peak;
     uint64_t last_demux_wait_us, max_demux_wait_us, demux_read_count;
@@ -2427,6 +2429,9 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->accepted_count = 0;
     s->output_count = 0;
     s->presented_count = 0;
+    s->start_wall_us = 0;
+    s->first_present_us = 0;
+    s->first_presented = 0;
     s->retired_count = 0;
     s->sequence = 0;
     s->advanced_count = 0;
@@ -2540,6 +2545,9 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
         ++s->seek_request_generation;
         s->seek_seconds = start_seconds;
     }
+    s->start_wall_us = play_now_us();
+    s->first_present_us = 0;
+    s->first_presented = 0;
     s->active = 1;
     if (pthread_create(&s->thread, NULL, play_thread_main, s) != 0) {
         s->active = 0;
@@ -2595,6 +2603,13 @@ int wiliwili_vdec_play_is_active(void) {
     const int active = s->active && !s->fallback;
     pthread_mutex_unlock(&s->mutex);
     return active;
+}
+int wiliwili_vdec_play_has_presented(void) {
+    VdecPlaySession *s = &g_vdec_play;
+    pthread_mutex_lock(&s->mutex);
+    const int presented = s->first_presented;
+    pthread_mutex_unlock(&s->mutex);
+    return presented;
 }
 
 void wiliwili_vdec_play_pause(int paused) {
@@ -2795,6 +2810,14 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     const uint64_t direct_mem = play_direct_mem_bytes(s);
     if (direct_mem > s->direct_mem_peak) s->direct_mem_peak = direct_mem;
     ++s->presented_count;
+    if (!s->first_presented) {
+        s->first_presented = 1;
+        s->first_present_us = play_now_us();
+        const uint64_t elapsed_us = s->first_present_us >= s->start_wall_us
+                                        ? s->first_present_us - s->start_wall_us
+                                        : 0;
+        play_logf("vdec-play: first-presented elapsed_ms=%llu", (unsigned long long)(elapsed_us / 1000));
+    }
     if (s->presented_count == 1 || s->presented_count % 120 == 0)
         play_logf(
             "vdec-play: presented=%llu pts90k=%lld clock90k=%lld slot=%d retired=%llu advanced=%llu dropped=%llu "
@@ -2843,6 +2866,7 @@ int wiliwili_vdec_play_seek(double seconds) {
     return 0;
 }
 void wiliwili_vdec_play_stop(void) {}
+int wiliwili_vdec_play_has_presented(void) { return 0; }
 void wiliwili_vdec_play_pause(int paused) { (void)paused; }
 int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
                             int view_h, int view_mode, double audio_pts) {

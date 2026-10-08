@@ -45,6 +45,7 @@ extern "C" int wiliwili_vdec_play_start(const char *url, int start_seconds);
 extern "C" void wiliwili_vdec_play_add_backup_url(const char *url);
 extern "C" int wiliwili_vdec_play_is_active(void);
 extern "C" void wiliwili_vdec_play_stop(void);
+extern "C" int wiliwili_vdec_play_has_presented(void);
 extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
                                         int view_h, int view_mode, double audio_pts);
 extern "C" void wiliwili_vdec_play_restore_ui_state(void);
@@ -722,6 +723,11 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     runNativeVdecAutotest();
     runNativeVdecStress();
     if (this->native_vdec_mpv_suppressed && !wiliwili_vdec_play_is_active()) {
+        if (this->native_vdec_loading) {
+            this->hideLoading();
+            this->native_vdec_loading = false;
+            wiliwili_boot_log("native-loading: FALLBACK_A before first frame");
+        }
         mpvCore->command_async("set", "vid", "auto");
         this->native_vdec_mpv_suppressed = false;
     }
@@ -751,9 +757,22 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
             wiliwili_boot_log(line);
             std::memcpy(lastRect, rect, sizeof(rect));
         }
-        nativeVideo = wiliwili_vdec_play_draw(mpvCore->getPlaybackTime(), mpvCore->getSpeed(), mpvCore->isPaused(),
-                                               nativeX, nativeY, nativeWidth, nativeHeight, view_mode,
-                                               mpvCore->audio_pts) != 0;
+        const int nativeDraw = wiliwili_vdec_play_draw(mpvCore->getPlaybackTime(), mpvCore->getSpeed(),
+                                                       mpvCore->isPaused(), nativeX, nativeY, nativeWidth,
+                                                       nativeHeight, view_mode, mpvCore->audio_pts);
+        nativeVideo = nativeDraw != 0;
+        if (this->native_vdec_loading && wiliwili_vdec_play_has_presented()) {
+            const uint64_t firstFrameUs = brls::getCPUTimeUsec();
+            const uint64_t elapsedUs = firstFrameUs >= this->native_vdec_loading_start_us
+                                            ? firstFrameUs - this->native_vdec_loading_start_us
+                                            : 0;
+            this->hideLoading();
+            this->native_vdec_loading = false;
+            char line[128];
+            std::snprintf(line, sizeof(line), "native-loading: first-frame elapsed_ms=%llu",
+                          (unsigned long long)(elapsedUs / 1000));
+            wiliwili_boot_log(line);
+        }
         wiliwili_vdec_play_restore_ui_state();
     }
 #endif
@@ -956,15 +975,40 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::st
 void VideoView::setUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
     bool nativeVdec = false;
 #if defined(PS5_NATIVE_APP)
+    const bool nativeVdecCandidate = wiliwili_vdec_play_enabled() && url.rfind("edl://", 0) != 0;
+    if (nativeVdecCandidate) {
+        this->native_vdec_loading          = true;
+        this->native_vdec_loading_start_us = brls::getCPUTimeUsec();
+        this->showLoading();
+        char line[128];
+        std::snprintf(line, sizeof(line), "native-loading: start us=%llu",
+                      (unsigned long long)this->native_vdec_loading_start_us);
+        wiliwili_boot_log(line);
+    }
     if (wiliwili_vdec_play_enabled()) mpvCore->reset();
     if (url.rfind("edl://", 0) != 0) nativeVdec = wiliwili_vdec_play_start(url.c_str(), start) != 0;
     if (nativeVdec && !native_vdec_autotest && std::getenv("WILIWILI_VDEC_AUTOTEST") != nullptr)
         native_vdec_autotest = true;
+    if (!nativeVdec && this->native_vdec_loading) {
+        this->hideLoading();
+        this->native_vdec_loading = false;
+        wiliwili_boot_log(nativeVdecCandidate ? "native-loading: native-start-failed -> A"
+                                              : "native-loading: switch-to-A");
+    }
     if (!nativeVdec && this->native_vdec_mpv_suppressed) {
         mpvCore->command_async("set", "vid", "auto");
         this->native_vdec_mpv_suppressed = false;
     }
 #endif
+#if defined(PS5_NATIVE_APP)
+    if (!nativeVdec && std::getenv("WILIWILI_TRACE_LOADING") != nullptr) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "a-loading: start us=%llu",
+                      (unsigned long long)brls::getCPUTimeUsec());
+        wiliwili_boot_log(line);
+    }
+#endif
+
     std::string extra = genExtraUrlParam(start, end, audios);
 #if defined(PS5_NATIVE_APP)
     const char* audioOverride = getenv("WILIWILI_VDEC_AUDIO_URL");
@@ -973,6 +1017,7 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::ve
     if (nativeVdec) {
         extra += ",vid=no";
         this->native_vdec_mpv_suppressed = true;
+        wiliwili_boot_log("mpv: set vid=no");
     }
 #endif
     mpvCore->setUrl(url, extra);
@@ -1022,6 +1067,13 @@ void VideoView::pause() {
 }
 
 void VideoView::stop() {
+#if defined(PS5_NATIVE_APP)
+    if (this->native_vdec_loading) {
+        this->hideLoading();
+        this->native_vdec_loading = false;
+        wiliwili_boot_log("native-loading: stop before first frame");
+    }
+#endif
     this->native_vdec_mpv_suppressed = false;
     mpvCore->stop();
 }
@@ -1195,9 +1247,25 @@ void VideoView::showPlayerSetting() const {
 void VideoView::showLoading() {
     centerLabel->setVisibility(brls::Visibility::INVISIBLE);
     osdCenterBox->setVisibility(brls::Visibility::VISIBLE);
+#if defined(PS5_NATIVE_APP)
+    if (std::getenv("WILIWILI_TRACE_LOADING") != nullptr) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "ui: loading show us=%llu", (unsigned long long)brls::getCPUTimeUsec());
+        wiliwili_boot_log(line);
+    }
+#endif
 }
 
-void VideoView::hideLoading() { osdCenterBox->setVisibility(brls::Visibility::GONE); }
+void VideoView::hideLoading() {
+    osdCenterBox->setVisibility(brls::Visibility::GONE);
+#if defined(PS5_NATIVE_APP)
+    if (std::getenv("WILIWILI_TRACE_LOADING") != nullptr) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "ui: loading hide us=%llu", (unsigned long long)brls::getCPUTimeUsec());
+        wiliwili_boot_log(line);
+    }
+#endif
+}
 
 void VideoView::setCenterHintText(const std::string& text) { centerLabel2->setText(text); }
 
@@ -1401,6 +1469,10 @@ void VideoView::setFullScreen(bool fs) {
          * original player view own decoder shutdown when the fullscreen clone is popped. */
         video->native_vdec_mpv_suppressed = this->native_vdec_mpv_suppressed;
         video->native_vdec_play_owner     = !this->native_vdec_mpv_suppressed;
+        if (this->native_vdec_mpv_suppressed) {
+            video->native_vdec_loading          = this->native_vdec_loading;
+            video->native_vdec_loading_start_us = this->native_vdec_loading_start_us;
+        }
 #endif
         float width    = brls::Application::contentWidth;
         float height   = brls::Application::contentHeight;
@@ -1491,6 +1563,16 @@ void VideoView::setFullScreen(bool fs) {
                 if (last) {
                     auto* video = dynamic_cast<VideoView*>(last->getView("video"));
                     if (video) {
+#if defined(PS5_NATIVE_APP)
+                        if (this->native_vdec_mpv_suppressed) {
+                            video->native_vdec_loading          = this->native_vdec_loading;
+                            video->native_vdec_loading_start_us = this->native_vdec_loading_start_us;
+                            if (video->native_vdec_loading)
+                                video->showLoading();
+                            else
+                                video->hideLoading();
+                        }
+#endif
                         // 将当前播放状态传递给小窗
                         video->setProgress(this->getProgress());
                         video->showOSD(this->osd_state != OSDState::ALWAYS_ON);
@@ -1532,6 +1614,17 @@ void VideoView::setFullScreen(bool fs) {
                     if (contentView) {
                         auto* video = dynamic_cast<VideoView*>(contentView->getView("video"));
                         if (video) {
+#if defined(PS5_NATIVE_APP)
+                            if (this->native_vdec_mpv_suppressed) {
+                                video->native_vdec_loading          = this->native_vdec_loading;
+                                video->native_vdec_loading_start_us = this->native_vdec_loading_start_us;
+                                if (video->native_vdec_loading)
+                                    video->showLoading();
+                                else
+                                    video->hideLoading();
+                            }
+#endif
+
                             // 对于非BasePlayerActivity中的VideoView，也应该同步状态
                             video->setProgress(this->getProgress());
                             video->showOSD(this->osd_state != OSDState::ALWAYS_ON);
@@ -1718,22 +1811,41 @@ void VideoView::registerMpvEvent() {
             case MpvEventEnum::MPV_RESUME:
                 this->showReplay = false;
                 this->showOSD(true);
+#if defined(PS5_NATIVE_APP)
+                if (!this->native_vdec_loading) this->hideLoading();
+#else
                 this->hideLoading();
+#endif
                 break;
             case MpvEventEnum::MPV_PAUSE:
                 this->showOSD(false);
                 break;
             case MpvEventEnum::START_FILE:
                 this->showOSD(false);
+#if defined(PS5_NATIVE_APP)
+                wiliwili_boot_log("mpv: start file");
+#endif
                 break;
             case MpvEventEnum::LOADING_START:
                 this->showLoading();
                 break;
             case MpvEventEnum::LOADING_END:
+#if defined(PS5_NATIVE_APP)
+                if (!this->native_vdec_loading) this->hideLoading();
+#else
                 this->hideLoading();
+#endif
                 break;
             case MpvEventEnum::MPV_STOP:
+#if defined(PS5_NATIVE_APP)
+                if (!this->native_vdec_mpv_suppressed) {
+                    this->hideLoading();
+                    this->native_vdec_loading = false;
+                    wiliwili_boot_log("native-loading: mpv stop");
+                }
+#else
                 this->hideLoading();
+#endif
                 this->showOSD(false);
                 break;
             case MpvEventEnum::MPV_LOADED:

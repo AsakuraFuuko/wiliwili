@@ -1556,6 +1556,13 @@ void MPVCore::eventMainLoop() {
                 break;
             }
             default:
+#if defined(PS5_NATIVE_APP)
+                if (std::getenv("WILIWILI_TRACE_MPV_EVENTS") != nullptr) {
+                    char line[96];
+                    std::snprintf(line, sizeof(line), "mpv: unhandled event id=%d", event->event_id);
+                    wiliwili_boot_log(line);
+                }
+#endif
                 break;
         }
     }

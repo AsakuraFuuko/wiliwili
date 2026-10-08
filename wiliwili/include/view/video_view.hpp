@@ -376,6 +376,8 @@ private:
     uint64_t native_vdec_autotest_start_us = 0;
     int native_vdec_stress_seek_done = 0;
     uint64_t native_vdec_stress_next_us = 0;
+    bool native_vdec_loading = false;
+    uint64_t native_vdec_loading_start_us = 0;
     brls::Rect oldRect = brls::Rect(-1, -1, -1, -1);
 
     /**
