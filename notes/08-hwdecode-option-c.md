@@ -566,6 +566,12 @@ seek 压力 `/tmp/m12-evo-seek-stress-final.log` 完成 `m5-stress seek=20/20`�
 最终自动长测 `/tmp/m12-evo-final-cycle.log` 约 1804 s、89 个窗口；排除起播窗口后 drift p95 `30.733–32.033 ms`、p99 `32.055–32.977 ms`，publish-age p95 `15.411–16.055 ms`、p99 `17.355–20.022 ms`。末端 `presented=11040 inputs=5527 accepted=5526 outputs=5526 dropped=0 errors=0 order_errors=0`，180 个 health 检查点三项/timeouts/vo_rc 全0，无 `FALLBACK_A`/`img-net: failed`。
 
 最终安装收据 `/tmp/m12-evo-final-auto-cycle.log` marker `Oct 8 2026 01:56:03`、`user mode=0`，主机 FTP `/data/homebrew/` 仅 `PPSA99233.ffpkg`，最终画面 `/tmp/m12-evo-final-auto-home.png` 正常。
+#### 6.5.13 M15：native 首帧 loading 生命周期（2026-10-08）
+
+根因定位：native 播放把 mpv 设置为 `vid=no`，视频帧不再由 mpv 渲染；mpv 仍会发 `START_FILE`、`FILE_LOADED`、`PLAYBACK_RESTART` 及音频/进度属性事件。原有 `MPV_RESUME`/`LOADING_END` 直接隐藏 spinner，可能早于 C 的第一帧 AGC present。代码提交 `205c310`：native `setUrl()` 立即调用既有 `showLoading()`；C 在第一次成功 `evo_agc_blit_yuv_rect()` 后记录 `first-presented`，VideoView 下一次 draw 查询该状态并隐藏 spinner；启动失败、`FALLBACK_A`、停止和 native→A 切换均清理 loading。native pending 时屏蔽 mpv 的 resume/loading-end 隐藏，A 路径保持原分支。全屏 clone 同步 loading 所有权，避免残留 spinner。
+
+一次性诊断由 `WILIWILI_TRACE_LOADING=1`、`WILIWILI_TRACE_MPV_EVENTS=1` 开启，日志包含 `native-loading: start us=...`、`first-frame elapsed_ms=...`、A 的 loading 起点、spinner show/hide 和未处理 MPV event id。诊断版已完成 289/289 TU 编译；真机点开→首帧耗时、A 对照和中间态截图尚未收据化：PS5 当前三次唤醒均为 `session_request_unknown`，发现无主机，8080/8084 不可达。未据此改变 48 packet/4 s 预缓冲语义。
+
 
 ### 6.6 P2：可发布生产
 
