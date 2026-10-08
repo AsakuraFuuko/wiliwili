@@ -131,6 +131,8 @@ void MineHistory::onCreate() {
                             });
 }
 
+void MineHistory::onHide() { recyclingGrid->reloadData(); }
+
 void MineHistory::onHistoryList(const bilibili::HistoryVideoResultWrapper& result) {
     for (auto i : result.list) {
         brls::Logger::verbose("history: {}: {}", i.title, i.progress);

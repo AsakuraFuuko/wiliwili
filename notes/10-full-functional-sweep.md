@@ -145,3 +145,18 @@
 
 - **E02**：最小复现：播放器 → Options → 画质 → 720P；`/tmp/sweep-E-options-quality.png` 显示可选项，`/tmp/sweep-E-quality-720-result.png` 返回播放器；`/tmp/sweep-live-udp.log:4101-4128` 记录 1280×720 `decoder ready` 后 `failure-context reason=agc-blit rc=-1`、`FALLBACK_A`、mpv 重启。初步归因：C 路质量切换后的 AGC blit/资源重建限制；A 回退和 health（`dcb_full=0 ring_fail=0 tex_fail=0`）正常。
 - **H-MINE-TAB**：最小复现：我的页 → 我的收藏 → 我的订阅 → 番剧标签；`/tmp/sweep-H-mine-tab-collection.png` 与 `/tmp/sweep-H-mine-tab-subscription.png` 正常，随后 `/tmp/sweep-H-mine-tab-anime.png` 显示 PS5 Debug：`PPSA99233 在暂停 KStuff 前崩溃: 0xa0d0c005 (GPU_FAULT_PAGE_FAULT_ASYNC)`；`/tmp/sweep-H-mine-tab-series.png`、`/tmp/sweep-H-mine-tab-later.png` 已回到主机界面。初步归因：Mine 标签切换期间 GPU 资源/纹理生命周期或 AGC 提交竞态，非网络错误。
+
+## FAIL 深挖（2026-10-09）
+
+### H-MINE-TAB
+
+- 复现证据：原始失败截图仍为 `/tmp/sweep-H-mine-tab-anime.png`；原始失败序列是“我的页 → 我的收藏 → 我的订阅 → 番剧”。本轮用默认 `PPSA99233` 重走时，先后两次控制会话被残留 Remote Play 会话占用；清理本地残留后可重连。当前 `/download0` 登录态已不可用，`/tmp/h-fixed-mine.png` 明确显示“点击登录”，因此没有用未登录空列表冒充原始卡片场景。
+- 本轮复现取证：`/tmp/klog-h-mine-repro-fresh.txt` 未出现 `GPU_FAULT_PAGE_FAULT_ASYNC`、`0xa0d0c005` 或标题 fault；相关标题终止段是 `sceApplicationExitSpawn3`/`SIG12`，不是可归因的 H 崩溃。`/tmp/h-mine-live-udp.log` 的普通运行 health 至 `frame=4800` 三项全 0；`/tmp/klog-h-fixed.txt` 也未出现 GPU fault。app-log FTP/HTTP 全镜像提取在 321 MiB `download0.dat` 上超时，未把失败轮次误写成成功 app-log 证据。
+- 根因判断：`mine_tab.xml` 的六个 Mine Tab 由 `AutoTabFrame` demand 创建；`setTabAttachedView()` 只 `removeView(..., false)` 并调用 `onHide()`，旧 attached view 和其 `RecyclingGrid` 仍被 `AutoSidebarItem` 保留。原生 `TextureCache` 固定上限为 24；缓存淘汰在 `cache_helper.hpp` 直接调用 `nvgDeleteImage()`，AGC `deleteTexture()` 立即 `evo_direct_mem_free()`。标签切换因此会让多个隐藏 grid 的卡片纹理长期持有/集中释放，触发 AGC 提交后的纹理生命周期窗口；这与 `GPU_FAULT_PAGE_FAULT_ASYNC` 一致。现有 health 三项为 0 不能排除这种异步 page fault。
+- 局部修复：Mine 四个 grid 的 `onHide()` 现在执行 `recyclingGrid->reloadData()`，隐藏 tab 释放可见 cell 的图片请求/引用；`RecyclingGridItemHistoryVideoCard` 和 `RecyclingGridItemCollectionVideoCard` 补齐 `cacheForReuse()`，避免回收时继承 no-op 而继续持有旧纹理。包含 C slot 修复的最终构建 marker 为 `Oct 9 2026 07:55:45`，已部署；未登录条件下相同 tab 快捷切换 5 次标题仍存活，health 三项全 0。登录态恢复后仍需重走原始有卡片序列，才能把 H 从 FAIL 改为 PASS。
+
+### E02
+
+- 失败窗口：`/tmp/sweep-live-udp.log:4098-4128`。720P C 路 `decoder ready visible=1280x720` 后立即 `seek reset target=3412`，尚未出现 `output`/`presented` 就进入 `failure-context reason=agc-blit rc=-1` 并回 A；health 三项保持 0。
+- 对照：同日志 `03:40` 的 1280x720 C 路从 `start=0` 起播，先 `network-prebuffer`/`output seq=1` 再正常 present；随后 seek 也正常。根因已定位：`play_reset_state_locked()` 清空 `s->slots[]` 却没有把 `s->current_slot` 置为 `-1`；画质重启后首个 draw 把上一会话的 slot index 当成新帧，读取已清零的 slot，最终以 `coded_w/coded_h=0` 命中 `evo_agc_blit_yuv_rect()` 的参数早退并触发 `FALLBACK_A`。这不是 720P 尺寸、NV12 格式或解码器能力限制。
+- 局部修复：在 `native_vdec_play.c::play_reset_state_locked()` 清零 slot 数组后显式设置 `s->current_slot = -1`；新包已重新构建。真实登录态下的 Options→720P 回归仍待补测，当前不把未重走的路径标 PASS。

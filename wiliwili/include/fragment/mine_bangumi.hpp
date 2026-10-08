@@ -21,6 +21,7 @@ public:
     ~MineBangumi() override;
 
     void onCreate() override;
+    void onHide() override;
 
     void onError(const std::string &error) override;
 

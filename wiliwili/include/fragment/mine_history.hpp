@@ -22,6 +22,7 @@ public:
     static View *create();
 
     void onCreate() override;
+    void onHide() override;
 
     void onHistoryList(const bilibili::HistoryVideoResultWrapper &result) override;
 

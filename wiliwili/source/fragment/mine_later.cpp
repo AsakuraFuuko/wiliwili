@@ -66,6 +66,8 @@ void MineLater::onCreate() {
                             });
 }
 
+void MineLater::onHide() { recyclingGrid->reloadData(); }
+
 void MineLater::onWatchLaterList(const bilibili::WatchLaterListWrapper& result) {
     brls::Threading::sync(
         [this, result]() { recyclingGrid->setDataSource(new DataSourceMineWatchLaterList(result.list)); });

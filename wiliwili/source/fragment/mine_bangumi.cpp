@@ -99,3 +99,5 @@ void MineBangumi::onCreate() {
                                 return true;
                             });
 }
+
+void MineBangumi::onHide() { recyclingGrid->reloadData(); }

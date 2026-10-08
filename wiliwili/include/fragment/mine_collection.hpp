@@ -22,6 +22,7 @@ public:
     static View *create();
 
     void onCreate() override;
+    void onHide() override;
 
     void onCollectionList(const bilibili::CollectionListResultWrapper &result) override;
 

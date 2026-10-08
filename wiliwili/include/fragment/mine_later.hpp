@@ -17,6 +17,7 @@ public:
     static View *create();
 
     void onCreate() override;
+    void onHide() override;
 
     void onWatchLaterList(const bilibili::WatchLaterListWrapper &result) override;
 

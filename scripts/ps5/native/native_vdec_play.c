@@ -2375,6 +2375,8 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->sequential_seek = 0;
     s->sequential_seek_pts90k = 0;
     s->ready_count = 0;
+    // A quality restart clears the slot array; never let the draw path treat the old session's index as a frame.
+    s->current_slot = -1;
     s->present_pending = 0;
     s->present_pending_since_us = 0;
     s->timeout_ms = VDEC_PLAY_TIMEOUT_MS_DEFAULT;

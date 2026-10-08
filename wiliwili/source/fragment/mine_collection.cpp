@@ -130,6 +130,8 @@ void MineCollection::onCreate() {
                             });
 }
 
+void MineCollection::onHide() { recyclingGrid->reloadData(); }
+
 void MineCollection::onCollectionList(const bilibili::CollectionListResultWrapper& result) {
     brls::Logger::debug("collection: {} ", result.count);
     for (auto& i : result.list) {

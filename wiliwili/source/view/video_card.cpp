@@ -342,6 +342,11 @@ RecyclingGridItemHistoryVideoCard::~RecyclingGridItemHistoryVideoCard() {
     ImageHelper::clear(this->picture);
 }
 
+void RecyclingGridItemHistoryVideoCard::cacheForReuse() {
+    // Hidden Mine tabs retain their attached views; release card textures when the grid is reloaded.
+    ImageHelper::clear(this->picture);
+}
+
 RecyclingGridItemHistoryVideoCard* RecyclingGridItemHistoryVideoCard::create() {
     return new RecyclingGridItemHistoryVideoCard();
 }
@@ -419,6 +424,11 @@ RecyclingGridItemCollectionVideoCard::RecyclingGridItemCollectionVideoCard() {
 
 RecyclingGridItemCollectionVideoCard::~RecyclingGridItemCollectionVideoCard() {
     // 优先清空正在进行的图片请求
+    ImageHelper::clear(this->picture);
+}
+
+void RecyclingGridItemCollectionVideoCard::cacheForReuse() {
+    // Collection cards otherwise inherit the no-op base hook and retain old textures on reuse.
     ImageHelper::clear(this->picture);
 }
 

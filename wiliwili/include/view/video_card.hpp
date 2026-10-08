@@ -226,6 +226,7 @@ public:
     RecyclingGridItemHistoryVideoCard();
 
     ~RecyclingGridItemHistoryVideoCard() override;
+    void cacheForReuse() override;
 
     void setCard(std::string pic, std::string title, std::string username, std::string leftBottomBadge = "",
                  std::string rightBottomBadge = "", std::string rightTopBadge = "", int deviceType = 0,
@@ -252,6 +253,7 @@ public:
     RecyclingGridItemCollectionVideoCard();
 
     ~RecyclingGridItemCollectionVideoCard() override;
+    void cacheForReuse() override;
 
     void setCard(std::string pic, std::string title, std::string username, std::string leftBottomBadge = "",
                  std::string rightBottomBadge = "");
