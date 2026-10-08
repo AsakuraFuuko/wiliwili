@@ -129,19 +129,19 @@
 
 |ID|项目|入口/操作|预期|判据|证据|结果|
 |---|---|---|---|---|---|---|
-|K01|payload 画面对照|payload 线最小启动|画面正常|截图|待补|待测|
-|K02|payload 网络对照|payload 首页/搜索请求|请求与图片正常|截图/日志|待补|待测|
-|K03|payload 视频对照|payload 打开视频并播放|起播/控制正常|截图/日志|待补|待测|
-|K04|payload 退出对照|退出 payload|干净退出|截图/日志|待补|待测|
-|K05|收尾默认包|不设 env/options，确认 FTP|仅保留正式 `PPSA99233.ffpkg`|`user mode=0`、无 options|`test-cycle.sh PPSA99233 60` 最终启动日志 `/tmp/PPSA99233-boot.log`：build `Oct 8 2026 14:36:57`、`vdec-play: user mode=0`、health frame 0/600/1200/1800/2400/3000 全三项 0；主机 `ls /data/homebrew` 仅 `PPSA99233.ffpkg`；本地 dist 仅 `PPSA99233` 且 `assets/wiliwili-options.txt` 不存在|PASS|
-|K06|全局日志|收集 app log/必要内核 log|无未解释 crash|health 全0，失败有归因|`/tmp/PPSA99233-boot.log` 启动/网络/图片/AGC health 无 `img-net: failed`；本轮 FAIL 已在 E02/H-MINE-TAB 记录最小复现和初步归因；未发现额外未解释 crash|PASS|
+|K01|payload 画面对照|payload 线最小启动|画面正常|截图|`scripts/ps5/deploy.sh 192.168.102.118`（跳过自动 launch）后 `scripts/ps5/start.sh 192.168.102.118` 成功；进程列表出现 `wiliwili.elf`；`/tmp/sweep-K01-payload-home.png` 显示 payload Explore 首页与已加载缩略图网格|PASS|
+|K02|payload 网络对照|payload 首页/搜索请求|请求与图片正常|截图/日志|`/tmp/sweep-K02-payload-home.png` 显示 payload 首页已填充远程视频卡片、缩略图和 `Search for videos` 搜索入口；首页请求与图片加载正常|PASS|
+|K03|payload 视频对照|payload 打开视频并播放|起播/控制正常|截图/日志|`/tmp/sweep-K03-payload-detail.png` 显示 payload 视频画面、时间线和播放器控制栏；进程列表仍为 `wiliwili.elf`|PASS|
+|K04|payload 退出对照|退出 payload|干净退出|截图/日志|`/tmp/sweep-K04-payload-exit-dialog.png` 显示退出确认；选择 OK 后进程列表无 `wiliwili`/`eboot`/`PPSA` 进程|PASS|
+|K05|收尾默认包|不设 env/options，确认 FTP|仅保留正式 `PPSA99233.ffpkg`|`user mode=0`、无 options|`test-cycle.sh PPSA99233 60` 最新启动日志 `/tmp/PPSA99233-boot.log`：build `Oct  8 2026 14:36:57`、`vdec-play: user mode=0`、health frame 0/600/1200/1800/2400/3000 全三项 0；最终 `ls /data/homebrew` 仅 `PPSA99233.ffpkg`；本地 `assets/wiliwili-options.txt` 不存在|PASS|
+|K06|全局日志|收集 app log/必要内核 log|无未解释 crash|health 全0，失败有归因|`/tmp/PPSA99233-boot.log` 最新记录无 `img-net: failed`、GPU fault 或 crash，health frame 0/600/1200/1800/2400/3000 的 `dcb_full=0 ring_fail=0 tex_fail=0`；已知 E02/H-MINE-TAB FAIL 均有独立复现和归因记录|PASS|
 
 ## 结果汇总
 
-- 截至收尾：PASS 56；FAIL 2（E02、H-MINE-TAB）；未测 20（K01-K04、D05/D06/D10、E04-E07、E09、H04-H05、H07-H08、I06-I07、I09、I11）。
-- 需要决策：E02 清晰度切换触发干净 `FALLBACK_A`；H Mine 标签切换触发 `GPU_FAULT_PAGE_FAULT_ASYNC`；I11 网络检查、K01-K04 payload 对照仍未测。
+- 截至收尾：PASS 60；FAIL 2（E02、H-MINE-TAB）；未测 16（D05/D06/D10、E04-E07、E09、H04-H05、H07-H08、I06-I07、I09、I11）。
+- 需要决策：E02 清晰度切换触发干净 `FALLBACK_A`；H Mine 标签切换触发 `GPU_FAULT_PAGE_FAULT_ASYNC`；其余未测项保持原原因。
 
 > 每个 FAIL 写：ID、最小复现、截图/日志路径、关键日志行、初步归因（app bug / 平台限制 / 内容不可得）。
 
-- **E02**：播放器 Options→画质→720P；`/tmp/sweep-E-options-quality.png` 显示可选项，`/tmp/sweep-E-quality-720-result.png` 返回播放器；`/tmp/sweep-live-udp.log:4101-4128` 记录 1280×720 `decoder ready` 后 `failure-context reason=agc-blit rc=-1`、`FALLBACK_A`、mpv 重启。初步归因：C 路质量切换后的 AGC blit/资源重建限制；A 回退和 health（`dcb_full=0 ring_fail=0 tex_fail=0`）正常。
-- **H-MINE-TAB**：在“我的”页依次切换“我的收藏”→“我的订阅”→后续番剧/媒体标签；`/tmp/sweep-H-mine-tab-collection.png` 与 `/tmp/sweep-H-mine-tab-subscription.png` 正常，随后 `/tmp/sweep-H-mine-tab-anime.png` 显示 PS5 Debug：`PPSA99233 在暂停 KStuff 前崩溃: 0xa0d0c005 (GPU_FAULT_PAGE_FAULT_ASYNC)`；`/tmp/sweep-H-mine-tab-series.png`、`/tmp/sweep-H-mine-tab-later.png` 已回到主机界面。初步归因：Mine 标签切换期间 GPU 资源/纹理生命周期或 AGC 提交竞态，非网络错误。
+- **E02**：最小复现：播放器 → Options → 画质 → 720P；`/tmp/sweep-E-options-quality.png` 显示可选项，`/tmp/sweep-E-quality-720-result.png` 返回播放器；`/tmp/sweep-live-udp.log:4101-4128` 记录 1280×720 `decoder ready` 后 `failure-context reason=agc-blit rc=-1`、`FALLBACK_A`、mpv 重启。初步归因：C 路质量切换后的 AGC blit/资源重建限制；A 回退和 health（`dcb_full=0 ring_fail=0 tex_fail=0`）正常。
+- **H-MINE-TAB**：最小复现：我的页 → 我的收藏 → 我的订阅 → 番剧标签；`/tmp/sweep-H-mine-tab-collection.png` 与 `/tmp/sweep-H-mine-tab-subscription.png` 正常，随后 `/tmp/sweep-H-mine-tab-anime.png` 显示 PS5 Debug：`PPSA99233 在暂停 KStuff 前崩溃: 0xa0d0c005 (GPU_FAULT_PAGE_FAULT_ASYNC)`；`/tmp/sweep-H-mine-tab-series.png`、`/tmp/sweep-H-mine-tab-later.png` 已回到主机界面。初步归因：Mine 标签切换期间 GPU 资源/纹理生命周期或 AGC 提交竞态，非网络错误。
