@@ -1472,6 +1472,10 @@ void VideoView::setFullScreen(bool fs) {
         if (this->native_vdec_mpv_suppressed) {
             video->native_vdec_loading          = this->native_vdec_loading;
             video->native_vdec_loading_start_us = this->native_vdec_loading_start_us;
+            if (video->native_vdec_loading)
+                video->showLoading();
+            else
+                video->hideLoading();
         }
 #endif
         float width    = brls::Application::contentWidth;
@@ -1506,9 +1510,14 @@ void VideoView::setFullScreen(bool fs) {
         DanmakuCore::instance().refresh();
         LiveDanmakuCore::instance().refresh();
         video->setOnlineCount(this->videoOnlineCountLabel->getFullText());
+#if defined(PS5_NATIVE_APP)
+        if (!this->native_vdec_mpv_suppressed && osdCenterBox->getVisibility() == brls::Visibility::GONE)
+            video->hideLoading();
+#else
         if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
             video->hideLoading();
         }
+#endif
         if (this->seasonAction != nullptr) {
             brls::View* view = video->showEpisode->getParent();
             view->registerClickAction(this->seasonAction);
@@ -1599,11 +1608,17 @@ void VideoView::setFullScreen(bool fs) {
                             video->resume();
                         }
 
-                        if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
-                            video->hideLoading();
-                        } else {
-                            video->showLoading();
+#if defined(PS5_NATIVE_APP)
+                        if (!this->native_vdec_mpv_suppressed) {
+#endif
+                            if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
+                                video->hideLoading();
+                            } else {
+                                video->showLoading();
+                            }
+#if defined(PS5_NATIVE_APP)
                         }
+#endif
                         found = true;
                         break;
                     }
@@ -1645,11 +1660,17 @@ void VideoView::setFullScreen(bool fs) {
                             DanmakuCore::instance().refresh();
                             LiveDanmakuCore::instance().refresh();
 
-                            if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
-                                video->hideLoading();
-                            } else {
-                                video->showLoading();
+#if defined(PS5_NATIVE_APP)
+                            if (!this->native_vdec_mpv_suppressed) {
+#endif
+                                if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
+                                    video->hideLoading();
+                                } else {
+                                    video->showLoading();
+                                }
+#if defined(PS5_NATIVE_APP)
                             }
+#endif
                             found = true;
                             break;
                         }
