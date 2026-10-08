@@ -577,6 +577,23 @@ seek 压力 `/tmp/m12-evo-seek-stress-final.log` 完成 `m5-stress seek=20/20`�
 自动诊断运行至 `agc health frame=6600`，`dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0 vo_rc=0`，无 `FALLBACK_A`/`img-net: failed`；强制 A cycle 同样持续 health 全0。最终用无 options 的 `test-cycle.sh PPSA99233 90` 恢复默认包，启动日志 `user mode=0`，dist 无 `assets/wiliwili-options.txt`；FTP `/data/homebrew/` 仅 `PPSA99233.ffpkg`（95,768,576 B）。
 
 
+#### 6.5.14 M16：原生缩略图尺寸对齐 payload（2026-10-08）
+
+实现：删除 `#elif defined(PS5_NATIVE_APP)` 的移植期低分支，使原生线直接落到 `#else`。`h_ext`、`v_ext`、`face_ext`、`face_large_ext`、两档 emoji、`note_ext`、`note_raw_ext`、`note_small` 均因此与 payload 一致；没有其它 PS5 专用图片尺寸分支需要保留。旧 native 取值为 `336x189/156x210/48/80/24/36/270/note-small=2.5`，新取值为 `672x378/312x420/96/160/48/72/540/note-small=5.0`；`note_raw_ext` 文本值本来已一致。最终代码只改 `wiliwili/include/utils/image_helper.hpp`，临时队列探针已恢复，未改变 A/C 逻辑。
+
+同一 PPSA99233、无 options、自动 `user mode=0` 的页面收据：旧尺寸截图为推荐 `/tmp/thumb-before-recommend-top.png`、`/tmp/thumb-before-recommend-scroll2.png`，搜索 `/tmp/thumb-before-search-results.png`、`/tmp/thumb-before-search-scroll.png`，动态 `/tmp/thumb-before-dynamic-feed-top.png`、`/tmp/thumb-before-dynamic-feed-scroll.png`；新尺寸截图为推荐 `/tmp/thumb-final-recommend-top.png`、`/tmp/thumb-final-recommend-scroll.png`，搜索 `/tmp/thumb-final-search-results.png`、`/tmp/thumb-final-search-scroll.png`，动态 `/tmp/thumb-final-last-dynamic-top.png`、`/tmp/thumb-final-last-dynamic-scroll.png`。肉眼对比新图封面细节明显更清楚；推荐/搜索截图 FPS 旧 `60/60`、`59/60`，新 `60/60`、`60/60`；动态旧 `60/30`，新 `60/30`，没有尺寸导致的额外下降。持续 health 的 `presents=600` 也保持约 60 Hz。
+
+代价实测（队列上限仍为8、每次 drain 最多2项）：
+
+|指标|旧 `336x189`|新 `672x378`|结论|
+|---|---:|---:|---|
+|上传队列 peak / blocked enqueue|`4 / 0`|`8 / 26`|新尺寸在首页/搜索 burst 会顶到上限并发生 backpressure；日志随后同一秒按 `8→6→4→2→0` 排空，非长期打满|
+|direct_mem 代表性页面峰值|`25,770,752 B`|`63,982,592 B`|增加 `38,211,840 B`，约 `2.48x`；固定 TextureCache 容量仍为 24，direct_mem 是图片+UI direct pool 代理，不是单独图片字节计数|
+|AGC health|三项、`timeouts`、`vo_rc` 全0|三项、`timeouts`、`vo_rc` 全0|通过|
+|图片失败|无 `img-net: failed`、无 `img-decode`|无 `img-net: failed`、无 `img-decode`|通过|
+
+队列 trace 是临时编译探针：旧 `/tmp/thumb-before-queue-cycle.log` peak=4/blocked=0，新 `/tmp/thumb-after-cycle.log` peak=8/blocked=26；测完已移除，最终包 `/tmp/thumb-final-last-cycle.log` 为无探针构建 marker `Oct 8 2026 14:36:57`，health 至 frame=10200 全0。结论：672x378 的上传 burst 成本可见、缓存 direct memory 增长约 36.4 MiB，但未触发长期满队列、帧率下降、AGC 错误或网络失败；在当前 128 MiB direct pool（峰值约 64 MiB）下可接受，推荐维持 672x378，不退回 480x270。
+
 ### 6.6 P2：可发布生产
 
 仍需补齐：
