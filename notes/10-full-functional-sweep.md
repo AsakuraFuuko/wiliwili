@@ -55,14 +55,14 @@
 |ID|项目|入口/操作|预期|判据|证据|结果|
 |---|---|---|---|---|---|---|
 |E01|起播/loading|从详情进入视频，观察 loading 到首帧|先显示 loading，首帧后消失|首帧、无 spinner 残留|`/tmp/sweep-E-c-player2.png` 首帧可见；`/tmp/sweep-E-c-final-udp.log:2-16` 持续 C `presented` 和 health|PASS|
-|E02|清晰度|播放器菜单切换可用清晰度|重新取流并继续播放|无卡死/错误，日志记录质量|`/tmp/sweep-E-options-quality.png`, `/tmp/sweep-E-quality-720-result.png`; `/tmp/sweep-live-udp.log:4101-4128`|FAIL|
+|E02|清晰度|播放器菜单切换可用清晰度|重新取流并继续播放|无卡死/错误，日志记录质量|`/tmp/rt-e02-evidence.log`、`/tmp/d0.png`、`/tmp/e2.png`；修复 `39f7db0`、验证记录 `843e0ca`|PASS|
 |E03|倍速|播放器菜单切换 0.5/1/1.5/2 倍|播放速度变化|画面/音频连续|`/tmp/sweep-E-c-speed-menu.png` 列出 1.75x…0.25x 且 1.0x 选中；`/tmp/sweep-E-c-speed-150.png` 播放器仍显示并变为 1.25x；`/tmp/sweep-E-c-speed-final-closed.png` 恢复菜单关闭|PASS|
 |E04|字幕|播放器设置打开字幕并切换语言/关闭|字幕显示、隐藏正确|字幕显示、隐藏正确|`/tmp/sweep-E-speed-f3.png` 可见中文字幕；本轮未打开字幕设置切换|未测|
 |E05|弹幕开关|打开/关闭弹幕|弹幕出现/消失|无崩溃，状态持久|`/tmp/sweep-E-c-osd-r1.png`, `/tmp/sweep-E-c-osd-r2.png` 可见弹幕开关/设置控件；样本无滚动弹幕，不能证明状态变化|未测|
 |E06|弹幕样式|弹幕设置调整区域、透明度、字号、速度、字体/渲染质量|样式即时生效|前后截图|本轮未打开弹幕样式面板|未测|
 |E07|音量|手柄音量增减/播放器音量设置|音量变化并显示 OSD|无异常跳变|本轮未取得音量滑块前后值|未测|
 |E08|暂停恢复|叉/确认暂停，再恢复|播放暂停、恢复|时间线和音频恢复|`/tmp/sweep-E-c-paused.png` 显示暂停键状态；`/tmp/sweep-E-c-resumed.png` 显示播放键状态；两次操作后仍在播放器|PASS|
-|E09|seek|左右快进/快退，拖动/选择时间|跳转目标附近继续播放|无旧帧回放、无 crash|C：`/tmp/seek-fixed-udp.log:194-264`；A：`/tmp/seek-fixed-udp.log` mode=2 后的 `mpv` 播放窗口；截图 `/tmp/seek-fixed-multi.png`、`/tmp/seek-a-multi.png`|PASS|
+|E09|seek|左右快进/快退，拖动/选择时间|跳转目标附近继续播放|无旧帧回放、无 crash|**已修复并验证**（`67a3e41`+`c09facdb`）：8 次 seek 全成功（`seek reset rc=0`→`seek ready`→`IDR reached`）、`superseded=3`、0 回退/0 GPU 故障/应用存活；证据 `/tmp/autonav-udp.log`、`/tmp/final-udp.log`|PASS|
 |E10|小窗↔全屏|进入全屏、退出全屏|布局和视频尺寸正确|可来回切换|`/tmp/sweep-E-c-fullscreen-on.png` 视频铺满屏幕；`/tmp/sweep-E-c-fullscreen-exit.png` 回到嵌入详情布局|PASS|
 |E11|退出|播放器圈返回|退出播放器回详情/列表|无残留音频/标题进程|`/tmp/sweep-E-after-player-circle.png`, `/tmp/sweep-E-after-detail-circle.png`|PASS|
 |E12|播放器内菜单|打开设置/清晰度/播放列表等菜单|菜单可打开、取消、保存|每个菜单无空白/卡死|`/tmp/sweep-E-c-speed-menu.png`, `/tmp/sweep-E-options-quality.png`, `/tmp/sweep-E-fullscreen-from-small.png`|PASS|
@@ -93,7 +93,7 @@
 |H01|我的页|左侧我的入口|用户信息/登录入口加载|页面可操作|`/tmp/sweep-H-mine-page.png` 显示账号头像、昵称、统计数据和 Mine tabs|PASS|
 |H02|历史|我的→历史|历史视频列表加载，可打开|列表/返回正常|`/tmp/sweep-H-mine-page.png` 的“历史记录” tab 显示多张历史视频卡片|PASS|
 |H03|收藏|我的→收藏|收藏夹/视频列表加载|登录态成功；未登录明确提示|`/tmp/sweep-H-mine-tab-collection.png` 显示收藏夹卡片、数量和日期；`/tmp/sweep-H-mine-tab-subscription.png` 显示订阅列表|PASS|
-|H04|稍后再看|我的→稍后再看|列表加载，可打开/移除|状态正确|切换 Mine 后续标签前发生 GPU fault，未到达稍后再看|未测|
+|H04|稍后再看|我的→稍后再看|列表加载，可打开/移除|状态正确|集成方手动验证（`39f7db0` 后）：列表加载 ✓、打开并播放 ✓（《18年前的索尼黑科技…》），无崩溃；证据 `/tmp/q1.png`、`/tmp/q2.png`|PASS|
 |H05|关注|我的→关注|关注列表/分组加载|可滚动/进入主页|本轮未到达关注入口|未测|
 |H06|消息|左侧消息入口|消息/回复/系统消息页加载|登录态成功；未登录明确提示|`/tmp/sweep-H-inbox-open4.png` 显示聊天列表、回复、@和收到的赞标签及会话列表|PASS|
 |H07|登录入口|我的页点击登录|二维码/登录页显示|二维码或明确服务不可得|已有登录态，本轮未执行登出后登录入口|未测|
@@ -138,11 +138,13 @@
 
 ## 结果汇总
 
-- 截至本轮：PASS 61；FAIL 2（E02、H-MINE-TAB）；未测 15（D05/D06/D10、E04-E07、H04-H05、H07-H08、I06-I07、I09、I11）。E09 seek 已在 C/A 两路径完成复测并通过。
-- **两个 FAIL 均已修复并验证通过**（见下方「FAIL 深挖与修复验证」；修复提交 `39f7db0`、验证记录 `843e0ca`）：
-  - E02：受控复测通过 —— 详情页切 480P→720P，C 会话重启且无 `agc-blit rc=-1`/`FALLBACK_A`、health 三项 0。
-  - H-MINE-TAB：多轮切标签（含原崩溃路径「追番」）无崩溃、health 三项 0。
-- 其余未测项保持原原因（无内容/未覆盖入口）。
+- 截至 2026-10-10：**PASS 63；FAIL 0**；未测 14（D05/D06/D10、E04–E07、H05、H07–H08、I06–I07、I09、I11）。
+- **三个曾失败/存疑的项均已修复并验证**：
+  - E02（清晰度切换→回退 A）：受控复测通过（480P→720P 无 `agc-blit rc=-1`/`FALLBACK_A`；修复 `39f7db0`、验证 `843e0ca`）。
+  - H-MINE-TAB（我的页切标签→GPU 崩溃）：多轮切标签（含原崩溃路径）无崩溃。
+  - **E09（seek 崩溃 + C 层 seek 失败）：已修复并验证**（`67a3e41`+`c09facdb`：8 次 seek 全成功、`superseded=3`、0 回退/0 GPU 故障/存活；原 3/3 崩溃场景不复现）。
+  - H04（稍后再看）由集成方手动验证通过（列表+打开播放）。
+- 其余未测项保持原原因（无内容/未覆盖入口/工具限制）。
 
 > 每个 FAIL 写：ID、最小复现、截图/日志路径、关键日志行、初步归因（app bug / 平台限制 / 内容不可得）。
 
