@@ -62,7 +62,7 @@
 |E06|弹幕样式|弹幕设置调整区域、透明度、字号、速度、字体/渲染质量|样式即时生效|前后截图|本轮未打开弹幕样式面板|未测|
 |E07|音量|手柄音量增减/播放器音量设置|音量变化并显示 OSD|无异常跳变|本轮未取得音量滑块前后值|未测|
 |E08|暂停恢复|叉/确认暂停，再恢复|播放暂停、恢复|时间线和音频恢复|`/tmp/sweep-E-c-paused.png` 显示暂停键状态；`/tmp/sweep-E-c-resumed.png` 显示播放键状态；两次操作后仍在播放器|PASS|
-|E09|seek|左右快进/快退，拖动/选择时间|跳转目标附近继续播放|无旧帧回放、无 crash|手柄左右本身未绑定快退/快进；本轮无键盘 `[`/`]` 或滑条目标的独立证据|未测|
+|E09|seek|左右快进/快退，拖动/选择时间|跳转目标附近继续播放|无旧帧回放、无 crash|C：`/tmp/seek-fixed-udp.log:194-264`；A：`/tmp/seek-fixed-udp.log` mode=2 后的 `mpv` 播放窗口；截图 `/tmp/seek-fixed-multi.png`、`/tmp/seek-a-multi.png`|PASS|
 |E10|小窗↔全屏|进入全屏、退出全屏|布局和视频尺寸正确|可来回切换|`/tmp/sweep-E-c-fullscreen-on.png` 视频铺满屏幕；`/tmp/sweep-E-c-fullscreen-exit.png` 回到嵌入详情布局|PASS|
 |E11|退出|播放器圈返回|退出播放器回详情/列表|无残留音频/标题进程|`/tmp/sweep-E-after-player-circle.png`, `/tmp/sweep-E-after-detail-circle.png`|PASS|
 |E12|播放器内菜单|打开设置/清晰度/播放列表等菜单|菜单可打开、取消、保存|每个菜单无空白/卡死|`/tmp/sweep-E-c-speed-menu.png`, `/tmp/sweep-E-options-quality.png`, `/tmp/sweep-E-fullscreen-from-small.png`|PASS|
@@ -138,7 +138,7 @@
 
 ## 结果汇总
 
-- 截至收尾：PASS 60；FAIL 2（E02、H-MINE-TAB）；未测 16（D05/D06/D10、E04-E07、E09、H04-H05、H07-H08、I06-I07、I09、I11）。
+- 截至本轮：PASS 61；FAIL 2（E02、H-MINE-TAB）；未测 15（D05/D06/D10、E04-E07、H04-H05、H07-H08、I06-I07、I09、I11）。E09 seek 已在 C/A 两路径完成复测并通过。
 - **两个 FAIL 均已修复并验证通过**（见下方「FAIL 深挖与修复验证」；修复提交 `39f7db0`、验证记录 `843e0ca`）：
   - E02：受控复测通过 —— 详情页切 480P→720P，C 会话重启且无 `agc-blit rc=-1`/`FALLBACK_A`、health 三项 0。
   - H-MINE-TAB：多轮切标签（含原崩溃路径「追番」）无崩溃、health 三项 0。
@@ -182,3 +182,18 @@
 - 验证（集成方手动，2026-10-09）：我的页六标签依次走完 + 多次往返、**多次进入「我的追番」**（原崩溃触发路径）；全程**无崩溃**（eboot 存活）、`agc health` 三项 0、无 GPU_FAULT。
 - 证据：`/tmp/vh-v1.png`、`/tmp/vh-v2.png`、`/tmp/vh-rounds.png`（激活标签分别为 收藏/追番，内容正常）。
 - 口径：原崩溃为间歇性（sweep 中命中 1 次），多轮未复现 ≠ 绝对证明；但原触发路径已稳定，配合修复机制判断为已解决。
+
+## E09 seek 调试进展（2026-10-09）
+
+- 基线：`/tmp/crash-repro.log:823-866`（marker `Oct  9 2026 07:55:45`）记录 `seek requested` 后 `seek failed rc=-1414092869 (Immediate exit requested)`、`failure-context reason=seek-demux`、`FALLBACK_A`；集成方另有提交 seek 前 GPU fault 记录。
+- 二分 A：临时让 `VideoSnapshotCore::loadTexture()` 直接返回，重建并安装 marker `Oct  9 2026 19:06:07`。同一视频详情页播放中执行 R1 1 次、随后 L1/R1/L1/R1 连续 4 次；`/tmp/seek-snapshot-udp.log:269-298` 与 `:397-439` 均显示 seek reset/ready、IDR、首帧继续，未出现 `FALLBACK_A`、GPU fault 或 `seek failed`；`/tmp/seek-snapshot-multi.png` 仍在播放，标题进程存活。
+- 二分结论：A（禁用快照纹理）与 B（保留快照、禁用 `setCenterHintIcon`）均稳定；B 的 5 次 L1/R1 无崩溃，说明 seek 本体不是首要触发源，最终锁定中心 SVG 引发的缓存纹理淘汰/立即回收窗口。
+
+### E09 修复与 C 路径复测
+
+- 修复：`library/borealis/library/lib/extern/nanovg/nanovg_agc.cpp` 的 `deleteTexture()` 不再立即 `evo_direct_mem_free()`；纹理先进入 `retired_textures`，在 NanoVG `flush` 前通过 AGC frame fence drain 后释放。`nvgDeleteAgc()` 退出路径也先 drain，避免 GPU 仍读 direct-memory 时归还页面。
+- 正式包 marker：`Oct  9 2026 19:41:54`；构建成功并安装到 `PPSA99233`。
+- C 路径复测：`/tmp/seek-fixed-udp.log:194-264` 记录 R1/L1 交替连续 6 次（R1 3 次、L1 3 次），每次均有 `seek reset rc=0`、`seek ready`、`sequential seek reached`、`output/presented`；标题 `eboot.bin` 持续存活，未出现 GPU fault 或 `seek failed`。
+- 同窗口 AGC health：`/tmp/seek-fixed-udp.log:186,202,243,265,272` 等均为 `dcb_full=0 ring_fail=0 tex_fail=0`。窗口内唯一 `FALLBACK_A` 是首次媒体重开 `replay-open rc=-9022` 的传输/备用源切换，随后 1080p C 源正常起播并完成全部 seek，不是 seek-demux 或 GPU 失败。
+- A 路径复测：设置 `vdec-play: user mode=2` 后打开视频，执行 L1/R1/L1/R1；截图 `/tmp/seek-a-multi.png` 仍在 `00:40/12:26` 播放，日志持续 `mpv: playback restart/audio active`，无 GPU fault；随后恢复设置并确认 `vdec-play: user mode=0`（`20:40:18`）。
+- 最终状态：C、A 两路径 seek 均通过，E09 标记 PASS；窗口内无 `img-net: failed`、GPU fault、`seek failed`，正式包最终仍为自动模式。
