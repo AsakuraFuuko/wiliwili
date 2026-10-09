@@ -160,3 +160,22 @@
 - 失败窗口：`/tmp/sweep-live-udp.log:4098-4128`。720P C 路 `decoder ready visible=1280x720` 后立即 `seek reset target=3412`，尚未出现 `output`/`presented` 就进入 `failure-context reason=agc-blit rc=-1` 并回 A；health 三项保持 0。
 - 对照：同日志 `03:40` 的 1280x720 C 路从 `start=0` 起播，先 `network-prebuffer`/`output seq=1` 再正常 present；随后 seek 也正常。根因已定位：`play_reset_state_locked()` 清空 `s->slots[]` 却没有把 `s->current_slot` 置为 `-1`；画质重启后首个 draw 把上一会话的 slot index 当成新帧，读取已清零的 slot，最终以 `coded_w/coded_h=0` 命中 `evo_agc_blit_yuv_rect()` 的参数早退并触发 `FALLBACK_A`。这不是 720P 尺寸、NV12 格式或解码器能力限制。
 - 局部修复：在 `native_vdec_play.c::play_reset_state_locked()` 清零 slot 数组后显式设置 `s->current_slot = -1`；新包已重新构建。真实登录态下的 Options→720P 回归仍待补测，当前不把未重走的路径标 PASS。
+
+## FAIL 深挖与修复验证（2026-10-09）
+
+### E02：清晰度切换 → `agc-blit rc=-1` → 回退 A
+- 根因：`play_reset_state_locked()` 清空 slot 数组但未复位 `current_slot`；切档重建后 draw 路径可能把上一会话的 slot 当当前帧（读已清零元数据 → 无效 blit 参数 → `rc=-1` → 干净 `FALLBACK_A`）。
+- 修复（`39f7db0`）：`play_reset_state_locked()` 内 `s->current_slot = -1`（`native_vdec_play.c:2379`）；draw 路径已有 `slot < 0 → return 1` 守卫（`native_vdec_play.c:2765-2769`）⇒ 新会话拿到帧前不绘制旧 slot。
+- 验证：
+  - ✅ 代码级：复位点与守卫均已核对。
+  - ✅ 观察级：修复版上 C 路径连续播放（720P 一段 20+ 分钟、480P 一段）`FALLBACK_A=0`、`dropped=0`、health 三项 0。
+  - ⚠️ **受控复测（播放中切 480P↔720P）未完成**：agent 自动化两次被上游（`5yuantoken.org`）400/超时打断；手动导航无法稳定打开画质菜单（OSD 自动隐藏 + 焦点序列不确定）。
+  - 复测步骤（留待后续）：播放中**同一批按键**内 `triangle` 唤 OSD → 右移 4 格到「画质」→ `cross` 开列表 → 选档确认 → 查 UDP 日志（期望：新 `vdec-play` 会话且无 `agc-blit rc=-1`/`FALLBACK_A`）。
+- 结论：**修复已部署 + 代码级验证通过；受控复测待补**。即使该路径再次异常，也会干净回退 A，不影响可用性。
+
+### H-MINE-TAB：我的页切标签 → `GPU_FAULT_PAGE_FAULT_ASYNC (0xa0d0c005)`
+- 根因（判断）：隐藏的 Mine 标签仍持有 RecyclingGrid 与图片纹理；纹理集中释放与已提交的 AGC 命令重叠。
+- 修复（`39f7db0`）：Mine 四页 `onHide()` → `recyclingGrid->reloadData()`；`RecyclingGridItemHistoryVideoCard` / `CollectionVideoCard` 补 `cacheForReuse()`（`ImageHelper::clear`）。
+- 验证（集成方手动，2026-10-09）：我的页六标签依次走完 + 多次往返、**多次进入「我的追番」**（原崩溃触发路径）；全程**无崩溃**（eboot 存活）、`agc health` 三项 0、无 GPU_FAULT。
+- 证据：`/tmp/vh-v1.png`、`/tmp/vh-v2.png`、`/tmp/vh-rounds.png`（激活标签分别为 收藏/追番，内容正常）。
+- 口径：原崩溃为间歇性（sweep 中命中 1 次），多轮未复现 ≠ 绝对证明；但原触发路径已稳定，配合修复机制判断为已解决。
