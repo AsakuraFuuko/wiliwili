@@ -197,3 +197,21 @@
 - 同窗口 AGC health：`/tmp/seek-fixed-udp.log:186,202,243,265,272` 等均为 `dcb_full=0 ring_fail=0 tex_fail=0`。窗口内唯一 `FALLBACK_A` 是首次媒体重开 `replay-open rc=-9022` 的传输/备用源切换，随后 1080p C 源正常起播并完成全部 seek，不是 seek-demux 或 GPU 失败。
 - A 路径复测：设置 `vdec-play: user mode=2` 后打开视频，执行 L1/R1/L1/R1；截图 `/tmp/seek-a-multi.png` 仍在 `00:40/12:26` 播放，日志持续 `mpv: playback restart/audio active`，无 GPU fault；随后恢复设置并确认 `vdec-play: user mode=0`（`20:40:18`）。
 - 最终状态：C、A 两路径 seek 均通过，E09 标记 PASS；窗口内无 `img-net: failed`、GPU fault、`seek failed`，正式包最终仍为自动模式。
+
+### E09：seek（快进/快退 L1/R1）→ 应用死亡 → 已修复并验证（2026-10-09）
+
+**修复前现象（3/3 复现）**：播放中按 R1/L1 ⇒ 应用 1–2 秒内静默死亡（GPU 故障类，PS5 偶显 `0xa0d0c005 GPU_FAULT_PAGE_FAULT_ASYNC`）；且 C 层 seek 本身失败：`seek requested` → `seek failed rc=-1414092869 (AVERROR_EXIT)` → `FALLBACK_A reason=seek-demux`。
+
+**根因（两层）**：
+1. `native_vdec_play.c`：`play_interrupt()` 在"seek 待处理"时中断 demux I/O；当**第二个 seek 请求**（重复/并发，例如启动续播 + UI seek）在第一次 seek 的 `avformat_seek_file` 执行期间到达时，I/O 被打断（`AVERROR_EXIT`），失败分支直接 `play_fail("seek-demux")` → 回退 A（并伴随崩溃）。
+2. 纹理生命周期（同批修复）：`nanovg_agc.cpp deleteTexture()` 立即 `evo_direct_mem_free()`，在飞 GPU 命令可能仍引用该纹理 ⇒ 页错误。改为 `retired_textures` + `flush` 前 `evo_agc_runtime_wait_idle()` 延迟回收（borealis `c09facdb`）。
+
+**修复**（`67a3e41` + `c09facdb`）：
+- `play_restart_after_seek()`：`AVERROR_EXIT` 且仍有待处理 seek ⇒ **不再当致命失败**，清 `seek_in_progress` 返回"重试"，主循环用最新目标重跑（3 处调用点同步改造）。
+- 纹理删除延迟到栅栏退休后回收。
+
+**验证（2026-10-09 23:29–23:36；终版含图标恢复、无探针）**：
+- 自动导航开播（搜索流）→ R1/L1/R1 三连 + 连按 5 次 = **8 次 seek 全部成功**：`seek reset rc=0` → `seek ready` → `sequential seek reached idr=1` ✓
+- `superseded=3` ⇒ 修复的"被更新请求中断→重试"路径真实触发并被正确处理 ✓
+- **`FALLBACK_A`=0、`GPU_FAULT`=0、`crash`=0、eboot 存活** ✓（原 3/3 崩溃场景不再复现）
+- 证据：`/tmp/autonav-udp.log`、`/tmp/final-udp.log`；自动导航脚本 `tools/seek-autonav.py`（用 `vdec-play: presented` 作为开播判定）
