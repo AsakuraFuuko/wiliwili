@@ -2195,6 +2195,16 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
         rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, target, target, 0);
         if (rc < 0) {
             play_log_av_error("seek", rc);
+            /* A newer seek request aborts this demux I/O through play_interrupt with
+             * AVERROR_EXIT. That is not a demux failure: keep the pending request and let
+             * the caller re-run the seek with the newest target instead of falling back. */
+            if (rc == AVERROR_EXIT && __atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
+                pthread_mutex_lock(&s->mutex);
+                s->seek_in_progress = 0;
+                pthread_mutex_unlock(&s->mutex);
+                play_logf("vdec-play: seek superseded by newer request; retrying");
+                return 1;
+            }
             if (!reopen_media && current_pts90k != INT64_MIN && target90k >= current_pts90k) {
                 avformat_flush(media->format);
                 sequential_seek = 1;
@@ -2306,13 +2316,18 @@ static void *play_thread_main(void *opaque) {
         pthread_cond_broadcast(&s->condition);
         pthread_mutex_unlock(&s->mutex);
         while (!play_stop_requested(s) && !s->fallback) {
-            if (__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE) && play_restart_after_seek(s, &media) != 0) {
-                result = -1;
-                break;
+            if (__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
+                const int restart_rc = play_restart_after_seek(s, &media);
+                if (restart_rc > 0) continue; /* superseded: serve the newer seek */
+                if (restart_rc < 0) {
+                    result = -1;
+                    break;
+                }
             }
             result = play_media_loop(s, &media);
             if (result == VDEC_PLAY_RESULT_SEEK) {
-                if (play_restart_after_seek(s, &media) != 0) {
+                const int restart_rc = play_restart_after_seek(s, &media);
+                if (restart_rc < 0) {
                     result = -1;
                     break;
                 }
@@ -2348,7 +2363,8 @@ static void *play_thread_main(void *opaque) {
             const int restart = !play_stop_requested(s) && !s->fallback && s->seek_requested;
             pthread_mutex_unlock(&s->mutex);
             if (!restart) break;
-            if (play_restart_after_seek(s, &media) != 0) {
+            const int eof_restart_rc = play_restart_after_seek(s, &media);
+            if (eof_restart_rc < 0) {
                 result = -1;
                 break;
             }
