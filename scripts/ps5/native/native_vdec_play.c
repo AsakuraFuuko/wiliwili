@@ -2388,14 +2388,22 @@ static void *play_thread_main(void *opaque) {
                 ++s->seek_request_generation;
                 play_logf("m5-stress: eof=%d/5", s->stress_eof_count);
             }
-            while (!play_stop_requested(s) && !s->fallback && !s->seek_requested) {
-                pthread_mutex_unlock(&s->mutex);
-                sceKernelUsleep(2000);
-                pthread_mutex_lock(&s->mutex);
-            }
-            const int restart = !play_stop_requested(s) && !s->fallback && s->seek_requested;
             pthread_mutex_unlock(&s->mutex);
-            if (!restart) break;
+            int eof_restart = 0;
+            for (;;) {
+                const int parked_stop     = play_stop_requested(s);
+                const int parked_fallback = __atomic_load_n(&s->fallback, __ATOMIC_ACQUIRE);
+                const int parked_seek     = __atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE);
+                if (parked_stop || parked_fallback || parked_seek) {
+                    eof_restart = !parked_stop && !parked_fallback && parked_seek;
+                    break;
+                }
+                sceKernelUsleep(2000);
+            }
+            if (!eof_restart) {
+                result = -1;
+                break;
+            }
             const int eof_restart_rc = play_restart_after_seek(s, &media);
             if (eof_restart_rc < 0) {
                 result = -1;

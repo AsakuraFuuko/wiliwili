@@ -311,17 +311,17 @@
 **用户现象**：视频播完后自动重播，第二遍只有声音、画面定格在最后一帧。
 
 **根因与修复**：
-- clean-room libc 的条件变量等待不能作为标题内永久等待原语；EOF parking、帧槽耗尽、暂停、备用源切换和 present wait 已统一使用 `sceKernelUsleep(2000)` 轮询，睡眠期间释放 session mutex。
-- 诊断版确认残余卡点在 `sceVideodec2Reset()`：`seek requested target=0.000 reopen=1` 后无返回日志。EOF 重播前先等待并回收仍被 AGC 借用的最后呈现帧（`present_pending`），然后重开媒体；EOF 路径跳过 `sceVideodec2Reset()`，依靠重开流中的参数集和 IDR 重建解码状态。普通用户 seek 仍保留 reset。
+- clean-room libc 的条件变量等待不能作为标题内永久等待原语；EOF parking、帧槽耗尽、暂停、备用源切换和 present wait 使用 `sceKernelUsleep(2000)` 轮询，睡眠期间释放 session mutex。
+- 诊断版确认 `seek requested target=0.000 reopen=1` 后，worker 可在 EOF 停车轮询出口和重启入口之间被同步路径卡住；最终 EOF parking 改为完全无锁轮询，原子读取 `stop_requested`、`fallback`、`seek_requested`，避免无界依赖 `s->mutex`。
+- EOF 重播前继续等待并回收 `present_pending` 的 AGC 帧，重开媒体后跳过 decoder reset；普通用户 seek 仍保留 reset。
+
+**代码证据**：
+- `native_vdec_play.c`：EOF parking 解锁后只用原子状态和 `sceKernelUsleep(2000)`；EOF 路径跳过 `sceVideodec2Reset()` 的注释保留。
+- 一次性 `restart` 入口/返回、EOF parking、暂停入口/出口诊断已清理。
 
 **实机证据**：
-- 诊断构建 marker `Oct 10 2026 22:58:26`：`seek requested target=0.000 reopen=1` 后卡在 reset 之前/内部，确认了 reset 阻塞假设。
-- 修复构建 marker `Oct 11 2026 00:00:29`，`res-check: critical=20 missing=0`，`user mode=0`；启动与播放期间 `agc health` 持续 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`。
-- 修复后短片与 5:51 长片均在 EOF 后自动重播；截图 `/tmp/eof-short-fixed.png`、`/tmp/long-eof-fixed.png` 显示播放器仍有画面。日志中的 `demux EOF`、`clock discontinuity ... target=0 reopen=1` 后继续运行，第二遍 `presented`/`pts90k` 持续推进；无 `FALLBACK_A`、GPU fault 或 crash。
+- 修复前独立复验（marker `Oct 11 2026 00:00:29`）：`demux EOF` → `clock discontinuity ... seek requested target=0.000 reopen=1` 后 46 秒无 vdec 新日志，`pts90k` 冻结而 `presented` 增长；该证据否定“只卡 reset 内”的旧结论。
+- 修复版构建完成并重新部署为 `PPSA99233`；构建 marker 从 `eboot.bin` 读取后用于部署校验。启动要求 `res-check: critical=20 missing=0`、`user mode=0`，运行健康判据为 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`。
+- 历史修复样本 `/tmp/eof-short-fixed.png`、`/tmp/long-eof-fixed.png` 与 `/tmp/eof-fixed.log` 保留为此前版本的参考；本轮新的两种时长 EOF 复测尚未取得完整 EOF 日志/截图，因此不将“本轮两片 PASS”写入验收表。
 
-**结论**：EOF 自动重播冻结已收口。保留 EOF AGC idle 排空与跳过 decoder reset 的“为什么”注释；一次性 reset 进入/返回诊断已清理。
-
-**独立复验结果（2026-10-11 00:47，构建 marker `Oct 11 2026 00:00:29` = `56c6a7c`）：未通过 ✗**
-- 实测 5:51 片：`demux EOF` → `seek requested target=0.000 reopen=1` 之后 **46 秒内无任何 vdec 日志**，`pts90k` 冻在 31520998、`presented` 继续增长。
-- 关键：**连 `56c6a7c` 新增的日志也没出现**（`EOF replay waiting for AGC idle…` / `EOF replay skips decoder reset…` 均无）⇒ worker 停在**到达 `play_restart_after_seek()` 之前**（EOF 停车退出 → 该函数入口之间），不是解码器 reset 那段。
-- 因此"reset 内阻塞"假设**未被证实**；需要给"EOF 停车退出 → 函数入口"之间再加分段诊断（含 `pthread_mutex_lock(&s->mutex)` 是否死锁、`play_wait_if_paused` 是否参与）。
+**结论**：代码已针对新定位的无锁 EOF parking 卡点修复并通过本地构建；真机最终包的两种时长验收仍待完成，当前不能宣称硬性验收已通过。
