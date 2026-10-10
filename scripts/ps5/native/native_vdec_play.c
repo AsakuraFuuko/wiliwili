@@ -2484,7 +2484,15 @@ void wiliwili_vdec_play_stop(void) {
     pthread_mutex_unlock(&s->mutex);
     if (join_needed && !pthread_equal(pthread_self(), thread)) pthread_join(thread, NULL);
 #if defined(PS5_NATIVE_APP) && defined(BOREALIS_USE_AGC)
-    if (s->resources_live) evo_agc_runtime_wait_idle(500);
+    if (s->resources_live) {
+        /* The frame/aux pools are read by AGC video blits, so they may only be unmapped
+         * after every submit retired. Retry the drain here rather than a single bounded
+         * wait: freeing while a blit is still in flight raises an async GPU page fault
+         * that kills the title with no application-visible log. */
+        int idle = 0;
+        for (int attempt = 0; attempt < 8 && !idle; ++attempt) idle = evo_agc_runtime_is_idle(125);
+        if (!idle) play_logf("vdec-play: drain still busy before pool release (gpu fault risk)");
+    }
 #endif
     pthread_mutex_lock(&s->mutex);
     play_logf(
