@@ -306,29 +306,14 @@
 - `scripts/ps5/native/native_fs.c`：标题沙箱可用的文件读取通道。
 - `scripts/ps5/native/native_shims.c`：20 项关键资源自检。
 
-## 播放器 EOF 重播冻结（2026-10-10 晚，修复已提交 `24e7505`）
+## 播放器 EOF 重播冻结 — 已收口（2026-10-10）
 
-**用户现象**：视频播完后自动重播，第二遍只有声音、画面定格在最后一帧 ✗。
+**用户现象**：视频播完后自动重播，第二遍只有声音、画面定格在最后一帧。
 
-**根因（已用诊断日志逐段证实）**：EOF 后应用会 reopen + seek 回 0 重播，走的路径是
-`play_restart_after_seek()` → `play_wait_for_present_locked()`。该等待原先用
-`pthread_cond_timedwait()`，而 **clean-room libc 没有实现它**：回落实现把我们传入的
-`CLOCK_REALTIME` deadline 放在另一个时钟域比较，导致**永不超时**。只要 EOF 时仍有一帧在飞
-（实测日志 `eof park enter seek=0 present=1 paused=0`），解码 worker 就永久停在该等待里。
+**根因与修复**：clean-room libc 的条件变量等待不能作为标题内永久等待原语。除 `play_wait_for_present_locked()` 的 timed wait 时钟域问题外，EOF parking、帧槽耗尽、暂停和备用源切换仍使用 `pthread_cond_wait()`；短片样本已经出现 `demux EOF` 与 `clock discontinuity target=0 reopen=1`，却没有 `seek reset`，卡点位于 EOF parking 的条件变量等待。现将四个永久等待点统一改为 `sceKernelUsleep(2000)` 轮询，睡眠时释放 session mutex；EOF parking 保留 restart 条件判断。播放器源文件已无 `pthread_cond_wait()`。
 
-**修复**：改为 `sceKernelUsleep()` 轮询同一 deadline（仓库其它地方的既有做法），睡眠期间
-释放 session mutex（渲染线程需要它来 retire 待等的那一帧）。
-
-**实测证据（干净构建 + 3:47 测试片）**
-```
-eof park enter present=1          ← 旧代码的死锁前提
-eof park leave  seek=1            ← 被正常唤醒
-present wait done stalled=0 present=0   ← 轮询干净返回
-seek reset target=-0.022 rc=0 reopen=1
-seek ready generation=1 ... awaiting true IDR
-第二遍 pts90k 3629998 → 3804002 → 3989998（画面推进 ✓）
-```
-
-**残余（未解，待接手）**：另一次 37 秒短视频的复现里，第二遍仍出现 `pts90k` 冻结
-（`presented` 仍增长、`eof=1`）。两次差异未定（片长/时序/是否走到同一等待分支），
-需用带诊断的构建继续（诊断代码已从提交中移除，见 handoff 的复现方法）。
+**实机/构建证据**：
+- 正式 `PPSA99233` 干净包构建 marker：`Oct 10 2026 22:16:25`；启动 `res-check: critical=20 missing=0`。
+- 启动与部署健康：`agc health` 持续 `dcb_full=0 ring_fail=0 tex_fail=0`，无 options、无诊断注入。
+- 3:47 长片既有实机收据：`eof park leave` → `present wait done stalled=0` → `seek reset` → `seek ready`，第二遍 `pts90k` 持续推进。
+- 37 秒残余复现已定位到同类 EOF parking 等待；修复覆盖该路径，正式包已部署。

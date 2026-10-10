@@ -282,6 +282,7 @@ static int play_gate_value(const char *name) {
     const char *value = getenv(name);
     return value != NULL && strcmp(value, "1") == 0;
 }
+
 static int play_env_flag(const char *name) {
     const char *value = getenv(name);
     if (value == NULL || value[0] == '\0') return -1;
@@ -841,7 +842,10 @@ static int play_wait_for_frame_slot(VdecPlaySession *s) {
     const uint64_t wait_begin = play_now_us();
     int slot = play_find_free_slot_locked(s);
     while (slot < 0 && !play_stop_requested(s) && !s->fallback && !s->seek_requested) {
-        pthread_cond_wait(&s->condition, &s->mutex);
+        /* clean-room libc condition waits are not reliable on the title signal path. */
+        pthread_mutex_unlock(&s->mutex);
+        sceKernelUsleep(2000);
+        pthread_mutex_lock(&s->mutex);
         slot = play_find_free_slot_locked(s);
     }
     const uint64_t waited_us = play_now_us() - wait_begin;
@@ -1760,8 +1764,11 @@ static int play_switch_to_backup(VdecPlaySession *s, VdecPlayMedia *media, int f
         snprintf(backup, sizeof(backup), "%s", s->backup_urls[backup_index]);
         if (s->last_output_pts != INT64_MIN) target90k = s->last_output_pts;
         s->decoder_ready = 0;
-        while (s->present_pending && !play_stop_requested(s) && !s->fallback)
-            pthread_cond_wait(&s->condition, &s->mutex);
+        while (s->present_pending && !play_stop_requested(s) && !s->fallback) {
+            pthread_mutex_unlock(&s->mutex);
+            sceKernelUsleep(2000);
+            pthread_mutex_lock(&s->mutex);
+        }
         if (play_stop_requested(s) || s->fallback) {
             pthread_mutex_unlock(&s->mutex);
             return 0;
@@ -2099,8 +2106,11 @@ done:
 static void play_wait_if_paused(VdecPlaySession *s) {
     pthread_mutex_lock(&s->mutex);
     while (__atomic_load_n(&s->paused, __ATOMIC_ACQUIRE) && !play_stop_requested(s) && !s->fallback &&
-           !s->seek_requested)
-        pthread_cond_wait(&s->condition, &s->mutex);
+           !s->seek_requested) {
+        pthread_mutex_unlock(&s->mutex);
+        sceKernelUsleep(2000);
+        pthread_mutex_lock(&s->mutex);
+    }
     pthread_mutex_unlock(&s->mutex);
 }
 
@@ -2356,8 +2366,11 @@ static void *play_thread_main(void *opaque) {
                 ++s->seek_request_generation;
                 play_logf("m5-stress: eof=%d/5", s->stress_eof_count);
             }
-            while (!play_stop_requested(s) && !s->fallback && !s->seek_requested)
-                pthread_cond_wait(&s->condition, &s->mutex);
+            while (!play_stop_requested(s) && !s->fallback && !s->seek_requested) {
+                pthread_mutex_unlock(&s->mutex);
+                sceKernelUsleep(2000);
+                pthread_mutex_lock(&s->mutex);
+            }
             const int restart = !play_stop_requested(s) && !s->fallback && s->seek_requested;
             pthread_mutex_unlock(&s->mutex);
             if (!restart) break;
