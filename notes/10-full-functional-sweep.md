@@ -320,3 +320,8 @@
 - 修复后短片与 5:51 长片均在 EOF 后自动重播；截图 `/tmp/eof-short-fixed.png`、`/tmp/long-eof-fixed.png` 显示播放器仍有画面。日志中的 `demux EOF`、`clock discontinuity ... target=0 reopen=1` 后继续运行，第二遍 `presented`/`pts90k` 持续推进；无 `FALLBACK_A`、GPU fault 或 crash。
 
 **结论**：EOF 自动重播冻结已收口。保留 EOF AGC idle 排空与跳过 decoder reset 的“为什么”注释；一次性 reset 进入/返回诊断已清理。
+
+**独立复验结果（2026-10-11 00:47，构建 marker `Oct 11 2026 00:00:29` = `56c6a7c`）：未通过 ✗**
+- 实测 5:51 片：`demux EOF` → `seek requested target=0.000 reopen=1` 之后 **46 秒内无任何 vdec 日志**，`pts90k` 冻在 31520998、`presented` 继续增长。
+- 关键：**连 `56c6a7c` 新增的日志也没出现**（`EOF replay waiting for AGC idle…` / `EOF replay skips decoder reset…` 均无）⇒ worker 停在**到达 `play_restart_after_seek()` 之前**（EOF 停车退出 → 该函数入口之间），不是解码器 reset 那段。
+- 因此"reset 内阻塞"假设**未被证实**；需要给"EOF 停车退出 → 函数入口"之间再加分段诊断（含 `pthread_mutex_lock(&s->mutex)` 是否死锁、`play_wait_if_paused` 是否参与）。
