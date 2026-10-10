@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 
 /* SDK 头文件没有在当前声明开关下暴露这个 FreeBSD 入口，故在此补声明。 */
@@ -65,10 +66,10 @@ int wiliwili_list_dir(const char *path, char names[][256], int maxNames) {
         if (got == 0) break;
 
         const char *cursor = buffer;
-        const char *end = buffer + got;
+        const char *end    = buffer + got;
         while (cursor < end) {
             const struct dirent *entry = (const struct dirent *)cursor;
-            const size_t record_len = entry->d_reclen;
+            const size_t record_len    = entry->d_reclen;
             if (record_len == 0 || record_len > (size_t)(end - cursor)) {
                 /* d_reclen 是步进依据；坏记录若只 break 会把枚举结果伪装成成功。 */
                 errno = EIO;
@@ -78,7 +79,7 @@ int wiliwili_list_dir(const char *path, char names[][256], int maxNames) {
 
             if (entry->d_namlen != 0) {
                 const size_t raw_name_len = entry->d_namlen;
-                const size_t name_offset = offsetof(struct dirent, d_name);
+                const size_t name_offset  = offsetof(struct dirent, d_name);
                 if (record_len < name_offset || raw_name_len > record_len - name_offset) {
                     /* d_namlen 不能越过当前记录，否则复制会读到下一条记录。 */
                     errno = EIO;
@@ -87,8 +88,8 @@ int wiliwili_list_dir(const char *path, char names[][256], int maxNames) {
                 }
                 size_t name_len = raw_name_len;
                 if (name_len > 255) name_len = 255;
-                const char *name = entry->d_name;
-                const int is_dot = name_len == 1 && name[0] == '.';
+                const char *name    = entry->d_name;
+                const int is_dot    = name_len == 1 && name[0] == '.';
                 const int is_dotdot = name_len == 2 && name[0] == '.' && name[1] == '.';
                 if (!is_dot && !is_dotdot && count < maxNames) {
                     memcpy(names[count], name, name_len);
@@ -108,4 +109,57 @@ int wiliwili_list_dir(const char *path, char names[][256], int maxNames) {
     close(fd);
     if (count < 0) errno = saved;
     return count;
+}
+
+/* 资源目录可由 options 覆盖；这里直接走 native title 已验证可用的 open/read，
+ * 绕过 clean-room libc 的 stdio/ifstream EPERM 路径。调用者取得的缓冲区由 malloc
+ * 分配，成功后交给 fontstash 以 freeData=true 接管。 */
+int wiliwili_read_file(const char *path, void **data, size_t *size) {
+    if (path == NULL || data == NULL || size == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *data  = NULL;
+    *size  = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    const off_t end = lseek(fd, 0, SEEK_END);
+    if (end <= 0 || (uintmax_t)end > SIZE_MAX) {
+        const int saved = end == 0 ? EINVAL : errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        const int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+
+    void *buffer = malloc((size_t)end);
+    if (buffer == NULL) {
+        const int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    size_t total = 0;
+    while (total < (size_t)end) {
+        const ssize_t got = read(fd, (char *)buffer + total, (size_t)end - total);
+        if (got <= 0) {
+            const int saved = got < 0 ? errno : EIO;
+            free(buffer);
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        total += (size_t)got;
+    }
+    close(fd);
+    *data = buffer;
+    *size = total;
+    return 0;
 }

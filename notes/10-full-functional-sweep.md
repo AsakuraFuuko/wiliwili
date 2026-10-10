@@ -288,13 +288,20 @@
 
 **结论**：分P列表展示、切集、切集后起播均正常 ✓。注意：切集后日志未再出现 `vdec-play: start`（新分P疑走另一路径或复用会话），但用户可见状态与播放健康均正确。
 
-### E04 字幕 — 最终状态（部分验证）
+### E04 字幕 — 字体回退后状态（2026-10-10）
 
 **已验证 ✓**
-1. **字幕渲染链路正常**：播放页实测**日语主字幕 + 中文译文**双行同屏（`OverDriveは、Falconsが…` / `OverDrive炮轰猎鹰…`），右上带「AI」（自动生成）标记 —— B站字幕 → mpv → OSD 叠加全链路工作。
-2. **多语种轨道面板存在且内容完整**（一次误触中打开并截图）：`字幕 / 中文 / English / 日本語（已勾选）/ Español（🔒不可用）/ □□□□□□ / Português` + 播放方式行。
-3. 该视频 `tracks=2`（video+audio）的常见点播视频**无字幕轨** → 解释此前测试中未见字幕项；带字幕的内容（本片）字幕正常显示。
+1. 字幕渲染链路正常：播放页实测日语主字幕 + 中文译文双行同屏（`OverDriveは、Falconsが…` / `OverDrive炮轰猎鹰…`），右上带「AI」标记。
+2. 字体链已修复：PS5 原生标题通过 `open/lseek/read` 读取随包字体，显式加载 `regular`，并将 11 个 Noto 字体挂载为逐字形 fallback。
+3. 语言切换实机验证：选择韩语并重启后日志为 `locale: ko`，截图 `/tmp/font-korean-home.png` 可见 `라이브 / 탐색 / 핫 프로그램 / 영화 / 검색 / 뒤로 가기 / 확인`，无方块。
+4. 切回简体中文并重启后日志为 `locale: zh-Hans`，截图 `/tmp/font-zh-home-final.png` 可见 `直播 / 推荐 / 热门 / 追番 / 影视` 及中文标题，无方块；AGC health 同时满足 `dcb_full=0`、`ring_fail=0`、`tex_fail=0`。
+5. 启动资源自检为 `res-check: critical=20 missing=0`，图片请求成功，未出现 `img-net: failed`。
 
-**未完成 ✗**：切换语种 / 关闭字幕的实际点击未完成 —— 面板仅能由播放器 OSD 的特定焦点路径打开，本工具的 OSD 焦点模型不稳定（左右=拖动进度条、上=顶部图标/详情侧栏），面板打开后又被后续按键关闭。
+**指定 CSGO 样本：本轮未完成最终截图验收**
+- 本轮从当前账号历史记录逐页滚动至较旧条目，未重新遇到交接记录所指 CSGO 片源；因此没有伪造“播放设置”面板截图，也不把该项标为 PASS。
+- 既有记录显示多语字幕面板中的轨名曾为 `□□□□□□`；本次 fallback 已覆盖韩文及其它目标 Unicode 字符集，但指定片源的修复后可见轨名仍需在再次取得该片源后补拍确认。
 
-**⚠️ 发现（非崩溃类）**：面板中一条字幕轨显示为 `□□□□□□`（占位方块），疑为该语种字体缺失或轨道元数据异常，建议后续排查（`scripts/ps5/native` 的字体加载；danmaku/subtitle 字体路径 `getConfigDir()/danmaku.ttf`）。
+**代码证据**
+- `library/borealis/library/lib/platforms/desktop/desktop_font.cpp`：PS5 基础字体与 11 个 Noto fallback 注册。
+- `scripts/ps5/native/native_fs.c`：标题沙箱可用的文件读取通道。
+- `scripts/ps5/native/native_shims.c`：20 项关键资源自检。

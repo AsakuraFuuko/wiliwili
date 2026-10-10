@@ -705,7 +705,7 @@ static void wiliwili_apply_options(void) {
     if (size <= 0) return;
     data[size] = '\0';
 
-    char *line = data;
+    char *line                 = data;
     const char secret_option[] = "WILIWILI_TEST_BILI_COOKIE=";
     while (*line != '\0') {
         char *end = line;
@@ -714,8 +714,8 @@ static void wiliwili_apply_options(void) {
         *end       = '\0';
         if (line[0] != '#' && line[0] != '\0') {
             const size_t line_length = (size_t)(end - line);
-            const int secret = line_length >= sizeof(secret_option) - 1 &&
-                                memcmp(line, secret_option, sizeof(secret_option) - 1) == 0;
+            const int secret =
+                line_length >= sizeof(secret_option) - 1 && memcmp(line, secret_option, sizeof(secret_option) - 1) == 0;
             char *entry = malloc(line_length + 1);
             if (entry != 0) {
                 memcpy(entry, line, line_length + 1);
@@ -1398,9 +1398,26 @@ static void wiliwili_resources_marker(void) {
      * "Invalid romfs resource path" 并且很难一眼看出是打包问题——启动时先按名字打开
      * 一小组"没有就必然起不来"的资源，缺哪个就明确报出来。 */
     static const char *critical[] = {
-        "xml/activity/main.xml",    "xml/activity/player_activity.xml",   "xml/activity/live_player_activity.xml",
-        "xml/views/video_card.xml", "i18n/zh-Hans/wiliwili.json",         "i18n/en-US/wiliwili.json",
-        "font/switch_font.ttf",     "material/MaterialIcons-Regular.ttf", "ca-bundle.crt",
+        "xml/activity/main.xml",
+        "xml/activity/player_activity.xml",
+        "xml/activity/live_player_activity.xml",
+        "xml/views/video_card.xml",
+        "i18n/zh-Hans/wiliwili.json",
+        "i18n/en-US/wiliwili.json",
+        "font/switch_font.ttf",
+        "font/noto-sans-kr.ttf",
+        "font/noto-sans-arabic.ttf",
+        "font/noto-sans-thai.ttf",
+        "font/noto-sans-devanagari.ttf",
+        "font/noto-sans-myanmar.ttf",
+        "font/noto-sans-telugu.ttf",
+        "font/noto-sans-tamil.ttf",
+        "font/noto-sans-sinhala.ttf",
+        "font/noto-sans-hebrew.ttf",
+        "font/noto-sans-georgian.ttf",
+        "font/noto-sans-armenian.ttf",
+        "material/MaterialIcons-Regular.ttf",
+        "ca-bundle.crt",
     };
     int missing = 0;
     for (size_t i = 0; i < sizeof(critical) / sizeof(critical[0]); ++i) {
