@@ -305,3 +305,30 @@
 - `library/borealis/library/lib/platforms/desktop/desktop_font.cpp`：PS5 基础字体与 11 个 Noto fallback 注册。
 - `scripts/ps5/native/native_fs.c`：标题沙箱可用的文件读取通道。
 - `scripts/ps5/native/native_shims.c`：20 项关键资源自检。
+
+## 播放器 EOF 重播冻结（2026-10-10 晚，修复已提交 `24e7505`）
+
+**用户现象**：视频播完后自动重播，第二遍只有声音、画面定格在最后一帧 ✗。
+
+**根因（已用诊断日志逐段证实）**：EOF 后应用会 reopen + seek 回 0 重播，走的路径是
+`play_restart_after_seek()` → `play_wait_for_present_locked()`。该等待原先用
+`pthread_cond_timedwait()`，而 **clean-room libc 没有实现它**：回落实现把我们传入的
+`CLOCK_REALTIME` deadline 放在另一个时钟域比较，导致**永不超时**。只要 EOF 时仍有一帧在飞
+（实测日志 `eof park enter seek=0 present=1 paused=0`），解码 worker 就永久停在该等待里。
+
+**修复**：改为 `sceKernelUsleep()` 轮询同一 deadline（仓库其它地方的既有做法），睡眠期间
+释放 session mutex（渲染线程需要它来 retire 待等的那一帧）。
+
+**实测证据（干净构建 + 3:47 测试片）**
+```
+eof park enter present=1          ← 旧代码的死锁前提
+eof park leave  seek=1            ← 被正常唤醒
+present wait done stalled=0 present=0   ← 轮询干净返回
+seek reset target=-0.022 rc=0 reopen=1
+seek ready generation=1 ... awaiting true IDR
+第二遍 pts90k 3629998 → 3804002 → 3989998（画面推进 ✓）
+```
+
+**残余（未解，待接手）**：另一次 37 秒短视频的复现里，第二遍仍出现 `pts90k` 冻结
+（`presented` 仍增长、`eof=1`）。两次差异未定（片长/时序/是否走到同一等待分支），
+需用带诊断的构建继续（诊断代码已从提交中移除，见 handoff 的复现方法）。
