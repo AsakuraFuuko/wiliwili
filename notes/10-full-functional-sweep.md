@@ -317,3 +317,11 @@
 - 启动与部署健康：`agc health` 持续 `dcb_full=0 ring_fail=0 tex_fail=0`，无 options、无诊断注入。
 - 3:47 长片既有实机收据：`eof park leave` → `present wait done stalled=0` → `seek reset` → `seek ready`，第二遍 `pts90k` 持续推进。
 - 37 秒残余复现已定位到同类 EOF parking 等待；修复覆盖该路径，正式包已部署。
+
+**残余更新（2026-10-10 23:0x，结论修正）**：`888cce1` 把 4 处 `pthread_cond_wait` 全部改为轮询后，**短片/4:27 片仍会冻结** ✗。证据链：
+```
+22:42:58 mpv: end file → mpv: start file → demux EOF inputs=4799 outputs=4795
+22:42:59 seek requested target=0.000 reopen=1        ← 请求已发出
+（随后 2 分钟：presented/clock 持续增长，pts90k 冻结在 23965712，且没有任何 vdec 日志）
+```
+结合代码顺序（`play_logf("seek reset …")` 紧跟 `sceVideodec2Reset()` 之后）与 `play_now_us()` 为 CLOCK_MONOTONIC（超时逻辑可信）⇒ **卡点在 `sceVideodec2Reset()` 内部**（解码器仍有在飞工作时该 SDK 调用会阻塞；先前"诊断版通过一次"应是时序差异掩盖）。下一步方向：重放前先把解码流水线彻底排空（或避免在 EOF 场景重置解码器），并给该调用加可分段的诊断（进入/返回各一行）。
