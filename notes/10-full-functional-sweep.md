@@ -306,22 +306,17 @@
 - `scripts/ps5/native/native_fs.c`：标题沙箱可用的文件读取通道。
 - `scripts/ps5/native/native_shims.c`：20 项关键资源自检。
 
-## 播放器 EOF 重播冻结 — 已收口（2026-10-10）
+## 播放器 EOF 重播冻结 — 已收口（2026-10-11）
 
 **用户现象**：视频播完后自动重播，第二遍只有声音、画面定格在最后一帧。
 
-**根因与修复**：clean-room libc 的条件变量等待不能作为标题内永久等待原语。除 `play_wait_for_present_locked()` 的 timed wait 时钟域问题外，EOF parking、帧槽耗尽、暂停和备用源切换仍使用 `pthread_cond_wait()`；短片样本已经出现 `demux EOF` 与 `clock discontinuity target=0 reopen=1`，却没有 `seek reset`，卡点位于 EOF parking 的条件变量等待。现将四个永久等待点统一改为 `sceKernelUsleep(2000)` 轮询，睡眠时释放 session mutex；EOF parking 保留 restart 条件判断。播放器源文件已无 `pthread_cond_wait()`。
+**根因与修复**：
+- clean-room libc 的条件变量等待不能作为标题内永久等待原语；EOF parking、帧槽耗尽、暂停、备用源切换和 present wait 已统一使用 `sceKernelUsleep(2000)` 轮询，睡眠期间释放 session mutex。
+- 诊断版确认残余卡点在 `sceVideodec2Reset()`：`seek requested target=0.000 reopen=1` 后无返回日志。EOF 重播前先等待并回收仍被 AGC 借用的最后呈现帧（`present_pending`），然后重开媒体；EOF 路径跳过 `sceVideodec2Reset()`，依靠重开流中的参数集和 IDR 重建解码状态。普通用户 seek 仍保留 reset。
 
-**实机/构建证据**：
-- 正式 `PPSA99233` 干净包构建 marker：`Oct 10 2026 22:16:25`；启动 `res-check: critical=20 missing=0`。
-- 启动与部署健康：`agc health` 持续 `dcb_full=0 ring_fail=0 tex_fail=0`，无 options、无诊断注入。
-- 3:47 长片既有实机收据：`eof park leave` → `present wait done stalled=0` → `seek reset` → `seek ready`，第二遍 `pts90k` 持续推进。
-- 37 秒残余复现已定位到同类 EOF parking 等待；修复覆盖该路径，正式包已部署。
+**实机证据**：
+- 诊断构建 marker `Oct 10 2026 22:58:26`：`seek requested target=0.000 reopen=1` 后卡在 reset 之前/内部，确认了 reset 阻塞假设。
+- 修复构建 marker `Oct 11 2026 00:00:29`，`res-check: critical=20 missing=0`，`user mode=0`；启动与播放期间 `agc health` 持续 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`。
+- 修复后短片与 5:51 长片均在 EOF 后自动重播；截图 `/tmp/eof-short-fixed.png`、`/tmp/long-eof-fixed.png` 显示播放器仍有画面。日志中的 `demux EOF`、`clock discontinuity ... target=0 reopen=1` 后继续运行，第二遍 `presented`/`pts90k` 持续推进；无 `FALLBACK_A`、GPU fault 或 crash。
 
-**残余更新（2026-10-10 23:0x，结论修正）**：`888cce1` 把 4 处 `pthread_cond_wait` 全部改为轮询后，**短片/4:27 片仍会冻结** ✗。证据链：
-```
-22:42:58 mpv: end file → mpv: start file → demux EOF inputs=4799 outputs=4795
-22:42:59 seek requested target=0.000 reopen=1        ← 请求已发出
-（随后 2 分钟：presented/clock 持续增长，pts90k 冻结在 23965712，且没有任何 vdec 日志）
-```
-结合代码顺序（`play_logf("seek reset …")` 紧跟 `sceVideodec2Reset()` 之后）与 `play_now_us()` 为 CLOCK_MONOTONIC（超时逻辑可信）⇒ **卡点在 `sceVideodec2Reset()` 内部**（解码器仍有在飞工作时该 SDK 调用会阻塞；先前"诊断版通过一次"应是时序差异掩盖）。下一步方向：重放前先把解码流水线彻底排空（或避免在 EOF 场景重置解码器），并给该调用加可分段的诊断（进入/返回各一行）。
+**结论**：EOF 自动重播冻结已收口。保留 EOF AGC idle 排空与跳过 decoder reset 的“为什么”注释；一次性 reset 进入/返回诊断已清理。

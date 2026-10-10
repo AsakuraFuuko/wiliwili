@@ -2133,30 +2133,46 @@ static int play_wait_for_present_locked(VdecPlaySession *s) {
 }
 
 static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
-    double seconds = 0.0;
-    int reopen_media = 0;
+    double seconds         = 0.0;
+    int reopen_media       = 0;
+    int eof_replay         = 0;
     int64_t current_pts90k = INT64_MIN;
     pthread_mutex_lock(&s->mutex);
     const uint64_t request_generation = s->seek_request_generation;
-    s->seek_in_progress = 1;
-    seconds = s->seek_seconds;
-    reopen_media = s->source_eof || s->reopen_media;
+    s->seek_in_progress               = 1;
+    seconds                           = s->seek_seconds;
+    reopen_media                      = s->source_eof || s->reopen_media;
+    eof_replay                        = s->source_eof && seconds == 0.0;
     if (s->output_count > 0 || s->input_count > 0) current_pts90k = s->last_pts - s->timeline_origin_pts;
     const int64_t requested_target90k = (int64_t)llround(seconds * 90000.0);
     if (current_pts90k != INT64_MIN && requested_target90k < current_pts90k) reopen_media = 1;
-    s->reopen_media = 0;
-    const int present_stalled = play_wait_for_present_locked(s);
-    const int cancelled = play_stop_requested(s) || s->fallback;
+    s->reopen_media               = 0;
+    const int present_stalled     = eof_replay ? 0 : play_wait_for_present_locked(s);
+    const int eof_present_pending = eof_replay && s->present_pending;
+    const int cancelled           = play_stop_requested(s) || s->fallback;
     pthread_mutex_unlock(&s->mutex);
     if (cancelled) return -1;
-    if (present_stalled) {
+    if (eof_present_pending) {
+        /* EOF keeps drawing the last slot while mpv restarts its audio clock. Drain that
+         * borrowed AGC frame before reopening and reusing the decoder slots. */
+        play_logf("vdec-play: EOF replay waiting for AGC idle before slot reset");
+        evo_agc_runtime_wait_idle(VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS);
+        pthread_mutex_lock(&s->mutex);
+        if (!play_stop_requested(s) && !s->fallback && s->present_pending) {
+            s->present_pending          = 0;
+            s->present_pending_since_us = 0;
+            ++s->retired_count;
+            pthread_cond_broadcast(&s->condition);
+        }
+        pthread_mutex_unlock(&s->mutex);
+    } else if (present_stalled) {
         /* A scrub/seek can leave the borrowed AGC frame without its retire callback.
          * Wait for the GPU fence before reclaiming it; never reset a slot still in flight. */
         play_logf("vdec-play: seek present wait timeout; waiting for AGC idle");
         evo_agc_runtime_wait_idle(VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS);
         pthread_mutex_lock(&s->mutex);
         if (!play_stop_requested(s) && !s->fallback && s->present_pending) {
-            s->present_pending = 0;
+            s->present_pending          = 0;
             s->present_pending_since_us = 0;
             ++s->retired_count;
             pthread_cond_broadcast(&s->condition);
@@ -2170,13 +2186,18 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     pthread_mutex_unlock(&s->mutex);
     if (superseded_before_reset) return 0;
 
-
-
-    int32_t rc = sceVideodec2Reset(s->decoder.decoder);
-    play_logf("vdec-play: seek reset target=%.3f rc=%d reopen=%d", seconds, rc, reopen_media);
-    if (rc != 0) {
-        play_fail(s, "seek-reset", rc);
-        return -1;
+    if (!eof_replay) {
+        const int32_t rc = sceVideodec2Reset(s->decoder.decoder);
+        play_logf("vdec-play: seek reset target=%.3f rc=%d reopen=%d", seconds, rc, reopen_media);
+        if (rc != 0) {
+            play_fail(s, "seek-reset", rc);
+            return -1;
+        }
+    } else {
+        /* At EOF the decode call has already drained the stream. Firmware can deadlock
+         * Reset while its completed EOF work is still retiring; a reopened stream starts
+         * with parameter sets and an IDR, so the decoder can rebuild state without Reset. */
+        play_logf("vdec-play: EOF replay skips decoder reset; reopen=1");
     }
     if (reopen_media) {
         /* EOF or a backward seek can leave the HTTP/MP4 AVIO demuxer in a stale
@@ -2196,9 +2217,10 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
         play_logf("vdec-play: replay media reopened codec=%u size=%dx%d flush_each_decode=%d", media->codec,
                   media->stream->codecpar->width, media->stream->codecpar->height, s->flush_each_decode);
     }
+    int32_t rc              = 0;
     const int64_t target90k = (int64_t)llround(seconds * 90000.0);
-    const int64_t target = av_rescale_q(target90k, (AVRational){1, 90000}, media->time_base);
-    int sequential_seek = target90k > 0;
+    const int64_t target    = av_rescale_q(target90k, (AVRational){1, 90000}, media->time_base);
+    int sequential_seek     = target90k > 0;
     if (!reopen_media || target90k != 0) {
         rc = avformat_seek_file(media->format, media->stream->index, INT64_MIN, target, target, 0);
         if (rc < 0) {
