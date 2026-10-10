@@ -2107,19 +2107,17 @@ static void play_wait_if_paused(VdecPlaySession *s) {
 static int play_wait_for_present_locked(VdecPlaySession *s) {
     const uint64_t deadline_us = play_now_us() + (uint64_t)VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS * 1000u;
     while (s->present_pending && !play_stop_requested(s) && !s->fallback) {
-        uint64_t now_us = play_now_us();
-        if (now_us >= deadline_us) return 1;
-        uint64_t wait_us = deadline_us - now_us;
-        if (wait_us > 50000) wait_us = 50000;
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += (time_t)(wait_us / 1000000u);
-        deadline.tv_nsec += (long)((wait_us % 1000000u) * 1000u);
-        if (deadline.tv_nsec >= 1000000000L) {
-            ++deadline.tv_sec;
-            deadline.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&s->condition, &s->mutex, &deadline);
+        if (play_now_us() >= deadline_us) return 1;
+        /* Poll instead of pthread_cond_timedwait(). The clean-room libc ships no working
+         * implementation: our CLOCK_REALTIME deadline is compared against another clock
+         * domain downstream, so the wait never expires. Replaying a finished file
+         * (EOF -> reopen -> seek 0) therefore parked the decode worker forever with the
+         * last frame frozen on screen while only the audio restarted. The mutex must be
+         * dropped around the sleep - the render thread retires the frame we wait for and
+         * needs the lock to do so. */
+        pthread_mutex_unlock(&s->mutex);
+        sceKernelUsleep(2000);
+        pthread_mutex_lock(&s->mutex);
     }
     return s->present_pending ? 1 : 0;
 }
