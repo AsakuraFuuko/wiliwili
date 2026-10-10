@@ -217,3 +217,13 @@
 - `superseded=3` ⇒ 修复的"被更新请求中断→重试"路径真实触发并被正确处理 ✓
 - **`FALLBACK_A`=0、`GPU_FAULT`=0、`crash`=0、eboot 存活** ✓（原 3/3 崩溃场景不再复现）
 - 证据：`/tmp/autonav-udp.log`、`/tmp/final-udp.log`；自动导航脚本 `tools/seek-autonav.py`（用 `vdec-play: presented` 作为开播判定）
+
+## 长时间稳定性（2026-10-10 修复）
+
+组合压力（`tools/soak-autonav.py`：随机 seek / 弹幕开关 / 暂停 / OSD / 进出播放器）曾稳定在 22–30 分钟静默死亡，内核日志 `0xa0d0c005 (GPU_FAULT_PAGE_FAULT_ASYNC)`。
+
+根因：纹理延迟回收被 gate 在 AGC fence 探测上，而"已准备未提交"的帧槽带有永不满足的期望值 ⇒ 回收从不执行 ⇒ nanovg direct 池（128MB）填满 ⇒ 分配器回落 `malloc`（CPU 指针给 GPU）⇒ 页错误。
+
+修复（borealis `234d1105` + 根仓 `d876cd7`）：按帧龄回收（viewport/flush tick，≈4 帧）；池满改为返回 NULL + 日志（跳过绘制，不再崩溃）；drain 返回成功与否供调用方重试；vdec 停止路径重试式排空后再释放帧池。
+
+验证（marker `Oct 10 2026 08:41:16`）：35 轮 / 31 分钟压力**存活**、0 回退 / 0 GPU 故障、`direct_mem` 平台化 93MB（6 次回落、0 次池耗尽）、内核日志 0 故障。判据：长跑时看 `direct_mem` 是否单调爬升（爬升＝回收失效）。
