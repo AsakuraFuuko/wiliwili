@@ -306,22 +306,25 @@
 - `scripts/ps5/native/native_fs.c`：标题沙箱可用的文件读取通道。
 - `scripts/ps5/native/native_shims.c`：20 项关键资源自检。
 
-## 播放器 EOF 重播冻结 — 已收口（2026-10-11）
+## 播放器 EOF 收尾 — 与 mpv 一致（2026-10-11）
 
-**用户现象**：视频播完后自动重播，第二遍只有声音、画面定格在最后一帧。
+**用户现象**：C 路在 `demux EOF` 后自行 `seek target=0.000 reopen=1`；第二遍画面可能停在最后一帧而音频继续。
 
 **根因与修复**：
-- clean-room libc 的条件变量等待不能作为标题内永久等待原语；EOF parking、帧槽耗尽、暂停、备用源切换和 present wait 使用 `sceKernelUsleep(2000)` 轮询，睡眠期间释放 session mutex。
-- 诊断版确认 `seek requested target=0.000 reopen=1` 后，worker 可在 EOF 停车轮询出口和重启入口之间被同步路径卡住；最终 EOF parking 改为完全无锁轮询，原子读取 `stop_requested`、`fallback`、`seek_requested`，避免无界依赖 `s->mutex`。
-- EOF 重播前继续等待并回收 `present_pending` 的 AGC 帧，重开媒体后跳过 decoder reset；普通用户 seek 仍保留 reset。
+- 上游 mpv 明确设置 `loop-file=no`；`MPV_EVENT_END_FILE` 只停止当前文件，不自动重播。
+- C 路此前在 EOF 分支伪造 `seek_seconds=0`、`reopen_media=1` 和 `seek_requested=1`，使 native 路径与 A 路语义不一致。
+- 现在 EOF 只标记 `source_eof`，无锁轮询等待显式 seek 或 stop；最后已呈现帧保持在屏幕上。显式 seek 仍进入原有重开/Reset 路径；时钟回退在 `source_eof` 时不再触发隐式 seek。
 
 **代码证据**：
-- `native_vdec_play.c`：EOF parking 解锁后只用原子状态和 `sceKernelUsleep(2000)`；EOF 路径跳过 `sceVideodec2Reset()` 的注释保留。
-- 一次性 `restart` 入口/返回、EOF parking、暂停入口/出口诊断已清理。
+- `scripts/ps5/native/native_vdec_play.c`：删除 EOF 自动 seek/reopen 与 `stress_eof_count`；EOF worker 释放 mutex 后用原子 `stop_requested/fallback/seek_requested` + `sceKernelUsleep(2000)` parking，显式 seek 才调用 `play_restart_after_seek()`。
+- 保留 AGC 帧退休和 stop/join 路径；未改变 A 路 mpv 配置或普通用户 seek。
 
-**实机证据**：
-- 修复前独立复验（marker `Oct 11 2026 00:00:29`）：`demux EOF` → `clock discontinuity ... seek requested target=0.000 reopen=1` 后 46 秒无 vdec 新日志，`pts90k` 冻结而 `presented` 增长；该证据否定“只卡 reset 内”的旧结论。
-- 修复版构建完成并重新部署为 `PPSA99233`；构建 marker 从 `eboot.bin` 读取后用于部署校验。启动要求 `res-check: critical=20 missing=0`、`user mode=0`，运行健康判据为 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`。
-- 历史修复样本 `/tmp/eof-short-fixed.png`、`/tmp/long-eof-fixed.png` 与 `/tmp/eof-fixed.log` 保留为此前版本的参考；本轮新的两种时长 EOF 复测尚未取得完整 EOF 日志/截图，因此不将“本轮两片 PASS”写入验收表。
+**修复前证据**：
+- `/tmp/eof-repro.log`：既有标题在非本轮媒体操作后仍出现 `presented` 停在 6105、`dcb_full=0 ring_fail=0 tex_fail=0`；此前独立记录 `/tmp/...` 的修复前窗口已证实 EOF 后时钟回退触发自动 seek。
+- `/tmp/eof-before.png`：真机交互截图，说明复现会话实际落在动态页，未作为 C 路 EOF 验收截图使用。
 
-**结论**：代码已针对新定位的无锁 EOF parking 卡点修复并通过本地构建；真机最终包的两种时长验收仍待完成，当前不能宣称硬性验收已通过。
+**本轮验证状态**：
+- ✅ 本地 `build-native.sh` 成功，289 个应用 TU 均未重新编译且原生运行时/`native_vdec_play.c` 重新编译，正式产物仍为 `PPSA99233`。
+- ❌ 真机尚未验证：主机 FTP `2120` 未恢复；`test-cycle.sh` 与 `wait-and-run.sh` 均因缺少/无法启动 `zftpd_v1.5.0.elf` 停止，未替换主机包。因此短片 EOF、手动 seek、选集、退出、AGC health 和截图验收均保持未验证，不标 PASS。
+
+**结论**：代码实现已切换为“播完停在最后一帧”；真机验收待主机 FTP 载荷恢复后执行，不能以本地构建代替。

@@ -216,7 +216,7 @@ typedef struct {
     uint64_t last_clock_input_us;
     int clock_prediction_valid;
     int video_color_trc;
-    int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen, stress_eof_count;
+    int timeline_origin_set, awaiting_idr, sps_seen, pps_seen, vps_seen;
     double last_logged_speed;
     uint64_t input_count, accepted_count, output_count, presented_count, retired_count, sequence;
     uint64_t start_wall_us, first_present_us;
@@ -2153,9 +2153,9 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     pthread_mutex_unlock(&s->mutex);
     if (cancelled) return -1;
     if (eof_present_pending) {
-        /* EOF keeps drawing the last slot while mpv restarts its audio clock. Drain that
-         * borrowed AGC frame before reopening and reusing the decoder slots. */
-        play_logf("vdec-play: EOF replay waiting for AGC idle before slot reset");
+        /* An explicit seek from the parked EOF frame still needs the borrowed AGC frame
+         * retired before reopening and reusing decoder slots. */
+        play_logf("vdec-play: EOF seek waiting for AGC idle before slot reset");
         evo_agc_runtime_wait_idle(VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS);
         pthread_mutex_lock(&s->mutex);
         if (!play_stop_requested(s) && !s->fallback && s->present_pending) {
@@ -2194,10 +2194,9 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
             return -1;
         }
     } else {
-        /* At EOF the decode call has already drained the stream. Firmware can deadlock
-         * Reset while its completed EOF work is still retiring; a reopened stream starts
-         * with parameter sets and an IDR, so the decoder can rebuild state without Reset. */
-        play_logf("vdec-play: EOF replay skips decoder reset; reopen=1");
+        /* An explicit seek to zero after EOF may reopen the stream, but it is not an
+         * automatic replay; ordinary seeks still reset the decoder as before. */
+        play_logf("vdec-play: explicit EOF seek skips decoder reset; reopen=1");
     }
     if (reopen_media) {
         /* EOF or a backward seek can leave the HTTP/MP4 AVIO demuxer in a stale
@@ -2380,32 +2379,29 @@ static void *play_thread_main(void *opaque) {
                       (unsigned long long)inputs, (unsigned long long)accepted, (unsigned long long)outputs,
                       s->pending_limit, s->peak_pending_count, (unsigned long long)s->error_count,
                       (unsigned long long)s->order_error_count);
-            if (play_gate_value("WILIWILI_VDEC_STRESS") && s->stress_eof_count < 5) {
-                ++s->stress_eof_count;
-                s->seek_seconds = 0.0;
-                s->reopen_media = 1;
-                s->seek_requested = 1;
-                ++s->seek_request_generation;
-                play_logf("m5-stress: eof=%d/5", s->stress_eof_count);
-            }
+            /* Match mpv's loop-file=no behavior: EOF parks on the last decoded frame.
+             * Keep the worker alive so an explicit user seek or a new episode can reuse
+             * the session, but never synthesize a seek back to zero here. */
+            play_logf("vdec-play: EOF parked final frame; waiting for explicit seek or stop");
             pthread_mutex_unlock(&s->mutex);
-            int eof_restart = 0;
+            int eof_action = 0;
             for (;;) {
                 const int parked_stop     = play_stop_requested(s);
                 const int parked_fallback = __atomic_load_n(&s->fallback, __ATOMIC_ACQUIRE);
                 const int parked_seek     = __atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE);
                 if (parked_stop || parked_fallback || parked_seek) {
-                    eof_restart = !parked_stop && !parked_fallback && parked_seek;
+                    eof_action = parked_seek && !parked_stop && !parked_fallback;
                     break;
                 }
                 sceKernelUsleep(2000);
             }
-            if (!eof_restart) {
+            play_logf("vdec-play: EOF parking released action=%s", eof_action ? "seek" : "stop");
+            if (!eof_action) {
                 result = -1;
                 break;
             }
-            const int eof_restart_rc = play_restart_after_seek(s, &media);
-            if (eof_restart_rc < 0) {
+            const int eof_seek_rc = play_restart_after_seek(s, &media);
+            if (eof_seek_rc < 0) {
                 result = -1;
                 break;
             }
@@ -2449,7 +2445,6 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->seek_generation = 0;
     s->seek_request_generation = 0;
     s->seek_in_progress = 0;
-    s->stress_eof_count = 0;
     s->pending_count = 0;
     s->peak_pending_count = 0;
     s->last_output_pts = INT64_MIN;
@@ -2771,8 +2766,9 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     }
     /* mpv may reload its separate audio file at EOF and reset playback-time; restart the
      * native timeline instead of leaving the decoder blocked behind stale READY frames. */
-    if (s->last_clock_pts != INT64_MIN && llabs(clock_pts90k - s->last_clock_pts) > VDEC_PLAY_CLOCK_JUMP_90K &&
-        !s->seek_requested && !s->seek_in_progress) {
+    if (!s->source_eof && s->last_clock_pts != INT64_MIN &&
+        llabs(clock_pts90k - s->last_clock_pts) > VDEC_PLAY_CLOCK_JUMP_90K && !s->seek_requested &&
+        !s->seek_in_progress) {
         const int64_t previous_clock = s->last_clock_pts;
         s->seek_seconds = playback_time;
         if (clock_pts90k < previous_clock && clock_pts90k <= VDEC_PLAY_CLOCK_JUMP_90K)
