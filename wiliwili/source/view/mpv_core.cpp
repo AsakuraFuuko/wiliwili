@@ -992,7 +992,9 @@ void MPVCore::setFrameSize(brls::Rect r) {
 #ifdef PS5_NATIVE_APP
     /* Fullscreen keeps a 1920x1080 SW surface; WILIWILI_SW_SIZE=800x450 remains
      * an explicit fallback for low-memory or diagnostic runs. Small-player rects
-     * still scale their surface down, so the detail-page 60 FPS path is unchanged. */
+     * still scale their surface down, so the detail-page 60 FPS path is unchanged.
+     * If the direct-memory pool cannot hold the requested size, setFrameSize
+     * below steps it down rather than leaving the player without a surface. */
     int maxSwWidth  = 1920;
     int maxSwHeight = 1080;
     const char *requestedSwSize = std::getenv("WILIWILI_SW_SIZE");
@@ -1020,17 +1022,44 @@ void MPVCore::setFrameSize(brls::Rect r) {
 
     if (pixels != nullptr && nvg_image != 0 && sw_size[0] == drawWidth && sw_size[1] == drawHeight) return;
 
-    if (nvg_image != 0) {
-        nvgDeleteImage(vg, nvg_image);
-        nvg_image = 0;
+    /* Build the replacement before releasing the current surface. Deleting
+     * first meant a failed nvgCreateImageRGBA left nvg_image == 0, and NanoVG
+     * paints image 0 as its 1x1 white fallback: the whole video rect then turns
+     * flat white, which is the "fullscreen is blank" report. The direct-memory
+     * pool is shared with every UI texture, so under pressure step the surface
+     * down (same aspect) instead of losing the picture; if nothing fits, keep
+     * the previous surface and let draw() scale it into the new rect. */
+    void *oldPixels    = pixels;
+    const int oldImage = nvg_image;
+    for (int attempt = 0;; ++attempt) {
+        const size_t frameSize = static_cast<size_t>(drawWidth) * static_cast<size_t>(drawHeight);
+        void *newPixels        = nullptr;
+        int newImage           = 0;
+        if (posix_memalign(&newPixels, 64, frameSize * PIXCEL_SIZE) == 0)
+            newImage = nvgCreateImageRGBA(vg, drawWidth, drawHeight, mpvImageFlags, nullptr);
+        if (newPixels != nullptr && newImage != 0) {
+            if (oldImage != 0) nvgDeleteImage(vg, oldImage);
+            free(oldPixels);
+            pixels             = newPixels;
+            nvg_image          = newImage;
+            mpv_params[3].data = pixels;
+            break;
+        }
+        free(newPixels);
+        if (attempt >= 2 || drawWidth <= 640 || drawHeight <= 360) {
+            pixels             = oldPixels;
+            nvg_image          = oldImage;
+            mpv_params[3].data = oldPixels;
+            if (pixels == nullptr) return;
+            char line[192];
+            std::snprintf(line, sizeof(line), "mpv-sw: surface allocate failed -> keep %dx%d for %dx%d", sw_size[0],
+                          sw_size[1], drawWidth, drawHeight);
+            wiliwili_boot_log(line);
+            return;
+        }
+        drawWidth  = std::max(640, drawWidth / 2);
+        drawHeight = std::max(360, drawHeight / 2);
     }
-    free(pixels);
-    pixels             = nullptr;
-    mpv_params[3].data = nullptr;
-    size_t frameSize   = (size_t)drawWidth * (size_t)drawHeight;
-    if (posix_memalign(&pixels, 64, frameSize * PIXCEL_SIZE) != 0) pixels = nullptr;
-    if (pixels == nullptr) return;
-    mpv_params[3].data = pixels;
 #else
     int drawWidth  = rect.getWidth();
     int drawHeight = rect.getHeight();
@@ -1051,9 +1080,9 @@ void MPVCore::setFrameSize(brls::Rect r) {
 
 #ifndef PS5_NATIVE_APP
     if (nvg_image) nvgDeleteImage(vg, nvg_image);
-#endif
     /* 创建时不带数据：数据每帧由 nvgUpdateImage 上传，避免把未初始化缓冲交给驱动。 */
     nvg_image = nvgCreateImageRGBA(vg, drawWidth, drawHeight, mpvImageFlags, nullptr);
+#endif
     /* 检查点：SW 视频面与渲染上下文就绪。ctx 为 NULL 时后面 mpv 渲染会在 mpv 内部
      * 对 NULL+0x70 取字段后跳 0（真机 addr=0x70/rip=0x0，见 notes/06 §10.8）。 */
     {
@@ -1145,7 +1174,7 @@ void MPVCore::draw(brls::Rect area, float alpha) {
      * RGBA 纹理。全屏时为当前物理窗口尺寸，通常是 1920x1080。 */
     if (this->redraw) {
         this->redraw = false;
-        nvgUpdateImage(vg, nvg_image, (const unsigned char *)pixels);
+        if (nvg_image != 0) nvgUpdateImage(vg, nvg_image, (const unsigned char *)pixels);
     }
 
     // draw black background
@@ -1155,6 +1184,11 @@ void MPVCore::draw(brls::Rect area, float alpha) {
     nvgFillColor(vg, bg);
     nvgRect(vg, rect.getMinX(), rect.getMinY(), rect.getWidth(), rect.getHeight());
     nvgFill(vg);
+
+    /* Image id 0 is NanoVG's 1x1 white fallback; painting it floods the whole
+     * video rect with white. Only reachable when no SW surface could be
+     * allocated, and the black background above is the honest picture then. */
+    if (nvg_image == 0) return;
 
     // draw video
     nvgBeginPath(vg);

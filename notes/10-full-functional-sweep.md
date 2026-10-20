@@ -363,3 +363,33 @@
 - **口径偏差**：手头没有 ≤60s 的横屏历史样本；两个 ≤60s 样本均为 1080x1920 竖屏，被 auto-gate 送 A。故使用 89.97s 横屏样本完整自然播放，全程未快进。
 
 **未验证**：`22:18:51` 构建新增的“原生 `END_OF_FILE` 停止自动连播”尚无真机通过证据——随后两次打开同一 90s 样本都在 demux 首包处 `FALLBACK_A reason=stream-count-mismatch rc=-9019`（22:10:44、22:24:00），native 路径未跑到 EOF。该行为按代码审查应只影响片尾分支；需要再跑一次 `auto-gate=pass` 的横屏短片确认片尾无 `mpv: start file` 且显示重播按钮。
+
+## 全屏空白（A 路 SW 视频面纹理创建失败）修复（2026-10-20）
+
+**用户现象**：`BV1kK4y167e6`（那些逆天的外卖聊天记录，1080×1440 / 3:4，13s）小窗有画面，切全屏后视频区域整片浅灰（不是黑屏）；同一会话里其它 16:9 片源全屏正常。
+
+**定位（真机日志与截图）**
+- 全屏瞬间：`mpv-sw: surface=0 ctx=… 1920x1080 display=1280x720`。`surface=0` 即 `nvgCreateImageRGBA()` 失败；小窗同一条日志是 `surface=473 800x450`。
+- `nvg_image==0` 时 `MPVCore::draw()` 仍以 image 0 作 paint，NanoVG 把未知 id 解析成内置 1×1 白纹理，整个视频矩形被白色填满（叠加 OSD 后就是用户看到的浅灰），所以“空白”不是黑屏而是白面。
+- 该片源 `auto-gate=A reason=size=1080x1440`（native 能力门上界 1920×1080），全屏走的是 **A 路 mpv SW 面**，与 C 路解码无关；`stop summary inputs=0` 也印证 native 未启动。
+- 失败分支判定：同一进程启动时曾成功创建 1920×1080 面（`surface=105`），说明 `evo_agc_build_tsharp_rgba8()` 的尺寸/pitch/对齐校验对 1920×1080 可通过，且 `posix_memalign` 已成功（`ptr` 非空）。失败时刻健康行 `direct_mem=121,166,592/134,217,728`（空闲约 13.05MB），请求 `7936×1080+255 = 8,571,135` 字节 ⇒ 是 `evo_direct_mem_alloc()` 在 128MB 池里找不到 8.5MB **连续**块（UI 封面纹理长会话后占 ~120MB），不是 descriptor 校验失败。
+- 池耗尽的静默性：`evo_boot_log()` 在原生构建里是空实现（`EVO_APP_MODULE` 未定义），所以旧的 `direct pool exhausted` 从未出现在标题日志里；`evo_agc_diag` 用 printf 才能进日志。
+
+**修复**
+- `library/borealis/.../agc/evo_direct_mem.h`：池 128MB → 256MB（真机 direct memory 12GiB，仍是有界预留）；`evo_direct_mem.c` 的降级档位补 192MB。
+- `evo_direct_mem.c`：拒绝分配时打印 `EVO direct_mem: exhausted request=… largest_free=… used=…`（含最大连续空闲，区分“没空间”和“没连续块”）。
+- `nanovg_agc.cpp`：`createTexture()` 的 alloc / upload 失败各打一行 `EVO tex: …`，不再让调用方只看到 `surface=0`。
+- `mpv_core.cpp`（PS5 native SW 面）：**先建新面再释放旧面**；创建失败按同宽高比 1/2 降档重试（最多两次），仍失败则保留旧面继续缩放显示；`draw()` 在 `nvg_image==0` 时只画黑底，绝不再拿白纹理铺满视频矩形。
+
+**真机证据（最终构建 marker `Oct 20 2026 23:16:46`，`PPSA99233`）**
+- A 路样本 `BV1kK4y167e6`：`auto-gate=A reason=size=1080x1440`。
+  - 小窗：`/tmp/fs/final-small.png`，视频画面正常（页面可见 `BV1kK4y167e6`）。
+  - 全屏：`/tmp/fs/final-full.png`，1080×1440 画面按 Fit 居中（左右黑边），时间 `00:10/00:12`；日志 `mpv-sw: surface=137 … 1920x1080 display=1280x720`（创建成功，非 0）。
+  - 播完：`/tmp/fs/final-eof1.png`、`/tmp/fs/final-eof2.png`（间隔 7s）均停在 `00:12/00:12` 最后一帧并显示重播按钮；期间无 `mpv: start file`、无 `seek requested target=0.000`。
+- C 路回归（`BV1yuVa6YERm`，1280×720，`auto-gate=pass`）：`/tmp/fs/f-c-small.png`、`/tmp/fs/f-c-full.png` 两态均有画面；全屏日志 `rect logical=0,0 1280x720 physical=0,0 1920x1080 scale=1.500 mode=0`，`presented` 持续增长、`dropped=0 errors=0 order_errors=0`，无 `FALLBACK_A`。
+- C 路 EOF 回归（同一 720p 样本完整播完，构建 `23:16:46` 之前一版逻辑相同）：`demux EOF inputs=2700 outputs=2696` 后 `pts90k=clock90k=8097002` 冻结、`presented` 继续增长、`advanced=2700` 不再前进；`/tmp/fs/c-eof1.png`、`/tmp/fs/c-eof2.png` 均 `01:30/01:30`；无 `mpv: start file`、无自动 seek。
+- AGC health 全程 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`，`direct_mem` 峰值 `127,574,528/268,435,456`；无 crash、无 `GPU_FAULT`；整轮无 `EVO tex` / `EVO direct_mem: exhausted`。
+
+**未验证**
+- 降档/保留旧面的兜底分支未在真机触发（池扩到 256MB 后 1920×1080 面一次创建成功）；该路径仅经代码审查，若日后仍出现纹理创建失败，日志会打出 `mpv-sw: surface allocate failed -> keep …` 或 `EVO tex: …`。
+- `BV1kK4y167e6` 本身是 A 路（`auto-gate=A`），其 `native-loading: FALLBACK_A before first frame` 是 native 能力门按尺寸判定的预期结果，不是故障回退；C 路样本无 `FALLBACK_A`。
