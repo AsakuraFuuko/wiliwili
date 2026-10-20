@@ -2743,6 +2743,13 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
         if (elapsed_us > 250000) elapsed_us = 250000;
         clock_pts90k = raw_clock_pts90k + (int64_t)llround((double)elapsed_us * speed * 90000.0 / 1000000.0);
     }
+    /* mpv keeps reporting time after END_OF_FILE (keep-open) while this decoder is parked
+     * on the last frame. Clamp the native timeline to the last decoded frame so the draw
+     * clock cannot run past the frozen picture; an explicit seek lifts the clamp. */
+    if (s->source_eof && !s->seek_requested && !s->seek_in_progress && s->last_output_pts != INT64_MIN &&
+        clock_pts90k > s->last_output_pts) {
+        clock_pts90k = s->last_output_pts;
+    }
     if (s->trace_au && (s->last_logged_speed < 0.0 || fabs(s->last_logged_speed - speed) > 0.0001)) {
         play_logf("vdec-play: clock playback=%.3f speed=%.3f paused=%d", playback_time, speed, paused != 0);
         s->last_logged_speed = speed;

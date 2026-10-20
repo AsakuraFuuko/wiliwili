@@ -326,6 +326,14 @@ void BasePlayerActivity::setCommonData() {
                 break;
             }
             case MpvEventEnum::END_OF_FILE:
+#if defined(PS5_NATIVE_APP)
+                /* The native decoder parks on the last frame at EOF and mpv carries no
+                 * video track. Advancing to the next part/recommendation (or looping)
+                 * reloads mpv and restarts audio while that frame stays frozen, so the
+                 * native title always stops here and offers the replay button instead. */
+                APP_E->fire(VideoView::REPLAY, nullptr);
+                break;
+#endif
                 // 尝试自动加载下一分集
                 // 如果当前最顶层是Dialog就放弃自动播放，因为有可能是用户点开了收藏或者投币对话框
                 {

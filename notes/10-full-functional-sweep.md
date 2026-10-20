@@ -343,3 +343,23 @@
 
 **环境记录**：主机待机后 payload 全掉时，可用 Payload Manager 的接口自行拉起：
 `curl "http://<host>:8084/loadpayload:/data/pldmgr/payloads/zftpd/zftpd_v1.6.0.elf"`（冒号分隔路径；websrv 同理）。
+
+## 播完音频重播/进度续走修复（2026-10-20）
+
+**用户现象**：C 路 EOF 后画面停在最后一帧，但 mpv 立即重新加载同一视频的备份源，音频从头播放、进度时间从 0 增长。
+
+**根因**：`VideoView::setBackupUrl()` 把每条视频备份 URL 以 `loadfile ... append` 写进 mpv 播放列表。`loop-file=no` 只禁止单文件循环；文件自然结束后 mpv 仍会前进到播放列表的下一条（同一视频的另一个 CDN 源），于是 `mpv: end file reason=0` 后紧接 `mpv: start file` / `audio active`，而 C 解码器已 `source_eof` 停在最后一帧。证据 `/tmp/eof-v5.log`（20:41:59、20:52:00、20:53:31）。
+
+**修复**：
+- `wiliwili/source/view/video_view.cpp`：native 会话（`native_vdec_mpv_suppressed`）只把备份 URL 交给 C 解码器（`wiliwili_vdec_play_add_backup_url`），不再 append 到 mpv 播放列表；A 路保持原样。
+- `scripts/ps5/native/native_vdec_play.c`：EOF 停车（无 pending seek）时把绘制时钟夹到 `last_output_pts`，`clock90k` 不再越过最后一帧。
+- `wiliwili/source/activity/player_base_activity.cpp`：PS5 原生标题的 `END_OF_FILE` 不再执行 LOOP/NEXT/RCMD 自动连播，只显示重播按钮；否则播放列表修复后 RCMD 仍会在片尾加载推荐视频（22:12:15 观测到 `stop summary` → 22:12:16 `native-loading: start`）。
+
+**真机证据（构建 `Oct 20 2026 21:21:21`，含前两项修复）**：`/tmp/eof-fix.log`
+- 1280x720 横屏、`auto-gate=pass`；从历史自动回到 0 起播（未用 L1/R1）；21:39:11 `demux EOF` → `EOF parked final frame`。
+- 之后 >3 分钟只有 `presented` 增长，`pts90k` / `clock90k` 冻结在 `8097002`（89.97s）；无 `mpv: start file`、无 `audio active`、无 `FALLBACK_A` / crash。
+- 截图 `/tmp/p1-osd.png`、`/tmp/p2-osd.png`（间隔 6s）均为 `01:30/01:30`，画面为最后一帧。
+- 手动暂停/恢复 `/tmp/f2-fs-pause.png`、`/tmp/f3-fs-pause.png`（暂停 4s 后仍 `01:15/01:15`）、`/tmp/g1-resume.png`（恢复后 `01:16`）；退出播放器 `stop summary inputs=397 ... errors=0`；再次打开其它视频正常（`/tmp/h1-other.png`，竖屏样本干净 `FALLBACK_A before first frame`）；AGC health 三项 0，无 crash。
+- **口径偏差**：手头没有 ≤60s 的横屏历史样本；两个 ≤60s 样本均为 1080x1920 竖屏，被 auto-gate 送 A。故使用 89.97s 横屏样本完整自然播放，全程未快进。
+
+**未验证**：`22:18:51` 构建新增的“原生 `END_OF_FILE` 停止自动连播”尚无真机通过证据——随后两次打开同一 90s 样本都在 demux 首包处 `FALLBACK_A reason=stream-count-mismatch rc=-9019`（22:10:44、22:24:00），native 路径未跑到 EOF。该行为按代码审查应只影响片尾分支；需要再跑一次 `auto-gate=pass` 的横屏短片确认片尾无 `mpv: start file` 且显示重播按钮。

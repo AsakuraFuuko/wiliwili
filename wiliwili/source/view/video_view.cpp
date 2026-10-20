@@ -1028,11 +1028,17 @@ void VideoView::setBackupUrl(const std::string& url, int start, int end, const s
 }
 
 void VideoView::setBackupUrl(const std::string& url, int start, int end, const std::vector<std::string>& audios) {
-    std::string extra = genExtraUrlParam(start, end, audios);
 #if defined(PS5_NATIVE_APP)
     if (wiliwili_vdec_play_enabled()) wiliwili_vdec_play_add_backup_url(url.c_str());
-    if (this->native_vdec_mpv_suppressed) extra += ",vid=no";
+    if (this->native_vdec_mpv_suppressed) {
+        /* mpv only carries audio on the native route. Appending the backup URL to its
+         * playlist makes mpv advance to that entry when the file ends: audio restarts
+         * from 0 and playback-time runs again while the native decoder stays parked on
+         * the last frame. The C decoder already owns this backup URL, so stop here. */
+        return;
+    }
 #endif
+    std::string extra = genExtraUrlParam(start, end, audios);
     mpvCore->setBackupUrl(url, extra);
 }
 
