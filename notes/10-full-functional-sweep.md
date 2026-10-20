@@ -328,3 +328,18 @@
 - ❌ 真机尚未验证：主机 FTP `2120` 未恢复；`test-cycle.sh` 与 `wait-and-run.sh` 均因缺少/无法启动 `zftpd_v1.5.0.elf` 停止，未替换主机包。因此短片 EOF、手动 seek、选集、退出、AGC health 和截图验收均保持未验证，不标 PASS。
 
 **结论**：代码实现已切换为“播完停在最后一帧”；真机验收待主机 FTP 载荷恢复后执行，不能以本地构建代替。
+
+### ✅ 方案 A 真机验收通过（2026-10-11 20:45，构建 marker `Oct 11 2026 22:22:26` = `62eb5a2`）
+
+**验证场景**：C 路径视频（`auto-gate=pass` 1920x1080）从历史打开，正常播放到结尾（未快进）。
+| 检查项 | 结果 |
+|---|---|
+| `demux EOF` | `inputs=1985 outputs=1981` ✓ |
+| **自动重播 seek（`seek requested target=0.000`）** | **0 次** ✓✓（旧版必有，即"会再播一遍"的根源）|
+| 画面 | `pts90k` 冻结 16746002（≈片尾）、`presented` 继续增长 = **定格最后一帧** ✓，且维持 ≥2.5 分钟不自动重播 ✓ |
+| 故障 | `FALLBACK_A`/`GPU_FAULT`/`crash` 均 0 ✓ |
+
+**观察（非原 bug，待定性）**：播完停在最后一帧后，按 L1 快退会记录 `seek requested target=174.527`，但停车中的 worker 未响应（无 `seek reset`/`seek ready`，画面仍定格）。上游 mpv 播完即停止、seek 同样不恢复（需重新播放），因此这可能与上游语义一致；如需"播完可快退续播"再另行处理。
+
+**环境记录**：主机待机后 payload 全掉时，可用 Payload Manager 的接口自行拉起：
+`curl "http://<host>:8084/loadpayload:/data/pldmgr/payloads/zftpd/zftpd_v1.6.0.elf"`（冒号分隔路径；websrv 同理）。
