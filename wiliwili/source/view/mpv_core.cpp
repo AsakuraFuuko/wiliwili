@@ -7,6 +7,20 @@ extern "C" void wiliwili_boot_log(const char *);
 extern "C" void wiliwili_vdec_play_pause(int paused);
 extern "C" void wiliwili_vdec_play_stop(void);
 extern "C" int wiliwili_vdec_play_seek(double seconds);
+/* App-owned audio path (scripts/ps5/native/native_audio.c). mpv keeps video,
+ * subtitles and the timeline; only its audio output is disabled. */
+extern "C" int wiliwili_audio_available(void);
+extern "C" void wiliwili_audio_stop(void);
+extern "C" void wiliwili_audio_pause(int paused);
+extern "C" int wiliwili_audio_seek(double seconds);
+extern "C" void wiliwili_audio_set_volume(int volume);
+extern "C" void wiliwili_audio_set_speed(double speed);
+extern "C" int wiliwili_audio_is_active(void);
+extern "C" int wiliwili_audio_take_failure(void);
+extern "C" double wiliwili_audio_clock(void);
+extern "C" void wiliwili_audio_observe(double mpv_time, double speed, int paused, int seeking);
+extern "C" int wiliwili_audio_switch_track(int index);
+extern "C" void wiliwili_audio_summary(void);
 #endif
 //
 
@@ -631,9 +645,13 @@ void MPVCore::init() {
 #endif
 
 #if defined(PS5_NATIVE_APP)
-    /* 原生线唯一的音频后端就是 SDL（libmpv 里编进了 audio_out_sdl；真机表现为
-     * 音轨短暂出现后 `a=-`/`ao=` 空 ⇒ 默认 AO 选择没起来）。显式指定，避免 auto 选空。 */
-    mpvSetOptionString(mpv, "ao", "sdl");
+    /* 原生线的声音由应用自己的 FFmpeg + sceAudioOut 路径送出，mpv 只保留解复用、
+     * 视频/字幕和播放时间线，因此把它的音频输出挂到 null（音频仍照常解码、照常
+     * 推进 A/V 时钟）。音频设备探测失败时保留 sdl，声音继续由 mpv 负责。 */
+    const int native_audio_ok = wiliwili_audio_available();
+    mpvSetOptionString(mpv, "ao", native_audio_ok ? "null" : "sdl");
+    wiliwili_boot_log(native_audio_ok ? "audio: mpv ao=null (app audio path owns output)"
+                                      : "audio: mpv ao=sdl (app audio path unavailable)");
 #endif
 
 #if defined(PS5_NATIVE_APP)
@@ -684,6 +702,9 @@ void MPVCore::init() {
     check_error(mpvObserveProperty(mpv, 21, "hue", MPV_FORMAT_DOUBLE));
 #if defined(PS5_NATIVE_APP)
     check_error(mpvObserveProperty(mpv, 22, "audio-pts", MPV_FORMAT_DOUBLE));
+    /* aid 是界面上「切音轨」的既有语义；应用音频路径按同样的序号切 URL/流。
+     * mpv 自己仍然是静音解码，序号变化只用来驱动我们的解复用器。 */
+    check_error(mpvObserveProperty(mpv, 23, "aid", MPV_FORMAT_INT64));
 #endif
 
     // init renderer params
@@ -1319,6 +1340,17 @@ void MPVCore::eventMainLoop() {
             } break;
             case MPV_EVENT_FILE_LOADED: {
                 brls::Logger::info("========> MPV_EVENT_FILE_LOADED");
+#if defined(PS5_NATIVE_APP)
+                /* 备用链接由 mpv 播放列表自动接管时，应用音频路径还停在旧文件上。
+                 * 此时把输出交还 mpv（声音从新条目当前位置继续），避免两路声音或静音。 */
+                if (wiliwili_audio_is_active() && !nativeAudioSource.empty()) {
+                    std::string loaded = mpvPropertyText(this->mpv, "path");
+                    if (!loaded.empty() && loaded != nativeAudioSource) {
+                        wiliwili_audio_stop();
+                        this->fallbackToMpvAudio("playlist-advance");
+                    }
+                }
+#endif
                 /* 启动/健康检查点（原生线专用）：mpv 的日志在本平台被关闭，播放状态只能靠
                  * 这两条事件落到启动日志里判断"流到底有没有加载、有没有真的开播"。 */
                 wiliwili_boot_log("mpv: file loaded");
@@ -1397,6 +1429,10 @@ void MPVCore::eventMainLoop() {
                     snprintf(line, sizeof(line), "mpv: end file reason=%d error=%d", end ? end->reason : -1,
                              end ? end->error : 0);
                     wiliwili_boot_log(line);
+#if defined(PS5_NATIVE_APP)
+                    /* 文件结束（正常播完或出错）都不该再往端口送样本。 */
+                    wiliwili_audio_pause(1);
+#endif
                 }
                 mpvCoreEvent.fire(MpvEventEnum::MPV_STOP);
                 video_stopped = true;
@@ -1430,6 +1466,11 @@ void MPVCore::eventMainLoop() {
                         break;
                     case 2:
                         if (data) video_eof = *(int *)data;
+#if defined(PS5_NATIVE_APP)
+                        /* 原生音频和 mpv 在同一条媒体时间线上到达文件尾。画面停在
+                         * 最后一帧时端口必须已经静音，否则会漏出解码缓冲里的尾音。 */
+                        if (video_eof && !video_stopped) wiliwili_audio_pause(1);
+#endif
                         // 当视频播放自然结束时会先触发一次 EOF，如果这时 stop 或者设置了新的播放文件，会触发 STOP 然后再触发一次 EOF
                         // 避免多次触发 EOF，将第二种情况排除在外
                         if (video_eof && !video_stopped) {
@@ -1450,6 +1491,11 @@ void MPVCore::eventMainLoop() {
                         // 播放进度更新
                         if (((mpv_event_property *)event->data)->data) {
                             playback_time = *(double *)((mpv_event_property *)event->data)->data;
+#if defined(PS5_NATIVE_APP)
+                            playback_time_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                   .count();
+#endif
                             if (video_progress != (int64_t)playback_time) {
                                 video_progress = (int64_t)playback_time;
                                 mpvCoreEvent.fire(MpvEventEnum::UPDATE_PROGRESS);
@@ -1519,8 +1565,19 @@ void MPVCore::eventMainLoop() {
                     case 10:
                         // 倍速信息
                         if (data) {
-                            video_speed = *(double *)data;
-                            mpvCoreEvent.fire(VIDEO_SPEED_CHANGE);
+                            const double observed = *(double *)data;
+#if defined(PS5_NATIVE_APP)
+                            /* 实测值是用户倍速乘上原生音频的漂移校正；界面和进度
+                             * 预测只应看到用户倍速。校正 <=1% 时两者几乎相等，但
+                             * 仍要还原，否则速度标签会显示 1.003x。 */
+                            const double user = observed / (1.0 + this->audio_sync_correction);
+#else
+                            const double user = observed;
+#endif
+                            if (std::fabs(user - video_speed) > 1e-4) {
+                                video_speed = user;
+                                mpvCoreEvent.fire(VIDEO_SPEED_CHANGE);
+                            }
                         }
                         break;
                     case 11:
@@ -1589,6 +1646,12 @@ void MPVCore::eventMainLoop() {
                     case 22:
                         if (data) audio_pts = *(double *)data;
                         break;
+                    case 23:
+                        if (data && wiliwili_audio_is_active()) {
+                            const int64_t aid = *(int64_t *)data;
+                            if (aid > 0) wiliwili_audio_switch_track((int)(aid - 1));
+                        }
+                        break;
 #endif
                     default:
                         break;
@@ -1618,6 +1681,12 @@ void MPVCore::reset() {
     this->video_progress = 0;
     this->mpv_error_code = 0;
     this->video_eof      = false;
+#if defined(PS5_NATIVE_APP)
+    this->playback_time_us       = 0;
+    this->audio_sync_last_us     = 0;
+    this->audio_sync_drift_ms    = 0.0;
+    this->audio_sync_correction  = 0.0;
+#endif
     this->video_aspect   = aspectConverter(MPVCore::VIDEO_ASPECT);
 
     // 软硬解切换后应该手动设置一次渲染尺寸
@@ -1643,11 +1712,17 @@ void MPVCore::setVolume(int64_t value) {
     if (value < 0 || value > 100) return;
     command_async("set", "volume", value);
     MPVCore::VIDEO_VOLUME = (int)value;
+#if defined(PS5_NATIVE_APP)
+    wiliwili_audio_set_volume((int)value);
+#endif
 }
 
 void MPVCore::setVolume(const std::string &value) {
     command_async("set", "volume", value);
     MPVCore::VIDEO_VOLUME = std::stoi(value);
+#if defined(PS5_NATIVE_APP)
+    wiliwili_audio_set_volume(MPVCore::VIDEO_VOLUME);
+#endif
 }
 
 int64_t MPVCore::getVolume() const { return this->volume; }
@@ -1656,6 +1731,7 @@ void MPVCore::resume() {
     command_async("set", "pause", "no");
 #if defined(PS5_NATIVE_APP)
     wiliwili_vdec_play_pause(0);
+    wiliwili_audio_pause(0);
 #endif
 }
 
@@ -1663,6 +1739,7 @@ void MPVCore::pause() {
     command_async("set", "pause", "yes");
 #if defined(PS5_NATIVE_APP)
     wiliwili_vdec_play_pause(1);
+    wiliwili_audio_pause(1);
 #endif
 }
 
@@ -1670,6 +1747,11 @@ void MPVCore::stop() {
     command_async("stop");
 #if defined(PS5_NATIVE_APP)
     wiliwili_vdec_play_stop();
+    /* 退出播放器/切集：先打印漂移收据，再同步静音并释放音频端口。 */
+    wiliwili_audio_summary();
+    wiliwili_audio_stop();
+    audio_sync_correction = 0.0;
+    audio_sync_last_us    = 0;
 #endif
 }
 
@@ -1677,6 +1759,7 @@ void MPVCore::seek(int64_t p) {
     command_async("seek", p, "absolute");
 #if defined(PS5_NATIVE_APP)
     wiliwili_vdec_play_seek((double)p);
+    wiliwili_audio_seek((double)p);
 #endif
 }
 
@@ -1685,7 +1768,10 @@ void MPVCore::seek(const std::string &p) {
 #if defined(PS5_NATIVE_APP)
     char *end = nullptr;
     const double seconds = std::strtod(p.c_str(), &end);
-    if (end != p.c_str() && end != nullptr && *end == '\0') wiliwili_vdec_play_seek(seconds);
+    if (end != p.c_str() && end != nullptr && *end == '\0') {
+        wiliwili_vdec_play_seek(seconds);
+        wiliwili_audio_seek(seconds);
+    }
 #endif
 }
 
@@ -1693,13 +1779,17 @@ void MPVCore::seekRelative(int64_t p) {
     command_async("seek", p, "relative");
 #if defined(PS5_NATIVE_APP)
     wiliwili_vdec_play_seek(playback_time + (double)p);
+    wiliwili_audio_seek(playback_time + (double)p);
 #endif
 }
 
 void MPVCore::seekPercent(double p) {
     command_async("seek", p * 100, "absolute-percent");
 #if defined(PS5_NATIVE_APP)
-    if (duration > 0) wiliwili_vdec_play_seek((double)duration * p);
+    if (duration > 0) {
+        wiliwili_vdec_play_seek((double)duration * p);
+        wiliwili_audio_seek((double)duration * p);
+    }
 #endif
 }
 
@@ -1713,7 +1803,93 @@ double MPVCore::getSpeed() const { return video_speed; }
 
 void MPVCore::setSpeed(double value) {
     if (video_speed != value) command_async("set", "speed", value);
+#if defined(PS5_NATIVE_APP)
+    /* 用户改了倍速：漂移校正归零，避免把旧校正乘进新速度。 */
+    audio_sync_correction = 0.0;
+    wiliwili_audio_set_speed(value);
+#endif
 }
+
+#if defined(PS5_NATIVE_APP)
+void MPVCore::fallbackToMpvAudio(const char *reason) {
+    if (mpv_audio_fallback) return;
+    mpv_audio_fallback    = true;
+    audio_sync_correction = 0.0;
+    char line[192];
+    std::snprintf(line, sizeof(line), "audio: FALLBACK_MPV_AO reason=%s", reason != nullptr ? reason : "?");
+    wiliwili_boot_log(line);
+    /* 原生路径已静音/释放端口；把 AO 换回 sdl 并重开，mpv 的音频链就在当前
+     * 播放位置继续出声，播放不中断。 */
+    command_async("set", "ao", "sdl");
+    command_async("ao-reload");
+}
+
+void MPVCore::updateNativeAudioSync() {
+    if (!wiliwili_audio_is_active()) return;
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    const double clock = wiliwili_audio_clock();
+    const bool paused  = video_paused || video_eof;
+    const double speed = video_speed > 0.0 ? video_speed : 1.0;
+    /* mpv 的 playback-time 属性按 ~100 ms 粒度更新；拿旧值直接比较会把更新
+     * 间隔当成漂移（真机上表现为 ±40 ms 抖动）。用挂钟外推到“现在”。 */
+    double mpv_now = playback_time;
+    if (playback_time_us != 0 && now > playback_time_us) {
+        uint64_t elapsed_us = now - playback_time_us;
+        if (elapsed_us > 500000) elapsed_us = 500000;
+        mpv_now += (double)elapsed_us * 1e-6 * speed * (1.0 + audio_sync_correction);
+    }
+    if (duration > 0 && mpv_now > (double)duration) mpv_now = (double)duration;
+    wiliwili_audio_observe(mpv_now, speed, paused ? 1 : 0, video_seeking ? 1 : 0);
+    if (clock < 0.0 || playback_time <= 0.0 || paused || video_seeking) {
+        this->audio_sync_drift_ms = 0.0;
+        if (audio_sync_correction != 0.0) {
+            audio_sync_correction = 0.0;
+            command_async("set", "speed", fmt::format("{:.6f}", speed));
+        }
+        return;
+    }
+    /* 2.5 Hz is plenty: the loop is first order and the audible error is what
+     * matters, not the property update cadence. */
+    if (audio_sync_last_us != 0 && now - audio_sync_last_us < 400000) return;
+    audio_sync_last_us = now;
+    const double drift_raw = clock - mpv_now;  // > 0: the sound is ahead of mpv
+    /* 一阶低通压住测量噪声；跳变（seek/切集）直接采用新值。 */
+    if (std::fabs(drift_raw - this->audio_sync_drift_ms * 0.001) > 0.2)
+        this->audio_sync_drift_ms = drift_raw * 1000.0;
+    else
+        this->audio_sync_drift_ms = this->audio_sync_drift_ms * 0.6 + drift_raw * 1000.0 * 0.4;
+    const double drift     = this->audio_sync_drift_ms * 0.001;
+    const double magnitude = std::fabs(drift);
+    double target          = 0.0;
+    if (magnitude > 0.020) {
+        /* Tiered gain: after a seek the audio path needs a few hundred ms to
+         * reopen/refill, so a 1% nudge would take half a minute to converge.
+         * Large offsets close at up to 8% for a few seconds, then the loop
+         * falls back to the inaudible 0.5% band. */
+        double limit = 0.005;
+        if (magnitude > 0.15) limit = 0.080;
+        else if (magnitude > 0.05) limit = 0.020;
+        double gain = (magnitude - 0.010) * 0.5;
+        if (gain > limit) gain = limit;
+        target = drift > 0.0 ? gain : -gain;
+    }
+    const double next = audio_sync_correction * 0.5 + target * 0.5;
+    if (std::fabs(next - audio_sync_correction) < 0.0004) return;
+    audio_sync_correction = next;
+    const double applied  = speed * (1.0 + audio_sync_correction);
+    command_async("set", "speed", fmt::format("{:.6f}", applied));
+    static uint64_t last_log_us = 0;
+    if (last_log_us == 0 || now - last_log_us >= 2000000) {
+        last_log_us = now;
+        char line[192];
+        std::snprintf(line, sizeof(line), "audio: sync drift_ms=%.1f correction=%.4f speed=%.4f",
+                      this->audio_sync_drift_ms, audio_sync_correction, applied);
+        wiliwili_boot_log(line);
+    }
+}
+#endif
 
 void MPVCore::setAspect(const std::string &value) {
     MPVCore::VIDEO_ASPECT = value;

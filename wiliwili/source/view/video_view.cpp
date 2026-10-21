@@ -51,6 +51,18 @@ extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int p
                                         int view_h, int view_mode, double audio_pts);
 extern "C" void wiliwili_vdec_play_restore_ui_state(void);
 extern "C" void wiliwili_boot_log(const char *message);
+/* App-owned audio path: FFmpeg decode + sceAudioOut, clock master for A/V sync. */
+extern "C" int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count,
+                                    double start_seconds);
+extern "C" void wiliwili_audio_stop(void);
+extern "C" void wiliwili_audio_pause(int paused);
+extern "C" void wiliwili_audio_set_volume(int volume);
+extern "C" void wiliwili_audio_set_speed(double speed);
+extern "C" int wiliwili_audio_is_active(void);
+extern "C" int wiliwili_audio_take_failure(void);
+extern "C" int wiliwili_audio_track_count(void);
+extern "C" int wiliwili_audio_switch_track(int index);
+extern "C" void wiliwili_audio_summary(void);
 #endif
 
 enum ClickState { IDLE = 0, PRESS = 1, FAST_RELEASE = 3, FAST_PRESS = 4, CLICK_DOUBLE = 5 };
@@ -720,6 +732,51 @@ void VideoView::runNativeVdecStress() {
 #endif
 }
 
+void VideoView::runNativeAudioAutotest() {
+#if defined(PS5_NATIVE_APP)
+    /* 真机取证钩子：固定节奏跑一遍 seek / 暂停恢复 / 切音轨，日志里留下
+     * audio-test:* 与漂移收据（WILIWILI_AUDIO_AUTOTEST=1 时启用）。 */
+    if (std::getenv("WILIWILI_AUDIO_AUTOTEST") == nullptr) return;
+    if (!this->native_vdec_play_owner || !wiliwili_audio_is_active()) return;
+    const uint64_t now = brls::getCPUTimeUsec();
+    if (this->native_audio_autotest_start_us == 0) this->native_audio_autotest_start_us = now;
+    const uint64_t elapsed_ms = (now - this->native_audio_autotest_start_us) / 1000;
+    if (this->native_audio_autotest_stage == 0 && elapsed_ms >= 6000) {
+        this->native_audio_autotest_stage = 1;
+        wiliwili_boot_log("audio-test: seek target=20");
+        mpvCore->seek(20);
+    } else if (this->native_audio_autotest_stage == 1 && elapsed_ms >= 10500) {
+        this->native_audio_autotest_stage = 2;
+        wiliwili_boot_log("audio-test: pause");
+        mpvCore->pause();
+    } else if (this->native_audio_autotest_stage == 2 && elapsed_ms >= 13500) {
+        this->native_audio_autotest_stage = 3;
+        wiliwili_boot_log("audio-test: resume");
+        mpvCore->resume();
+    } else if (this->native_audio_autotest_stage == 3 && elapsed_ms >= 17500) {
+        this->native_audio_autotest_stage = 4;
+        wiliwili_boot_log("audio-test: seek target=5");
+        mpvCore->seek(5);
+    } else if (this->native_audio_autotest_stage == 4 && elapsed_ms >= 21500) {
+        this->native_audio_autotest_stage = 5;
+        const int tracks = wiliwili_audio_track_count();
+        char line[128];
+        if (tracks > 1) {
+            std::snprintf(line, sizeof(line), "audio-test: switch-track %d/%d", 1, tracks);
+            wiliwili_boot_log(line);
+            wiliwili_audio_switch_track(1);
+        } else {
+            std::snprintf(line, sizeof(line), "audio-test: switch-track skipped tracks=%d", tracks);
+            wiliwili_boot_log(line);
+        }
+    } else if (this->native_audio_autotest_stage == 5 && elapsed_ms >= 27500) {
+        this->native_audio_autotest_stage = 6;
+        wiliwili_boot_log("audio-test: summary");
+        wiliwili_audio_summary();
+    }
+#endif
+}
+
 VideoView::~VideoView() {
     brls::Logger::debug("trying delete VideoView...");
 #if defined(PS5_NATIVE_APP)
@@ -767,6 +824,14 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     // VideoView is the normal video layer: native NV12 first, NanoVG OSD/danmaku after it.
     bool nativeVideo = false;
 #if defined(PS5_NATIVE_APP)
+    /* 原生音频运行中失败（解复用/解码/端口）：接回 mpv 的音频输出，播放不中断。 */
+    if (wiliwili_audio_take_failure()) {
+        wiliwili_audio_stop();
+        mpvCore->fallbackToMpvAudio("runtime-failure");
+    }
+    /* 音频主时钟 -> mpv speed 漂移校正；内部按 400 ms 节流。 */
+    mpvCore->updateNativeAudioSync();
+    runNativeAudioAutotest();
     runNativeVdecAutotest();
     runNativeVdecStress();
     if (this->native_vdec_mpv_suppressed && !wiliwili_vdec_play_is_active()) {
@@ -1074,6 +1139,33 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::ve
         this->native_vdec_mpv_suppressed = true;
         wiliwili_boot_log("mpv: set vid=no");
     }
+    /* 声音不再由 mpv 输出：起播时把音频 URL 交给应用自己的解码/输出路径。
+     * DASH 用独立的音频轨；非 DASH（单文件/FLV）则由该模块从同一 URL 里选
+     * 音轨。EDL 拼接没有稳定时间线，直接留在 mpv 音频。 */
+    const bool audioCandidate = url.rfind("edl://", 0) != 0;
+    int audioStarted         = 0;
+    if (audioCandidate) {
+        std::vector<std::string> audioSources = audios;
+        if (audioOverride != nullptr && audioOverride[0] != '\0') audioSources.assign(1, audioOverride);
+        std::vector<const char*> audioPtrs;
+        audioPtrs.reserve(audioSources.size());
+        for (const auto& item : audioSources) audioPtrs.push_back(item.c_str());
+        audioStarted = wiliwili_audio_start(url.c_str(), audioPtrs.empty() ? nullptr : audioPtrs.data(),
+                                            (int)audioPtrs.size(), (double)start);
+        if (audioStarted) {
+            wiliwili_audio_set_volume(MPVCore::VIDEO_VOLUME);
+            wiliwili_audio_set_speed(1.0);
+            /* 等 mpv 的 FILE_LOADED / resume 再出声，避免画面还没起来先放声音。 */
+            wiliwili_audio_pause(1);
+        } else {
+            mpvCore->fallbackToMpvAudio("start-rejected");
+        }
+    } else {
+        mpvCore->fallbackToMpvAudio("edl-url");
+    }
+#endif
+#if defined(PS5_NATIVE_APP)
+    mpvCore->nativeAudioSource = audioStarted ? url : std::string();
 #endif
     mpvCore->setUrl(url, extra);
 }

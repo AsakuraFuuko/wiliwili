@@ -219,6 +219,23 @@ public:
      */
     void setSpeed(double value);
 
+#if defined(PS5_NATIVE_APP)
+    /**
+     * 原生音频主时钟的漂移校正。
+     *
+     * mpv 的音频输出被禁用（ao=null），声音由应用自己的 FFmpeg + sceAudioOut
+     * 路径送出；这里用「音频时钟 - mpv playback_time」的差值微调 mpv 的 speed，
+     * 让 A 路视频（以及 C 路使用的 playback_time）持续跟随音频主时钟。
+     */
+    void updateNativeAudioSync();
+
+    /**
+     * 新音频路径初始化/运行失败时把 mpv 的音频输出接回来，播放不中断。
+     * 调用前原生音频已被停止，mpv 的音频链仍在当前位置静音解码。
+     */
+    void fallbackToMpvAudio(const char *reason);
+#endif
+
     void showOsdText(const std::string &value, int duration = 2000);
 
     /**
@@ -337,6 +354,18 @@ public:
     float video_aspect     = -1;
     double playback_time   = 0;
     double audio_pts = -1.0;
+#if defined(PS5_NATIVE_APP)
+    // 原生音频主时钟校正量（mpv speed 的乘数偏移）与节流时间戳
+    double audio_sync_correction = 0.0;
+    double audio_sync_drift_ms   = 0.0;
+    uint64_t audio_sync_last_us  = 0;
+    // playback-time 属性到达的挂钟时刻：用它外推 mpv 的当前播放位置，
+    // 否则属性更新间隔（~100 ms）会被当成音画漂移。
+    uint64_t playback_time_us    = 0;
+    bool mpv_audio_fallback      = false;
+    // 应用音频路径当前打开的主链接；mpv 播放列表切到别的条目时用于检测
+    std::string nativeAudioSource;
+#endif
     double percent_pos     = 0;
     int64_t video_progress = 0;
     int mpv_error_code     = 0;

@@ -236,7 +236,7 @@ def compile_runtime_objects(root: Path, toolchain: Path, sdk: Path, wrapper: Pat
     feature_defines = tuple(d for d in NATIVE_DEFINES
                             if d.startswith("-DWILIWILI_") or d in
                             ("-DPS5_NATIVE_APP", "-DPS5_NATIVE_AGC", "-DBOREALIS_USE_AGC", "-DEVO_TARGET_PS5"))
-    extra_sources = ["native_shims.c", "native_fs.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c", "native_vdec_play.c"]
+    extra_sources = ["native_shims.c", "native_fs.c", "native_libc_compat.c", "native_regex.c", "videodec2_probe.c", "native_vdec_play.c", "native_audio.c"]
     # native_libc_trace.c reports every string and memory call reached with a
     # NULL argument, which is how the software renderer's crash was identified.
     # It wraps hot libc entry points, so it is a diagnostic aid and stays out of
