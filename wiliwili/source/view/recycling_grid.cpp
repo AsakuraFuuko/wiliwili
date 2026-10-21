@@ -3,8 +3,10 @@
 //
 
 #include <utility>
+#include <cmath>
 #include "view/recycling_grid.hpp"
 #include "view/button_refresh.hpp"
+#include "utils/image_helper.hpp"
 
 /// RecyclingGridItem
 
@@ -138,6 +140,12 @@ RecyclingGrid::RecyclingGrid() {
 
 RecyclingGrid::~RecyclingGrid() {
     brls::Logger::debug("View RecyclingGridActivity: delete");
+#if defined(PS5_NATIVE_APP)
+    if (this->deferringLoads) {
+        this->deferringLoads = false;
+        ImageHelper::setLoadDeferSource(this, false);
+    }
+#endif
     if (this->hintImage) this->hintImage->freeView();
     this->hintImage = nullptr;
     if (this->hintLabel) this->hintLabel->freeView();
@@ -155,11 +163,25 @@ RecyclingGrid::~RecyclingGrid() {
     }
 }
 
+void RecyclingGrid::willDisappear(bool resetState) {
+#if defined(PS5_NATIVE_APP)
+    // A hidden grid stops drawing, so it can never reopen the gate itself.
+    if (this->deferringLoads) {
+        this->deferringLoads = false;
+        ImageHelper::setLoadDeferSource(this, false);
+    }
+#endif
+    ScrollingFrame::willDisappear(resetState);
+}
+
 void RecyclingGrid::draw(NVGcontext* vg, float x, float y, float width, float height, brls::Style style,
                          brls::FrameContext* ctx) {
     // 触摸或鼠标滑动时会导致屏幕元素位置变更
     // 简单地在draw函数中调用itemsRecyclingLoop 实现动态的增删元素
     // todo：只在滑动过程中调用 itemsRecyclingLoop 以节省静止时的计算消耗
+#if defined(PS5_NATIVE_APP)
+    updateScrollLoadGate();
+#endif
     itemsRecyclingLoop();
 
     ScrollingFrame::draw(vg, x, y, width, height, style, ctx);
@@ -179,6 +201,47 @@ void RecyclingGrid::registerCell(std::string identifier, std::function<Recycling
     queueMap.insert(std::make_pair(identifier, new std::vector<RecyclingGridItem*>()));
     allocationMap.insert(std::make_pair(identifier, allocation));
 }
+
+#if defined(PS5_NATIVE_APP)
+/// One D-pad step animates a single row; repeated steps keep the scroll moving
+/// without resting. Treating "has been moving for a while" as fast scrolling
+/// catches both held buttons and stick/touch drags without deferring a single
+/// step.
+static constexpr float FAST_SCROLL_CONTINUOUS_MS = 300.0f;
+/// Keep new loads paused briefly after the last movement so the cells the user
+/// actually stops on are the ones that get fetched.
+static constexpr auto FAST_SCROLL_HOLD = std::chrono::milliseconds(180);
+
+void RecyclingGrid::updateScrollLoadGate() {
+    const auto now     = std::chrono::steady_clock::now();
+    const float offset = this->getContentOffsetY();
+
+    if (this->lastScrollSample.time_since_epoch().count() == 0) {
+        this->lastScrollSample = now;
+        this->lastScrollOffset = offset;
+        return;
+    }
+
+    const float dt = std::chrono::duration<float>(now - this->lastScrollSample).count();
+    if (dt >= 0.5f) {
+        // Resumed after an idle gap; the jump is not user scrolling.
+        this->continuousScrollMs = 0;
+    } else if (std::fabs(offset - this->lastScrollOffset) > 0.5f) {
+        this->continuousScrollMs += dt * 1000.0f;
+    } else {
+        this->continuousScrollMs = 0;
+    }
+    this->lastScrollOffset = offset;
+    this->lastScrollSample = now;
+
+    if (this->continuousScrollMs >= FAST_SCROLL_CONTINUOUS_MS) this->fastScrollEnd = now + FAST_SCROLL_HOLD;
+
+    const bool defer = now < this->fastScrollEnd;
+    if (defer == this->deferringLoads) return;
+    this->deferringLoads = defer;
+    ImageHelper::setLoadDeferSource(this, defer);
+}
+#endif
 
 void RecyclingGrid::addCellAt(size_t index, bool downSide) {
     RecyclingGridItem* cell;
@@ -286,6 +349,19 @@ void RecyclingGrid::setDataSource(RecyclingGridDataSource* source) {
 
 void RecyclingGrid::reloadData() {
     if (!layouted) return;
+
+#if defined(PS5_NATIVE_APP)
+    // The offset jumps to the top; do not treat that as fast scrolling and do
+    // not leave the gate closed across a data reload.
+    this->lastScrollSample   = std::chrono::steady_clock::now();
+    this->lastScrollOffset   = 0;
+    this->continuousScrollMs = 0;
+    this->fastScrollEnd      = {};
+    if (this->deferringLoads) {
+        this->deferringLoads = false;
+        ImageHelper::setLoadDeferSource(this, false);
+    }
+#endif
 
     // 将所有节点从屏幕上移除放入重复利用的列表中
     auto &children = this->contentBox->getChildren();

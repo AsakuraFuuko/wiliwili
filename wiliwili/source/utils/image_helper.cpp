@@ -632,8 +632,17 @@ ImageHelper::~ImageHelper() { brls::Logger::verbose("delete ImageHelper {}", (si
 std::shared_ptr<ImageHelper> ImageHelper::with(brls::Image* view) {
     std::lock_guard<std::mutex> lock(requestMutex);
     std::shared_ptr<ImageHelper> item;
+    bool sameView = false;
 
-    if (!requestPool.empty() && (*requestPool.begin())->getImageView() == nullptr) {
+    auto existing = requestMap.find(view);
+    if (existing != requestMap.end() && (*existing->second)->getImageView() == view) {
+        // The same view asked for another image before the previous request
+        // finished (card rebound in place). Reuse that helper instead of
+        // creating a second one that would also write to this view.
+        item     = *existing->second;
+        sameView = true;
+        requestPool.splice(requestPool.end(), requestPool, item->currentIter);
+    } else if (!requestPool.empty() && (*requestPool.begin())->getImageView() == nullptr) {
         // 复用请求，挪到队尾
         item = *requestPool.begin();
         item->setImageView(view);
@@ -649,8 +658,9 @@ std::shared_ptr<ImageHelper> ImageHelper::with(brls::Image* view) {
     item->currentIter = iter;
     // 重置 "取消" 标记位
     item->isCancel = false;
-    // 禁止图片组件销毁
-    item->imageView->ptrLock();
+    item->deferred = false;
+    // 禁止图片组件销毁（同一个 view 复用已有 helper 时它已经被锁定）
+    if (!sameView) item->imageView->ptrLock();
     // 设置图片组件不处理纹理的销毁，由缓存统一管理纹理销毁
     item->imageView->setFreeTexture(false);
 
@@ -662,6 +672,8 @@ std::shared_ptr<ImageHelper> ImageHelper::with(brls::Image* view) {
 void ImageHelper::load(const std::string& url) {
     this->imageUrl       = bilibili::HTTP::VERIFY.verify ? url : pystring::replace(url, "https", "http", 1);
     this->decodeAttempts = 0;
+    // Invalidate anything still in flight for the previous URL.
+    const unsigned generation = ++this->imageGeneration;
 
 #ifdef BOREALIS_USE_GXM
     std::vector<std::string> urls = pystring::rsplit(this->imageUrl, "@", 1);
@@ -680,23 +692,34 @@ void ImageHelper::load(const std::string& url) {
     int tex = brls::TextureCache::instance().getCache(this->imageUrl);
     if (tex > 0) {
         brls::Logger::verbose("cache hit: {}", this->imageUrl);
-        this->imageView->innerSetImage(tex);
+        this->bindImage(tex);
         this->clean();
         return;
     }
+
+    // While a grid is scrolling fast, remember the URL and wait. The grid opens
+    // the gate when it settles, then flushDeferred() fetches what is still on
+    // screen. Deferring here (rather than in the network pool) also stops the
+    // decode/upload queues from being fed work no one will see.
+    if (loadsDeferred()) {
+        this->deferred = true;
+        return;
+    }
+    this->deferred = false;
 
     //todo: 可能会发生同时请求多个重复链接的情况，此种情况下最好合并为一个请求
 
     // 缓存网络图片
     brls::Logger::verbose("request Image 1: {} {}", this->imageUrl, this->isCancel.load());
-    ImageThreadPool::instance().Submit([this]() {
+    ImageThreadPool::instance().Submit([this, generation]() {
         brls::Logger::verbose("Submit view: {} {} {} {}", (size_t)this->imageView, (size_t)this, this->imageUrl,
                               this->isCancel.load());
+        if (this->imageGeneration != generation) return;
         if (this->isCancel) {
             this->clean();
             return;
         }
-        this->requestImage();
+        this->requestImage(generation);
     });
 }
 
@@ -801,14 +824,16 @@ private:
 };
 #endif
 
-void ImageHelper::requestImage() {
+void ImageHelper::requestImage(unsigned generation) {
     brls::Logger::verbose("request Image 2: {} {}", this->imageUrl, this->isCancel.load());
 #if defined(PS5_NATIVE_APP)
     ImageRequestRunner::instance().enqueue(
-        this->imageUrl, [this] { return this->isCancel.load(); },
-        [this](cpr::Response response) {
-            ImageThreadPool::instance().Submit(
-                [this, response = std::move(response)]() mutable { this->handleImageResponse(std::move(response)); });
+        this->imageUrl,
+        [this, generation] { return this->isCancel.load() || this->imageGeneration.load() != generation; },
+        [this, generation](cpr::Response response) {
+            ImageThreadPool::instance().Submit([this, generation, response = std::move(response)]() mutable {
+                this->handleImageResponse(std::move(response), generation);
+            });
         });
 #else
     cpr::Session session;
@@ -824,13 +849,17 @@ void ImageHelper::requestImage() {
     session.SetProxies(bilibili::HTTP::PROXIES);
     session.SetUrl(cpr::Url{this->imageUrl});
     session.SetProgressCallback(cpr::ProgressCallback([this](...) -> bool { return !this->isCancel; }));
-    this->handleImageResponse(session.Get());
+    this->handleImageResponse(session.Get(), generation);
 #endif
 }
 
-void ImageHelper::handleImageResponse(cpr::Response r) {
+void ImageHelper::handleImageResponse(cpr::Response r, unsigned generation) {
+    // A newer load took over this helper (the cell was rebound or recycled):
+    // drop this response without touching the view or the pool entry.
+    if (this->imageGeneration.load() != generation) return;
+
     // 图片请求失败或取消请求
-    if (r.status_code != 200 || r.downloaded_bytes == 0 || this->isCancel) {
+    if (r.status_code != 200 || r.downloaded_bytes == 0 || this->isCancel || !this->imageView) {
         brls::Logger::verbose("request undone: {} {} {} {}", r.status_code, r.downloaded_bytes, this->isCancel.load(),
                               r.url.str());
         this->clean();
@@ -875,9 +904,9 @@ void ImageHelper::handleImageResponse(cpr::Response r) {
         std::snprintf(message, sizeof(message), "img-decode: bytes=%zu size=%dx%d reason=%s try=%u", imageBytes, imageW,
                       imageH, reason ? reason : "unknown", this->decodeAttempts + 1);
         wiliwili_boot_log(message);
-        if (!this->isCancel && this->decodeAttempts < MAX_IMAGE_RETRIES) {
+        if (!this->isCancel && this->imageGeneration.load() == generation && this->decodeAttempts < MAX_IMAGE_RETRIES) {
             ++this->decodeAttempts;
-            this->requestImage();
+            this->requestImage(generation);
             return;
         }
     }
@@ -917,68 +946,106 @@ void ImageHelper::handleImageResponse(cpr::Response r) {
 
     // Note grids are the bursty path; keep avatars and card covers responsive ahead of them.
     const bool priority = this->imageUrl.find("!note-comment-multiple") == std::string::npos;
-    const bool queued   = ImageUploadQueue::instance().enqueue(
-        [self = std::move(self), decoded = std::move(decoded)] {
-            if (self->isCancel) {
-                self->clean();
+    const std::string url = this->imageUrl;
+    const bool queued     = ImageUploadQueue::instance().enqueue(
+        [self = std::move(self), decoded = std::move(decoded), url, generation] {
+            if (self->isCancel || !self->imageView) {
+                self->cleanIfCurrent(generation);
                 return;
             }
-            int tex = brls::TextureCache::instance().getCache(self->imageUrl);
+            // The cell may have been rebound to another URL while this upload
+            // waited in the queue.
+            if (self->imageGeneration.load() != generation) return;
+
+            int tex = brls::TextureCache::instance().getCache(url);
             if (tex > 0) {
-                if (!self->isCancel && self->imageView) self->imageView->innerSetImage(tex);
+                if (!self->isCancel && self->imageView) self->bindImage(tex);
             } else {
                 NVGcontext* vg = brls::Application::getNVGContext();
                 if (decoded->data) {
                     tex = nvgCreateImageRGBA(vg, decoded->width, decoded->height, 0, decoded->data);
                 } else {
-                    brls::Logger::error("Failed to load image: {}", self->imageUrl);
+                    brls::Logger::error("Failed to load image: {}", url);
                 }
                 if (tex > 0) {
-                    brls::TextureCache::instance().addCache(self->imageUrl, tex);
+                    brls::TextureCache::instance().addCache(url, tex);
                     if (!self->isCancel && self->imageView) {
-                        brls::Logger::verbose("load image: {}", self->imageUrl);
-                        self->imageView->innerSetImage(tex);
+                        brls::Logger::verbose("load image: {}", url);
+                        self->bindImage(tex);
                     }
                 }
             }
-            self->clean();
+            self->cleanIfCurrent(generation);
         },
-        [this] { return this->isCancel.load(); }, priority);
-    if (!queued) this->clean();
+        [this, generation] { return this->isCancel.load() || this->imageGeneration.load() != generation; }, priority);
+    if (!queued) this->cleanIfCurrent(generation);
 #else
-    brls::sync([this, imageData, imageW, imageH, isWebp]() {
-        int tex = brls::TextureCache::instance().getCache(this->imageUrl);
-        if (tex > 0) {
-            if (this->imageView) this->imageView->innerSetImage(tex);
-        } else {
-            NVGcontext* vg = brls::Application::getNVGContext();
-            if (imageData) {
-                tex = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
-            } else {
-                brls::Logger::error("Failed to load image: {}", this->imageUrl);
+        brls::sync([this, imageData, imageW, imageH, isWebp, generation, url = this->imageUrl]() {
+            if (this->imageGeneration.load() != generation) {
+                if (imageData) freeImageData(imageData, isWebp);
+                return;
             }
+            int tex = brls::TextureCache::instance().getCache(url);
             if (tex > 0) {
-                brls::TextureCache::instance().addCache(this->imageUrl, tex);
-                if (!this->isCancel && this->imageView) {
-                    brls::Logger::verbose("load image: {}", this->imageUrl);
-                    this->imageView->innerSetImage(tex);
+                if (this->imageView) this->bindImage(tex);
+            } else {
+                NVGcontext* vg = brls::Application::getNVGContext();
+                if (imageData) {
+                    tex = nvgCreateImageRGBA(vg, imageW, imageH, 0, imageData);
+                } else {
+                    brls::Logger::error("Failed to load image: {}", url);
+                }
+                if (tex > 0) {
+                    brls::TextureCache::instance().addCache(url, tex);
+                    if (!this->isCancel && this->imageView) {
+                        brls::Logger::verbose("load image: {}", url);
+                        this->bindImage(tex);
+                    }
                 }
             }
-        }
-        if (imageData) freeImageData(imageData, isWebp);
-        this->clean();
-    });
+            if (imageData) freeImageData(imageData, isWebp);
+            this->clean();
+        });
 #endif
+}
+
+void ImageHelper::bindImage(int tex) {
+    if (!this->imageView || tex <= 0) return;
+    // The view may still hold a reference to a previous texture (placeholder or
+    // an earlier cover). innerSetImage does not drop it because the view does
+    // not own textures loaded through ImageHelper; do it here or the cache
+    // counter never returns to zero and the entry can never be evicted.
+    // Release even when the id is unchanged: getCache()/addCache() just added
+    // the reference this bind is consuming.
+    const int previous = this->imageView->getTexture();
+    if (previous > 0) brls::TextureCache::instance().removeCache(previous);
+    this->imageView->innerSetImage(tex);
 }
 
 void ImageHelper::clean() {
     std::lock_guard<std::mutex> lock(requestMutex);
+    cleanUnlocked();
+}
 
-    // 允许图片组件销毁
-    if (this->imageView) this->imageView->ptrUnlock();
+void ImageHelper::cleanIfCurrent(unsigned generation) {
+    std::lock_guard<std::mutex> lock(requestMutex);
+    if (this->imageGeneration.load() != generation) return;
+    cleanUnlocked();
+}
+
+void ImageHelper::cleanUnlocked() {
+    if (this->currentIter == requestPool.end()) return;
+
+    // 允许图片组件销毁，并移除它在本表中的登记
+    if (this->imageView) {
+        auto it = requestMap.find(this->imageView);
+        if (it != requestMap.end() && it->second == this->currentIter) requestMap.erase(it);
+        this->imageView->ptrUnlock();
+    }
     // 移除请求，复用 ImageHelper (挪到队首)
     requestPool.splice(requestPool.begin(), requestPool, this->currentIter);
     this->imageView   = nullptr;
+    this->deferred    = false;
     this->currentIter = requestPool.end();
 }
 
@@ -994,8 +1061,15 @@ void ImageHelper::clear(brls::Image* view) {
     brls::Logger::verbose("clear view: {} {}", (size_t)view, (size_t)(*requestMap[view]).get());
 
     // 请求没结束，取消请求
-    if ((*requestMap[view])->imageView == view) {
-        (*requestMap[view])->cancel();
+    std::shared_ptr<ImageHelper> helper = *requestMap[view];
+    if (helper->imageView == view) {
+        helper->cancel();
+        // A deferred load has no request in flight, so nothing else will call
+        // clean(); release the locked view here (clear() holds requestMutex).
+        if (helper->deferred) {
+            helper->deferred = false;
+            helper->cleanUnlocked();
+        }
     }
     requestMap.erase(view);
 }
@@ -1006,6 +1080,65 @@ void ImageHelper::cancel() {
 #if defined(PS5_NATIVE_APP)
     ImageUploadQueue::instance().wake();
 #endif
+}
+
+void ImageHelper::setLoadDeferSource(const void* owner, bool defer) {
+    if (!owner) return;
+    bool closed = false;
+    bool open   = false;
+    {
+        std::lock_guard<std::mutex> lock(deferMutex);
+        const bool wasActive = !deferSources.empty();
+        if (defer)
+            deferSources.insert(owner);
+        else
+            deferSources.erase(owner);
+        const bool active = !deferSources.empty();
+        deferLoads        = active;
+        closed            = active && !wasActive;
+        open              = !active && wasActive;
+    }
+    if (closed) {
+#if defined(PS5_NATIVE_APP)
+        wiliwili_boot_log("img-load: deferred (fast scroll)");
+#endif
+        return;
+    }
+    if (!open) return;
+
+    // The gate just opened: fetch whatever was bound while it was closed.
+    const size_t resumed = flushDeferred();
+#if defined(PS5_NATIVE_APP)
+    char message[160];
+    std::snprintf(message, sizeof(message), "img-load: resumed=%zu cache=%zu/%zuB after fast scroll", resumed,
+                  brls::TextureCache::instance().getSize(), brls::TextureCache::instance().getTotalBytes());
+    wiliwili_boot_log(message);
+#endif
+}
+
+bool ImageHelper::loadsDeferred() { return deferLoads.load(); }
+
+size_t ImageHelper::flushDeferred() {
+    std::vector<std::shared_ptr<ImageHelper>> ready;
+    {
+        std::lock_guard<std::mutex> lock(requestMutex);
+        for (auto& helper : requestPool) {
+            if (helper->deferred && !helper->isCancel && helper->imageView) {
+                helper->deferred = false;
+                ready.push_back(helper);
+            }
+        }
+    }
+    for (auto& helper : ready) {
+        const unsigned generation = helper->imageGeneration.load();
+        ImageThreadPool::instance().Submit([helper, generation]() {
+            if (helper->isCancel || helper->imageGeneration != generation) {
+                return;
+            }
+            helper->requestImage(generation);
+        });
+    }
+    return ready.size();
 }
 
 void ImageHelper::setRequestThreads(size_t num) {

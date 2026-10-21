@@ -826,7 +826,12 @@ void ProgramConfig::load() {
         // 初始化纹理缓存数量
 #if defined(PS5_NATIVE_APP)
         // Keep native card textures bounded: their direct-memory pool is also used by video/UI textures.
-        brls::TextureCache::instance().cache.setCapacityExact(24);
+        // The item count is only a coarse backstop; the byte budget is what keeps
+        // scrolled-away covers from accumulating in the AGC direct-memory pool.
+        // ~24 covers (672x378 RGBA, ~1 MiB each) can be on screen with prefetch,
+        // so leave headroom for those plus icons and placeholders.
+        brls::TextureCache::instance().cache.setCapacityExact(64);
+        brls::TextureCache::instance().setBudgetBytes(32u * 1024u * 1024u);
 #elif defined(__PSV__) || defined(PS4)
         brls::TextureCache::instance().cache.setCapacity(1);
 #else

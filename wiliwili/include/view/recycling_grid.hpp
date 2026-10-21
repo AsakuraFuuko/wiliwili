@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <map>
 #include <borealis/core/application.hpp>
 #include <borealis/core/bind.hpp>
@@ -173,6 +174,8 @@ public:
 
     ~RecyclingGrid() override;
 
+    void willDisappear(bool resetState = false) override;
+
     static View* create();
 
     /// 元素间距
@@ -241,6 +244,18 @@ private:
     void addCellAt(size_t index, bool downSide);
 
     void removeCell(brls::View *view);
+
+#if defined(PS5_NATIVE_APP)
+    /// Visible-area publishing: cells only load when they are on screen or in
+    /// the prefetch band, and new network loads pause while scrolling fast.
+    void updateScrollLoadGate();
+
+    std::chrono::steady_clock::time_point lastScrollSample;
+    std::chrono::steady_clock::time_point fastScrollEnd;
+    float lastScrollOffset   = 0;
+    float continuousScrollMs = 0;
+    bool deferringLoads      = false;
+#endif
 };
 
 class RecyclingGridContentBox : public brls::Box {

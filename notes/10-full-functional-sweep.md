@@ -421,3 +421,37 @@
 - 用户日志里 07:03:13 的“历史回调晚到”时序未在本地复现；`app: last-time ignored` 分支只做了代码级封堵，真机未命中。
 - 伪 `END_OF_FILE`（旧 `eof-reached`）未在真机复现，`app: replay ignored, not at end` 分支同样未触发。
 - 本轮真机日志中正常播放期间 `showReplay` 始终为 0，因此“重播标志导致 seek(0)”的直接复现仍缺；已证明的是全屏/暂停路径不再 seek，且所有已知能产生 `seek(0)` 的路径都被限制在“确实在片尾”或“尚未开始”。
+
+## 封面懒加载与滚出释放（2026-10-21）
+
+**目标**：首页滚动后 AGC direct_mem 不再被已滚出的封面纹理长期占住；滚回必须正确重载；显示中的 cell 不得被淘汰。
+
+**实现**
+- `borealis/core/cache_helper.hpp`：`LRUCache` 增加按字节记账（`Node::bytes`、`totalBytes`、`capacityBytes`）与 `reclaim()/evictOne()`。淘汰从 LRU 尾部开始，跳过 `count>0`（正在被某个 Image 绘制）的项，且保护刚插入的表头；`remove()` 把引用计数降到 0 后若超预算立即回收。`TextureCache::addCache()` 用 `nvgImageSize()` 计算 `w*h*4`。
+- `config_helper.cpp`（`PS5_NATIVE_APP`）：纹理缓存改为精确 64 项 + **32 MiB 字节预算**。
+- `image_helper.cpp`：
+  - `bindImage()` 在给 view 换纹理时先 `removeCache(previous)`。旧实现缓存命中时直接 `innerSetImage`，不释放 view 原来那张（占位图/旧封面）的引用，计数永远回不到 0，LRU 因此无法淘汰。
+  - `imageGeneration`：每次 `load()` 递增，网络响应、解码、上传队列任务都带代际校验；过期响应直接丢弃，不再把旧封面贴到被复用的 cell。
+  - `with(view)` 复用同一 view 已有的 helper，避免两个 helper 同时写一个 Image。
+  - `clean()` 幂等：释放 ptrLock 时同时从 `requestMap` 移除；`cleanIfCurrent()` 只在代际仍匹配时清理，避免旧任务把新请求的 view 解绑。
+  - 快速滚动门控：`setLoadDeferSource(owner, defer)` 用 owner 集合支持多 grid；关门期间 `load()` 只记 URL 不发起请求；最后一个 owner 开门时 `flushDeferred()` 重发仍在屏上的请求，并打 `img-load: resumed=N cache=entries/bytesB`。
+- `recycling_grid.cpp`：`updateScrollLoadGate()` 按“连续移动超过 300ms”判定快速滚动（单次 D-pad 动画约 200ms 不触发），滚动停止后再保持 180ms 关门；`willDisappear`/析构/`reloadData` 都会开门，隐藏页面不会把门永久关住。可见性本身仍由 `itemsRecyclingLoop()` 的 visibleMin/Max + `preFetchLine` 决定。
+
+**真机 A/B（PPSA99233，同一路径：启动 → 推荐首页 → 焦点进入网格 → down×8≈32 格）**
+| 构建 | 滚 8 行后 direct_mem | peak | allocs | HUD RAM | 进程列表 |
+|---|---|---|---|---|---|
+| 基线 `Oct 21 08:02:58`（0707bcd） | 88,472,576 B (84.4 MiB) | 92,731,392 B | 102 | 549 MB | 1146 MB |
+| 本改动 | 35,762,944 B (34.1 MiB) | 40,021,760 B | 46 | 549 MB | 1146 MB |
+
+- 差值：**−52,709,632 B（−59.6%）**，峰值同降 52.7 MB；`dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0 vo_rc=0` 全程成立。
+- 首页首屏 idle：基线 84.2 MB / 98 allocs → 本改动 23.3 MB / 37 allocs（启动后，未滚动）。
+- HUD RAM 与进程列表内存不变：字节预算限制的是 AGC direct-memory 池里的 GPU 纹理，不改变应用堆预留。
+- 滚回顶部（up×8）截图 `/tmp/new-scrollback.png`：封面全部正常重载，无空图/错图；显示中的 cell 无白块。
+- 快速滚动 10s 后立刻确认打开视频 `/tmp/new-fast-open.png`：进入详情并起播，60 FPS，无崩溃。
+- 全屏 `/tmp/new-fullscreen.png`：1080P 正常出画，时间戳连续（未 seek 回 0）。
+- 片尾 `/tmp/new-eof1.png`：`23:35/23:35` 停在最后一帧、暂停图标，无重播。
+
+**已知/未验证**
+- 快速滚动门控在 A/B 那轮使用“速度 >1600 px/s”判定，实测离散 D-pad 可能不触发；最终代码改为“连续移动 >300ms”，**该新判定与 `img-load:` 两行日志在本轮真机 A/B 之后加入，仅通过编译，未在真机复测**（内存收益来自字节预算，与该判定无关）。
+- 详情页/评论/相关推荐会缓存更多图（全屏播放时 direct_mem 81.6 MB / 70 allocs），隐藏页面的 cell 仍持有引用，字节预算不能回收它们；本轮未处理，属后续可优化项。
+- 为测试片尾连续 R1 快进 78 次后，seek 目标 1644.6 s 超过实际片长，C 路按既有契约 `demux EOF` → 干净 `FALLBACK_A reason=stream-count-mismatch rc=-9019`，A 路继续并定格；该路径未触及本次改动。随之 A 路 direct_mem 升到 184.2 MB（78 次 seek/缩略图精灵），属既有 seek 路径开销，本次未处理。
