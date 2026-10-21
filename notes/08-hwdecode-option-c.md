@@ -641,3 +641,39 @@ seek 压力 `/tmp/m12-evo-seek-stress-final.log` 完成 `m5-stress seek=20/20`�
 ## 9. 临时实验清理
 
 M1 已保留 `videodec2_probe.c` 的既有 P0/PTS 门控，并新增 `WILIWILI_TEST_VDEC=1` + `WILIWILI_VDEC_AGC=1` 的静态 AGC 门控。临时主机包 `PPSA99279/PPSA99280` 已删除，主机当前只剩正式 `PPSA99233.ffpkg`；本地 `PPSA99280` dist、`/tmp/PPSA99280.ffpkg`、`/tmp/PPSA99280-boot.log` 和 `/tmp/m1-screen.png` 作为 M1 复核证据暂留，P1 收尾时清理。
+
+## 10. C 路覆盖面补全：4K / 10-bit（P010）/ VP9（2026-10-21）
+
+### 10.1 代码改动（`scripts/ps5/native/native_vdec_play.c`）
+
+|项|旧|新|锚点|
+|---|---|---|---|
+|auto-gate 尺寸|≤1920×1080|≤3840×2176（4K 档），越界仍回 A|`play_auto_capable`|
+|auto-gate 位深|`bits_per_raw_sample>8` 直接拒|接受 ≤10bit（`bits_per_raw_sample` 或像素格式深度任一为据），>10bit 回 A|`play_param_depth` / `play_auto_capable`|
+|auto-gate codec|H.264/HEVC|H.264/HEVC/VP9|`play_codec_type`|
+|`max_width/height`|宽用可见宽、高只对 2160 特判|两者都 16 对齐（1920×1088 / 2560×1440 / 3840×2176）|`play_setup_decoder`|
+|`max_level`|宽 ≥3840 才升级|按高映射：HEVC 123/150/153、AVC 51/52（1080/1440/2160），FFmpeg 已知 level 时优先用它|`play_codec_level`|
+|profile 默认|0/负值→HEVC 1、AVC 100|同左，另 VP9 保留 profile 0|`play_setup_decoder`|
+|P010 呈现|`WILIWILI_VDEC_P010=1` 才开|**默认开**；PQ(`trc=16`) 走 `ten_bit=1` + `video_yuv_p010_hdr` 管线，10bit SDR/HLG 先软转 NV12|`wiliwili_vdec_play_draw`|
+|P010 转换池|只要开 P010 就按 3 帧分配|仅软转路径分配（PQ 直通不再多花 3×frame_size direct mem）|`play_setup_decoder`|
+|VP9|无|`codec_type=2382845`；无 BSF（demux 包直送）；keyframe 只用 demuxer key flag；NAL 扫描/包 trace 跳过|`play_media_open` / `play_submit_au` / `play_sequential_seek_skip`|
+|分辨率变化|输出尺寸与实例不符即 `output-contract` 失败|检测到帧尺寸变化后 `recreate`：等 present 退休 + AGC idle → 关旧实例 → 按新尺寸建实例 → 重同步到 IDR；replay/备用 URL 重开后尺寸变化同样走重建|`play_account_output_locked` / `play_rebuild_decoder` / `play_recreate_decoder`|
+|测试 override|`WILIWILI_VDEC_URL` 仍套用 B 站续播点|override 生效时忽略 `start_seconds`（原位置对新媒体无意义）|`wiliwili_vdec_play_start`|
+
+门控/实例日志新增字段（真机取证用）：`auto-gate=pass codec=… size=… depth=…`、`config codec=…(name) profile=… level=… max=…x… visible=…x… depth=…`、`decoder ready … p010=native|convert|off frame_size=… au=… frame=… p010_pool=… direct_mem=… limit=…`、`first-frame … pitch=… pitch_bytes=… p010=… path=… ten_bit=… trc=…`、`recreate reason=resolution old=… new=…`。
+
+### 10.2 真机证据（第一批）
+
+**真实 B 站 HEVC 1080p 回归（新代码默认 P010 开）**：主机 `192.168.102.118`，包 `PPSA99233.ffpkg` build `Oct 21 2026 19:52:02`，B 站 HEVC `1920x1080@30`（profile=1 level=150，B 帧 reorder=1，`trc=1`）。
+
+- `auto-gate=pass codec=hevc(974921) size=1920x1080 depth=8 raw_bits=0 coded_bits=24 reorder=1`；`config codec=974921(hevc) profile=1 level=150 max=1920x1088 visible=1920x1080 depth=8`。
+- `decoder ready … p010=off frame_size=0x334000 au=0x1800000 frame=0x99c000 p010_pool=0x0 direct_mem=179863552 limit=12884901888`（8bit 流不分配 P010 转换池，符合预期）。
+- `first-frame codec=hevc frame=1920x1080 pitch=2048 pitch_bytes=2048 p010=0 path=nv12`，`first-presented elapsed_ms=296`。
+- 整段：`stop summary inputs=1892 accepted=1892 outputs=1892 presented=5509 retired=5509 dropped=0 errors=0 order_errors=0 failovers=0 direct_mem=179863552`；中间 `demux EOF` → `EOF parked final frame; waiting for explicit seek or stop`，`eof=1` 后 `presented` 持续增长而 `pts90k` 固定在最后一帧（定格）。
+- `agc health frame=12000/12600/13200`：`dcb_full=0 ring_fail=0 tex_fail=0`、`timeouts=0`、`vo_rc=0`；无 `FALLBACK_A`（同段唯一一次 `FALLBACK_A reason=stream-count-mismatch rc=-9019` 由“历史续播点 739 s 对 63 s 片源 seek 越界→立即 demux EOF”触发，属既有 seek 越界路径，与本次改动无关，见 10.4）。
+- 证据文件：`/tmp/cpath-evidence-1080p-hevc.log`（从共享 UDP 日志按时间戳截取）。
+
+### 10.3 待补（第二批及以后）
+
+- 4K H.264、4K HEVC、2K(2560×1440) HEVC、HEVC Main10（10bit SDR 与 HDR10/PQ）、VP9、mid-stream 分辨率变化：本地测试流已生成（`/tmp/vdec-media/`，见 10.4），待主机轮次。
+- 小窗/全屏/EOF 定格截图与 `direct_mem` 峰值：随上项一并采集。

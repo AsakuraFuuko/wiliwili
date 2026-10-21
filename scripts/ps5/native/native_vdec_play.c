@@ -52,6 +52,12 @@ enum {
     VDEC_PLAY_PREBUFFER_MAX_BYTES = 16 * 1024 * 1024,
     VDEC_PLAY_CODEC_AVC = 1,
     VDEC_PLAY_CODEC_HEVC = 974921,
+    VDEC_PLAY_CODEC_VP9 = 2382845,
+    /* The ABI sizes decoder instances by 16-aligned dimensions; 3840x2176 is
+     * the 4K profile and also the largest coded size we accept. */
+    VDEC_PLAY_MAX_WIDTH = 3840,
+    VDEC_PLAY_MAX_HEIGHT = 2176,
+    VDEC_PLAY_MAX_DEPTH = 10,
     VDEC_PLAY_SYSMODULE = 207,
 };
 enum {
@@ -64,6 +70,9 @@ static volatile int g_vdec_user_mode = VDEC_PLAY_MODE_AUTO;
 enum {
     VDEC_PLAY_RESULT_OK = 0,
     VDEC_PLAY_RESULT_SEEK = -2,
+    /* A decoded frame reported dimensions the live decoder instance was not
+     * created for; the play thread must recreate it before continuing. */
+    VDEC_PLAY_RESULT_RECONFIGURE = -3,
 };
 
 typedef struct {
@@ -140,6 +149,9 @@ typedef struct {
     void *compute_queue, *decoder;
     uint32_t codec;
     int visible_width, visible_height;
+    int depth;       /* sample depth of the configured stream (8 or 10) */
+    int p010_native; /* P010 goes to the blit as 10-bit (HDR10 pipe) */
+    int p010_convert;/* P010 is converted to NV12 before the blit */
 } VdecPlayDecoder;
 
 typedef enum {
@@ -201,6 +213,7 @@ typedef struct {
     volatile int seek_requested;
     int active, fallback, failure_logged, resources_live, decoder_ready, source_eof, reopen_media;
     int current_slot, ready_queue[VDEC_PLAY_SLOTS], ready_count, present_pending;
+    int reconfigure_requested, reconfigure_width, reconfigure_height;
     double seek_seconds;
     int sequential_seek;
     int64_t sequential_seek_pts90k;
@@ -571,6 +584,48 @@ static void play_log_av_error(const char *stage, int rc) {
 }
 
 static uint64_t play_align16k(uint64_t value) { return (value + 0x3fffu) & ~UINT64_C(0x3fff); }
+static int play_align16(int value) { return (value + 15) & ~15; }
+
+static const char *play_codec_name(uint32_t codec) {
+    switch (codec) {
+    case VDEC_PLAY_CODEC_AVC: return "h264";
+    case VDEC_PLAY_CODEC_HEVC: return "hevc";
+    case VDEC_PLAY_CODEC_VP9: return "vp9";
+    default: return "unknown";
+    }
+}
+
+static uint32_t play_codec_type(int codec_id) {
+    switch (codec_id) {
+    case AV_CODEC_ID_HEVC: return VDEC_PLAY_CODEC_HEVC;
+    case AV_CODEC_ID_VP9: return VDEC_PLAY_CODEC_VP9;
+    default: return VDEC_PLAY_CODEC_AVC;
+    }
+}
+
+/* Effective sample depth: a 10-bit stream reaches us either as
+ * bits_per_raw_sample=10 or only through a 10-bit pixel format, depending on
+ * how the demuxer filled codecpar. */
+static int play_param_depth(const AVCodecParameters *par) {
+    int depth = par->bits_per_raw_sample > 0 ? par->bits_per_raw_sample : 0;
+    if (depth <= 8 && par->format >= 0) {
+        const AVPixFmtDescriptor *format = av_pix_fmt_desc_get((enum AVPixelFormat)par->format);
+        if (format && format->comp[0].depth > depth) depth = format->comp[0].depth;
+    }
+    return depth > 0 ? depth : 8;
+}
+
+/* max_level values verified by the local probe: AVC 5.1/5.2 and HEVC
+ * 4.1/5.0/5.1 for 1080p/1440p/2160p. FFmpeg's own level idc is used whenever
+ * the demuxer knows it, because a wrong ceiling is a create-time failure. */
+static uint32_t play_codec_level(uint32_t codec, int height, int ffmpeg_level) {
+    if (ffmpeg_level > 0) return (uint32_t)ffmpeg_level;
+    switch (codec) {
+    case VDEC_PLAY_CODEC_HEVC: return height > 1440 ? 153 : height > 1080 ? 150 : 123;
+    case VDEC_PLAY_CODEC_AVC: return height > 1080 ? 52 : 51;
+    default: return 0;
+    }
+}
 
 static void *play_alloc_direct(VdecPlayDirectMemory *m, uint64_t limit, size_t bytes, int32_t prot) {
     if (!m || !bytes) return NULL;
@@ -637,6 +692,9 @@ typedef struct {
 static VdecPlayNalFlags play_scan_nals(const uint8_t *data, int size, uint32_t codec) {
     VdecPlayNalFlags flags;
     memset(&flags, 0, sizeof(flags));
+    /* VP9 has no start codes or NAL units; its keyframe flag comes from the
+     * demuxer. Scanning it as Annex B would invent random "types". */
+    if (codec != VDEC_PLAY_CODEC_AVC && codec != VDEC_PLAY_CODEC_HEVC) return flags;
     if (!data || size < 5) return flags;
     for (int i = 0; i + 4 < size;) {
         int prefix = 0;
@@ -664,6 +722,7 @@ static VdecPlayNalFlags play_scan_nals(const uint8_t *data, int size, uint32_t c
 }
 
 static int play_true_idr(const uint8_t *data, int size, uint32_t codec) {
+    if (codec != VDEC_PLAY_CODEC_AVC && codec != VDEC_PLAY_CODEC_HEVC) return 0;
     if (!data || size < 5) return 0;
     for (int i = 0; i + 4 < size;) {
         int prefix = 0;
@@ -788,11 +847,37 @@ static int play_account_output_locked(VdecPlaySession *s, int input_slot, const 
         play_fail_locked(s, "p010-disabled", -9026);
         return -1;
     }
+    /* A frame that does not match the instance we created means the stream
+     * changed resolution mid-flight. The frame pool and the config were sized
+     * for the old dimensions, so hand this AU back and let the play thread
+     * recreate the decoder instead of presenting through a stale contract.
+     * Coded dimensions may exceed the display size by the 16-pixel alignment
+     * (1080 -> 1088, 2160 -> 2176); that window is the same instance, so only
+     * a frame outside it is a real change. */
+    const int frame_ok = !out->error && out->picture_count == 1 && out->width > 0 && out->height > 0 &&
+                         out->buffer != NULL;
+    const int width_fits = (int)out->width == s->decoder.visible_width ||
+                           (out->width > (uint32_t)s->decoder.visible_width &&
+                            out->width <= (uint32_t)play_align16(s->decoder.visible_width));
+    const int height_fits = (int)out->height == s->decoder.visible_height ||
+                            (out->height > (uint32_t)s->decoder.visible_height &&
+                             out->height <= (uint32_t)play_align16(s->decoder.visible_height));
+    if (frame_ok && (!width_fits || !height_fits)) {
+        if (!s->reconfigure_requested) {
+            s->reconfigure_width = (int)out->width;
+            s->reconfigure_height = (int)out->height;
+            play_logf("vdec-play: output-resolution-change configured=%dx%d frame=%ux%u pitch=%u pitch_bytes=%u",
+                      s->decoder.visible_width, s->decoder.visible_height, out->width, out->height, out->pitch,
+                      out->pitch_bytes);
+        }
+        s->reconfigure_requested = 1;
+        play_release_slot_locked(s, input_slot);
+        return -2;
+    }
     const int pitch_invalid = p010 ? out->pitch_bytes != out->pitch * 2u : out->pitch_bytes != out->pitch;
     const int invalid = out->error || out->picture_count != 1 || out->codec != s->decoder.codec ||
-                        out->width < (uint32_t)s->decoder.visible_width ||
-                        out->height < (uint32_t)s->decoder.visible_height || out->pitch < out->width || pitch_invalid ||
-                        out->buffer == NULL || out->buffer_size < required || slot < 0;
+                        out->pitch < out->width || pitch_invalid || out->buffer == NULL ||
+                        out->buffer_size < required || slot < 0;
     if (invalid) {
         play_release_slot_locked(s, input_slot);
         play_fail_locked(s, "output-contract", -9002);
@@ -866,16 +951,28 @@ static int play_wait_for_frame_slot(VdecPlaySession *s) {
     return slot;
 }
 
-static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
+static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par, int width, int height) {
     s->resources_live = 1;
-    const uint32_t codec = par->codec_id == AV_CODEC_ID_HEVC ? VDEC_PLAY_CODEC_HEVC : VDEC_PLAY_CODEC_AVC;
-    const int visible_width = par->width;
-    const int visible_height = par->height;
-    const int max_height = visible_height >= 2160 ? 2176 : (visible_height + 15) & ~15;
-    const int profile = par->profile > 0 ? par->profile : (codec == VDEC_PLAY_CODEC_HEVC ? 1 : 100);
-    const int level = par->level > 0 ? par->level :
-                      (codec == VDEC_PLAY_CODEC_HEVC ? (visible_width >= 3840 ? 153 : 123)
-                                                     : (visible_width >= 3840 ? 52 : 51));
+    const uint32_t codec     = play_codec_type(par->codec_id);
+    const int visible_width  = width > 0 ? width : par->width;
+    const int visible_height = height > 0 ? height : par->height;
+    /* The ABI takes 16-aligned instance dimensions: 1920x1088, 2560x1440,
+     * 3840x2176. A stream that reports 2160 gets 2176, not 2160. */
+    const int max_width  = play_align16(visible_width);
+    const int max_height = play_align16(visible_height);
+    const int depth      = play_param_depth(par);
+    int profile          = par->profile;
+    if (profile < 0) profile = codec == VDEC_PLAY_CODEC_HEVC ? 1 : codec == VDEC_PLAY_CODEC_AVC ? 100 : 0;
+    /* A recreated instance can differ from what codecpar still describes, so
+     * only trust the demuxer's level when the dimensions agree. */
+    const int par_level = visible_width == par->width && visible_height == par->height ? par->level : 0;
+    const uint32_t level = play_codec_level(codec, visible_height, par_level);
+    /* HDR10 (PQ) has a compiled P010 pipe. HLG does not, so its P010 frames go
+     * through the same software NV12 conversion as 10-bit SDR rather than
+     * failing the blit and dropping the whole session to A. */
+    const int hdr10 = s->video_color_trc == 16;
+    const int p010_native  = s->p010_enabled && depth > 8 && hdr10;
+    const int p010_convert = s->p010_enabled && depth > 8 && !hdr10;
     const uint64_t limit = (uint64_t)sceKernelGetDirectMemorySize();
     int32_t rc = sceSysmoduleLoadModule(VDEC_PLAY_SYSMODULE);
     if (rc != 0) {
@@ -906,7 +1003,7 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
     config.codec_type = codec;
     config.profile = (uint32_t)profile;
     config.max_level = (uint32_t)level;
-    config.max_width = visible_width;
+    config.max_width = max_width;
     config.max_height = max_height;
     config.max_dpb_frames = -1;
     config.pipeline_depth = 1;
@@ -914,8 +1011,9 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
     config.cpu_affinity = 0x3f;
     config.cpu_priority = 700;
     config.optimize_progressive = 1;
-    play_logf("vdec-play: config codec=%u profile=%u level=%u max=%dx%d dpb=-1 depth=1",
-              codec, config.profile, config.max_level, config.max_width, config.max_height);
+    play_logf("vdec-play: config codec=%u(%s) profile=%u level=%u max=%dx%d visible=%dx%d depth=%d dpb=-1 depth=1",
+              codec, play_codec_name(codec), config.profile, config.max_level, config.max_width, config.max_height,
+              visible_width, visible_height, depth);
 
     VdecPlayMemory memory;
     memset(&memory, 0, sizeof(memory));
@@ -940,15 +1038,19 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
     memory.cpu_gpu = s->decoder.cpu_gpu.address;
     memory.cpu_gpu_size = cpu_gpu_bytes;
     s->decoder.frame_size = play_align16k(memory.max_frame_size);
-    if (!s->decoder.frame_size ||
-        !play_alloc_direct(&s->decoder.au_pool, limit, VDEC_PLAY_AU_BYTES * VDEC_PLAY_SLOTS, 0x32) ||
-        !play_alloc_direct(&s->decoder.frame_pool, limit, (size_t)s->decoder.frame_size * VDEC_PLAY_SLOTS, 0x32)) {
-        play_logf("vdec-play: frame pool allocation failed frame_size=0x%llx",
-                  (unsigned long long)s->decoder.frame_size);
+    const uint64_t au_bytes  = (uint64_t)VDEC_PLAY_AU_BYTES * VDEC_PLAY_SLOTS;
+    const uint64_t frame_bytes = (uint64_t)s->decoder.frame_size * VDEC_PLAY_SLOTS;
+    if (!s->decoder.frame_size || !play_alloc_direct(&s->decoder.au_pool, limit, (size_t)au_bytes, 0x32) ||
+        !play_alloc_direct(&s->decoder.frame_pool, limit, (size_t)frame_bytes, 0x32)) {
+        play_logf("vdec-play: frame pool allocation failed frame_size=0x%llx au=0x%llx frame=0x%llx",
+                  (unsigned long long)s->decoder.frame_size, (unsigned long long)au_bytes,
+                  (unsigned long long)frame_bytes);
         return -1;
     }
-    if (s->p010_enabled && !play_alloc_direct(&s->decoder.p010_pool, limit,
-                                               (size_t)s->decoder.frame_size * VDEC_PLAY_SLOTS, 0x32)) {
+    /* Only the software P010 path needs a second NV12-sized pool; native P010
+     * reads the decoder frame directly. 4K 10-bit would otherwise spend another
+     * 75 MB of direct memory on a conversion target that never runs. */
+    if (p010_convert && !play_alloc_direct(&s->decoder.p010_pool, limit, (size_t)frame_bytes, 0x32)) {
         play_logf("vdec-play: P010 conversion pool allocation failed frame_size=0x%llx",
                   (unsigned long long)s->decoder.frame_size);
         return -1;
@@ -960,11 +1062,18 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par) {
     s->decoder.codec = codec;
     s->decoder.visible_width = visible_width;
     s->decoder.visible_height = visible_height;
+    s->decoder.depth = depth;
+    s->decoder.p010_native = p010_native;
+    s->decoder.p010_convert = p010_convert;
     s->resources_live = 1;
     s->direct_mem_peak = play_direct_mem_bytes(s);
-    play_logf("vdec-play: decoder ready visible=%dx%d frame_size=0x%llx direct_mem=%llu",
-              visible_width, visible_height, (unsigned long long)s->decoder.frame_size,
-              (unsigned long long)s->direct_mem_peak);
+    play_logf("vdec-play: decoder ready codec=%s visible=%dx%d max=%dx%d depth=%d p010=%s frame_size=0x%llx "
+              "au=0x%llx frame=0x%llx p010_pool=0x%llx direct_mem=%llu limit=%llu",
+              play_codec_name(codec), visible_width, visible_height, max_width, max_height, depth,
+              p010_native ? "native" : p010_convert ? "convert" : "off", (unsigned long long)s->decoder.frame_size,
+              (unsigned long long)s->decoder.au_pool.bytes, (unsigned long long)s->decoder.frame_pool.bytes,
+              (unsigned long long)s->decoder.p010_pool.bytes, (unsigned long long)s->direct_mem_peak,
+              (unsigned long long)limit);
     return 0;
 }
 
@@ -1104,6 +1213,7 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
                   (unsigned long long)s->sequence, (long long)s->last_output_pts, output.valid, output.error,
                   output.picture_count, output_slot, is_flush || did_flush, s->pending_count);
     pthread_mutex_unlock(&s->mutex);
+    if (account == -2) return VDEC_PLAY_RESULT_RECONFIGURE;
     if (account < 0) return -1;
     if (output.valid && (s->sequence == 1 || (s->sequence % 120u) == 0u))
         play_logf("vdec-play: output seq=%llu pts90k=%lld slot=%d flush=%d limit=%d peak=%d error=%d picture_count=%d",
@@ -1118,7 +1228,7 @@ static int play_flush(VdecPlaySession *s) {
         if (slot == -2) return VDEC_PLAY_RESULT_SEEK;
         if (slot < 0) return -1;
         const int result = play_decode_call(s, slot, NULL, 0, 0, 1, i, UINT64_MAX);
-        if (result == VDEC_PLAY_RESULT_SEEK) return VDEC_PLAY_RESULT_SEEK;
+        if (result == VDEC_PLAY_RESULT_SEEK || result == VDEC_PLAY_RESULT_RECONFIGURE) return result;
         if (result < 0) return -1;
         if (result == 0) {
             pthread_mutex_lock(&s->mutex);
@@ -1158,7 +1268,11 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
     if (nal.has_sps) s->sps_seen = 1;
     if (nal.has_pps) s->pps_seen = 1;
     if (s->awaiting_idr) {
-        const int true_idr = keyframe && nal.idr && play_true_idr(data, size, s->decoder.codec);
+        /* VP9 keyframes reset all references; there is no separate IDR NAL to
+         * look for, so the demuxer's key flag is the whole contract. */
+        const int vp9 = s->decoder.codec == VDEC_PLAY_CODEC_VP9;
+        const int true_idr =
+            vp9 ? keyframe : (keyframe && nal.idr && play_true_idr(data, size, s->decoder.codec));
         if (!true_idr) {
             if (s->trace_au)
                 play_logf(
@@ -1238,7 +1352,9 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
         context->slot_state = s->slots[slot].state;
     }
     pthread_mutex_unlock(&s->mutex);
-    return play_decode_call(s, slot, data, size, pts90k, 0, -1, input_index) < 0 ? -1 : VDEC_PLAY_RESULT_OK;
+    const int decoded = play_decode_call(s, slot, data, size, pts90k, 0, -1, input_index);
+    if (decoded == VDEC_PLAY_RESULT_RECONFIGURE) return VDEC_PLAY_RESULT_RECONFIGURE;
+    return decoded < 0 ? -1 : VDEC_PLAY_RESULT_OK;
 }
 
 enum {
@@ -1371,6 +1487,12 @@ static void play_packet_trace_capture(VdecPlayPacketTrace *trace, const AVPacket
         return;
     }
     trace->format = 1;
+    /* VP9 has neither AVCC lengths nor Annex-B start codes; the byte scan
+     * below would invent NALs out of entropy-coded data. */
+    if (codec != VDEC_PLAY_CODEC_AVC && codec != VDEC_PLAY_CODEC_HEVC) {
+        trace->format = 3;
+        return;
+    }
     if (play_packet_trace_parse_avcc(trace, data, size, codec, nal_length_size)) return;
     trace->nal_count = 0;
     trace->truncated = 0;
@@ -1619,49 +1741,55 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     const char *filter_name = stream->codecpar->codec_id == AV_CODEC_ID_HEVC
                                   ? "hevc_mp4toannexb"
                                   : stream->codecpar->codec_id == AV_CODEC_ID_H264 ? "h264_mp4toannexb" : NULL;
-    if (!filter_name) {
+    /* VP9 has no start-code layer: the demuxer already hands us complete
+     * superframes, so this path takes the packet straight to the decoder. */
+    const int vp9 = stream->codecpar->codec_id == AV_CODEC_ID_VP9;
+    if (!filter_name && !vp9) {
         play_logf("vdec-play: unsupported codec id=%d", stream->codecpar->codec_id);
         avformat_close_input(&format);
         return -1;
     }
-    const AVBitStreamFilter *filter = av_bsf_get_by_name(filter_name);
-    if (!filter || av_bsf_alloc(filter, &media->bsf) < 0 || !media->bsf) {
-        play_logf("vdec-play: BSF unavailable name=%s", filter_name);
-        avformat_close_input(&format);
-        return -1;
-    }
-    rc = avcodec_parameters_copy(media->bsf->par_in, stream->codecpar);
-    if (rc < 0) {
-        play_log_av_error("BSF parameters", rc);
-        av_bsf_free(&media->bsf);
-        avformat_close_input(&format);
-        return -1;
-    }
-    media->bsf->time_base_in = stream->time_base;
-    rc = av_bsf_init(media->bsf);
-    if (rc < 0) {
-        play_log_av_error("BSF init", rc);
-        av_bsf_free(&media->bsf);
-        avformat_close_input(&format);
-        return -1;
+    if (filter_name) {
+        const AVBitStreamFilter *filter = av_bsf_get_by_name(filter_name);
+        if (!filter || av_bsf_alloc(filter, &media->bsf) < 0 || !media->bsf) {
+            play_logf("vdec-play: BSF unavailable name=%s", filter_name);
+            avformat_close_input(&format);
+            return -1;
+        }
+        rc = avcodec_parameters_copy(media->bsf->par_in, stream->codecpar);
+        if (rc < 0) {
+            play_log_av_error("BSF parameters", rc);
+            av_bsf_free(&media->bsf);
+            avformat_close_input(&format);
+            return -1;
+        }
+        media->bsf->time_base_in = stream->time_base;
+        rc = av_bsf_init(media->bsf);
+        if (rc < 0) {
+            play_log_av_error("BSF init", rc);
+            av_bsf_free(&media->bsf);
+            avformat_close_input(&format);
+            return -1;
+        }
     }
     media->format = format;
     media->stream = stream;
     media->time_base = stream->time_base;
-    media->codec = stream->codecpar->codec_id == AV_CODEC_ID_HEVC ? VDEC_PLAY_CODEC_HEVC : VDEC_PLAY_CODEC_AVC;
+    media->codec = play_codec_type(stream->codecpar->codec_id);
     media->nal_length_size = 4;
     if (stream->codecpar->extradata && stream->codecpar->extradata_size >= 5) {
         const int length_offset = stream->codecpar->codec_id == AV_CODEC_ID_HEVC ? 21 : 4;
-        if (stream->codecpar->extradata_size > length_offset)
+        if (!vp9 && stream->codecpar->extradata_size > length_offset)
             media->nal_length_size = (stream->codecpar->extradata[length_offset] & 3) + 1;
         if (media->nal_length_size < 1 || media->nal_length_size > 4) media->nal_length_size = 4;
     }
-    play_logf("vdec-play: demux ready stream=%d codec=%u size=%dx%d fps=%d/%d profile=%d format=%d bits=%d trc=%d "
-              "timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
-              stream_index, media->codec, stream->codecpar->width, stream->codecpar->height,
+    play_logf("vdec-play: demux ready stream=%d codec=%s size=%dx%d fps=%d/%d profile=%d format=%d bits=%d depth=%d "
+              "trc=%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
+              stream_index, play_codec_name(media->codec), stream->codecpar->width, stream->codecpar->height,
               stream->avg_frame_rate.num, stream->avg_frame_rate.den, stream->codecpar->profile, stream->codecpar->format,
-              stream->codecpar->bits_per_raw_sample, media->color_trc, media->time_base.num, media->time_base.den,
-              stream->codecpar->codec_tag, stream->codecpar->extradata_size, media->nal_length_size, filter_name,
+              stream->codecpar->bits_per_raw_sample, play_param_depth(stream->codecpar), media->color_trc,
+              media->time_base.num, media->time_base.den, stream->codecpar->codec_tag,
+              stream->codecpar->extradata_size, media->nal_length_size, filter_name ? filter_name : "none",
               media->has_reorder);
     return 0;
 }
@@ -1727,27 +1855,35 @@ static int play_prebuffer_network(VdecPlaySession *s, VdecPlayMedia *media, AVPa
 static int play_auto_capable(const VdecPlayMedia *media, char *reason, size_t capacity) {
     if (!media || !media->stream || !media->stream->codecpar || !reason || capacity == 0) return 0;
     const AVCodecParameters *par = media->stream->codecpar;
-    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC) {
+    const uint32_t codec         = play_codec_type(par->codec_id);
+    const int known = par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_HEVC ||
+                      par->codec_id == AV_CODEC_ID_VP9;
+    if (!known) {
         snprintf(reason, capacity, "codec=%d", par->codec_id);
         return 0;
     }
-    if (par->width <= 0 || par->height <= 0 || par->width > 1920 || par->height > 1080) {
+    /* The verified decoder profile reaches 3840x2176 (4K with a 16-aligned
+     * height). Anything wider or taller needs an ABI configuration this title
+     * has never proven, so it stays on A. */
+    if (par->width <= 0 || par->height <= 0 || par->width > VDEC_PLAY_MAX_WIDTH ||
+        par->height > VDEC_PLAY_MAX_HEIGHT) {
         snprintf(reason, capacity, "size=%dx%d", par->width, par->height);
         return 0;
     }
-    if (par->bits_per_raw_sample > 8) {
-        snprintf(reason, capacity, "raw-bits=%d", par->bits_per_raw_sample);
+    /* 10-bit P010 is decoded and presented; 12-bit has no verified profile. */
+    const int depth = play_param_depth(par);
+    if (depth > VDEC_PLAY_MAX_DEPTH) {
+        snprintf(reason, capacity, "depth=%d raw-bits=%d", depth, par->bits_per_raw_sample);
         return 0;
     }
-    const AVPixFmtDescriptor *format = par->format >= 0 ? av_pix_fmt_desc_get((enum AVPixelFormat)par->format) : NULL;
-    if (format && format->comp[0].depth > 8) {
-        snprintf(reason, capacity, "pixel-format=%s depth=%d", format->name, format->comp[0].depth);
-        return 0;
-    }
-    snprintf(reason, capacity, "codec=%u size=%dx%d raw_bits=%d coded_bits=%d reorder=%d", media->codec, par->width,
-             par->height, par->bits_per_raw_sample, par->bits_per_coded_sample, media->has_reorder);
+    snprintf(reason, capacity, "codec=%s(%u) size=%dx%d depth=%d raw_bits=%d coded_bits=%d reorder=%d",
+             play_codec_name(codec), media->codec, par->width, par->height, depth, par->bits_per_raw_sample,
+             par->bits_per_coded_sample, media->has_reorder);
     return 1;
 }
+
+/* Defined next to the play thread; a reopened URL can change the rendition. */
+static int play_rebuild_decoder(VdecPlaySession *s, VdecPlayMedia *media, int width, int height);
 
 static int play_switch_to_backup(VdecPlaySession *s, VdecPlayMedia *media, int failure_rc) {
     if (!s || !media) return 0;
@@ -1789,12 +1925,21 @@ static int play_switch_to_backup(VdecPlaySession *s, VdecPlayMedia *media, int f
             play_logf("vdec-play: backup-switch open failed index=%d", backup_index);
             continue;
         }
-        if (media->codec != s->decoder.codec || media->stream->codecpar->width != s->decoder.visible_width ||
-            media->stream->codecpar->height != s->decoder.visible_height) {
-            play_logf("vdec-play: backup-switch format mismatch index=%d codec=%u size=%dx%d", backup_index,
-                      media->codec, media->stream->codecpar->width, media->stream->codecpar->height);
+        if (media->codec != s->decoder.codec) {
+            play_logf("vdec-play: backup-switch codec mismatch index=%d codec=%s expected=%s", backup_index,
+                      play_codec_name(media->codec), play_codec_name(s->decoder.codec));
             play_media_close(media);
             continue;
+        }
+        if (media->stream->codecpar->width != s->decoder.visible_width ||
+            media->stream->codecpar->height != s->decoder.visible_height) {
+            /* Same codec, different rendition: swap the instance for its size
+             * instead of discarding a working backup. */
+            if (play_rebuild_decoder(s, media, media->stream->codecpar->width,
+                                     media->stream->codecpar->height) != 0) {
+                play_media_close(media);
+                continue;
+            }
         }
         const int64_t origin90k =
             media->stream->start_time != AV_NOPTS_VALUE
@@ -1810,7 +1955,7 @@ static int play_switch_to_backup(VdecPlaySession *s, VdecPlayMedia *media, int f
                 sequential_seek = 1;
             }
         }
-        av_bsf_flush(media->bsf);
+        if (media->bsf) av_bsf_flush(media->bsf);
         pthread_mutex_lock(&s->mutex);
         if (play_stop_requested(s) || s->fallback) {
             pthread_mutex_unlock(&s->mutex);
@@ -1917,14 +2062,24 @@ static int play_sequential_seek_skip(VdecPlaySession *s, const AVPacket *packet,
     pthread_mutex_unlock(&s->mutex);
     if (!enabled) return 0;
     const int64_t pts90k = av_rescale_q(packet->pts, time_base, (AVRational){1, 90000}) - origin90k;
-    const VdecPlayNalFlags nal = play_scan_nals(packet->data, packet->size, s->decoder.codec);
-    if (pts90k < target90k || !nal.idr) return 1;
+    const int key = s->decoder.codec == VDEC_PLAY_CODEC_VP9
+                        ? (packet->flags & AV_PKT_FLAG_KEY) != 0
+                        : play_scan_nals(packet->data, packet->size, s->decoder.codec).idr;
+    if (pts90k < target90k || !key) return 1;
     pthread_mutex_lock(&s->mutex);
     if (s->sequential_seek) s->sequential_seek = 0;
     pthread_mutex_unlock(&s->mutex);
     play_logf("vdec-play: sequential seek reached pts90k=%lld target90k=%lld idr=%d",
-              (long long)pts90k, (long long)target90k, nal.idr);
+              (long long)pts90k, (long long)target90k, key);
     return 0;
+}
+
+/* BSF-less streams (VP9) hand the demuxed packet straight to the decoder; the
+ * Annex-B filters keep going through their filter graph. */
+static int play_route_au(VdecPlaySession *s, VdecPlayMedia *media, const AVPacket *packet) {
+    if (play_sequential_seek_skip(s, packet, media->time_base)) return VDEC_PLAY_RESULT_OK;
+    return play_submit_au(s, packet->data, packet->size, packet->pts, packet->dts, media->time_base,
+                          (packet->flags & AV_PKT_FLAG_KEY) != 0);
 }
 
 static void play_wait_if_paused(VdecPlaySession *s);
@@ -2024,6 +2179,19 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             }
             play_packet_trace_record(media, input);
         }
+        if (media->bsf == NULL) {
+            const int submit = play_route_au(s, media, input);
+            av_packet_unref(input);
+            if (submit == VDEC_PLAY_RESULT_SEEK || submit == VDEC_PLAY_RESULT_RECONFIGURE) {
+                result = submit;
+                goto done;
+            }
+            if (submit < 0) {
+                result = -1;
+                goto done;
+            }
+            continue;
+        }
         int rc = av_bsf_send_packet(media->bsf, input);
         av_packet_unref(input);
         if (rc < 0) {
@@ -2050,8 +2218,8 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             const int submit = play_submit_au(s, filtered->data, filtered->size, filtered->pts, filtered->dts,
                                               media->time_base, (filtered->flags & AV_PKT_FLAG_KEY) != 0);
             av_packet_unref(filtered);
-            if (submit == VDEC_PLAY_RESULT_SEEK) {
-                result = VDEC_PLAY_RESULT_SEEK;
+            if (submit == VDEC_PLAY_RESULT_SEEK || submit == VDEC_PLAY_RESULT_RECONFIGURE) {
+                result = submit;
                 goto done;
             }
             if (submit < 0) {
@@ -2062,37 +2230,37 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
     }
 flush_bsf:
     if (!play_stop_requested(s) && !s->fallback && !__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
-        int rc = av_bsf_send_packet(media->bsf, NULL);
-        if (rc < 0 && rc != AVERROR_EOF) {
-            play_log_av_error("BSF flush", rc);
-            play_fail(s, "bsf-flush-error", rc);
-            result = -1;
-        }
-        while (result == VDEC_PLAY_RESULT_OK && !play_stop_requested(s) && !s->fallback &&
-               !__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
-            rc = av_bsf_receive_packet(media->bsf, filtered);
-            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
-            if (rc < 0) {
-                play_log_av_error("BSF flush receive", rc);
+        if (media->bsf) {
+            int rc = av_bsf_send_packet(media->bsf, NULL);
+            if (rc < 0 && rc != AVERROR_EOF) {
+                play_log_av_error("BSF flush", rc);
                 play_fail(s, "bsf-flush-error", rc);
                 result = -1;
-                break;
             }
-            if (play_sequential_seek_skip(s, filtered, media->time_base)) {
+            while (result == VDEC_PLAY_RESULT_OK && !play_stop_requested(s) && !s->fallback &&
+                   !__atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE)) {
+                rc = av_bsf_receive_packet(media->bsf, filtered);
+                if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+                if (rc < 0) {
+                    play_log_av_error("BSF flush receive", rc);
+                    play_fail(s, "bsf-flush-error", rc);
+                    result = -1;
+                    break;
+                }
+                const int submit = play_route_au(s, media, filtered);
                 av_packet_unref(filtered);
-                continue;
+                if (submit == VDEC_PLAY_RESULT_SEEK || submit == VDEC_PLAY_RESULT_RECONFIGURE) {
+                    result = submit;
+                    break;
+                }
+                if (submit < 0) result = -1;
             }
-            const int submit = play_submit_au(s, filtered->data, filtered->size, filtered->pts, filtered->dts,
-                                              media->time_base, (filtered->flags & AV_PKT_FLAG_KEY) != 0);
-            av_packet_unref(filtered);
-            if (submit == VDEC_PLAY_RESULT_SEEK) {
-                result = VDEC_PLAY_RESULT_SEEK;
-                break;
-            }
-            if (submit < 0) result = -1;
         }
-        if (result == VDEC_PLAY_RESULT_OK && !s->fallback && !play_stop_requested(s) && play_flush(s) != 0)
-            result = -1;
+        if (result == VDEC_PLAY_RESULT_OK && !s->fallback && !play_stop_requested(s)) {
+            /* Preserve SEEK/RECONFIGURE from the tail flush; only -1 is a failure. */
+            const int flush_rc = play_flush(s);
+            if (flush_rc != 0) result = flush_rc;
+        }
     }
 done:
     av_packet_free(&input);
@@ -2206,11 +2374,19 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
             play_fail(s, "replay-open", -9022);
             return -1;
         }
-        if (media->codec != s->decoder.codec || media->stream->codecpar->width != s->decoder.visible_width ||
-            media->stream->codecpar->height != s->decoder.visible_height) {
+        if (media->codec != s->decoder.codec) {
             play_media_close(media);
             play_fail(s, "replay-format", -9023);
             return -1;
+        }
+        if (media->stream->codecpar->width != s->decoder.visible_width ||
+            media->stream->codecpar->height != s->decoder.visible_height) {
+            if (play_rebuild_decoder(s, media, media->stream->codecpar->width,
+                                     media->stream->codecpar->height) != 0) {
+                play_media_close(media);
+                play_fail(s, "replay-recreate", -9023);
+                return -1;
+            }
         }
         s->flush_each_decode = !media->has_reorder;
         play_logf("vdec-play: replay media reopened codec=%u size=%dx%d flush_each_decode=%d", media->codec,
@@ -2245,7 +2421,7 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
             }
         }
     }
-    av_bsf_flush(media->bsf);
+    if (media->bsf) av_bsf_flush(media->bsf);
     pthread_mutex_lock(&s->mutex);
     if (!s->timeline_origin_set) {
         s->timeline_origin_pts = media->stream->start_time != AV_NOPTS_VALUE
@@ -2290,6 +2466,70 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
               (unsigned long long)generation, seconds, (long long)target90k, superseded);
     return 0;
 }
+/* Mid-stream or re-open resolution change: the running instance was created
+ * for the old size, so the ABI cannot decode the new frames into its pool.
+ * Tears the instance down and builds one for the reported dimensions. Slots,
+ * pending PTS and the IDR wait are reset; callers decide how to resume. */
+static int play_rebuild_decoder(VdecPlaySession *s, VdecPlayMedia *media, int width, int height) {
+    if (width <= 0 || height <= 0) {
+        play_logf("vdec-play: recreate rejected new=%dx%d", width, height);
+        return -1;
+    }
+    play_logf("vdec-play: recreate reason=resolution old=%dx%d new=%dx%d", s->decoder.visible_width,
+              s->decoder.visible_height, width, height);
+    /* The AGC may still be sampling the old frame pool. */
+    pthread_mutex_lock(&s->mutex);
+    play_wait_for_present_locked(s);
+    pthread_mutex_unlock(&s->mutex);
+    evo_agc_runtime_wait_idle(VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS);
+    play_decoder_close(&s->decoder);
+    s->resources_live = 0;
+    if (play_setup_decoder(s, media->stream->codecpar, width, height) != 0) {
+        play_logf("vdec-play: recreate setup failed new=%dx%d", width, height);
+        return -1;
+    }
+    pthread_mutex_lock(&s->mutex);
+    s->pending_count = 0;
+    s->peak_pending_count = 0;
+    s->ready_count = 0;
+    s->current_slot = -1;
+    s->present_pending = 0;
+    s->present_pending_since_us = 0;
+    s->last_output_pts = INT64_MIN;
+    s->awaiting_idr = 1;
+    s->sps_seen = 0;
+    s->pps_seen = 0;
+    s->vps_seen = 0;
+    s->reconfigure_requested = 0;
+    s->reconfigure_width = 0;
+    s->reconfigure_height = 0;
+    memset(s->ready_queue, 0, sizeof(s->ready_queue));
+    memset(s->slots, 0, sizeof(s->slots));
+    s->decoder_ready = 1;
+    pthread_cond_broadcast(&s->condition);
+    pthread_mutex_unlock(&s->mutex);
+    play_logf("vdec-play: recreate ready visible=%dx%d", width, height);
+    return 0;
+}
+
+/* After a decode-time resolution change the fresh instance has no reference
+ * frames, so ask the existing seek path for an IDR at the current clock. */
+static int play_recreate_decoder(VdecPlaySession *s, VdecPlayMedia *media) {
+    pthread_mutex_lock(&s->mutex);
+    const int width = s->reconfigure_width;
+    const int height = s->reconfigure_height;
+    pthread_mutex_unlock(&s->mutex);
+    if (play_rebuild_decoder(s, media, width, height) != 0) return -1;
+    pthread_mutex_lock(&s->mutex);
+    const double resume = s->last_clock_pts != INT64_MIN ? (double)s->last_clock_pts / 90000.0 : 0.0;
+    s->seek_seconds = resume;
+    s->seek_requested = 1;
+    ++s->seek_request_generation;
+    pthread_cond_broadcast(&s->condition);
+    pthread_mutex_unlock(&s->mutex);
+    play_logf("vdec-play: recreate resume=%.3f", resume);
+    return 0;
+}
 static void *play_thread_main(void *opaque) {
     VdecPlaySession *s = (VdecPlaySession *)opaque;
     VdecPlayMedia media;
@@ -2332,7 +2572,8 @@ static void *play_thread_main(void *opaque) {
         }
     }
     const int decoder_ok = media_ok && auto_gate_ok && !play_stop_requested(s) && !s->fallback &&
-                           play_setup_decoder(s, media.stream->codecpar) == 0;
+                           play_setup_decoder(s, media.stream->codecpar, media.stream->codecpar->width,
+                                              media.stream->codecpar->height) == 0;
     if (!decoder_ok) {
         if (!play_stop_requested(s) && !s->fallback) play_fail(s, "startup-failure", -9020);
         if (s->resources_live) {
@@ -2357,6 +2598,13 @@ static void *play_thread_main(void *opaque) {
             if (result == VDEC_PLAY_RESULT_SEEK) {
                 const int restart_rc = play_restart_after_seek(s, &media);
                 if (restart_rc < 0) {
+                    result = -1;
+                    break;
+                }
+                continue;
+            }
+            if (result == VDEC_PLAY_RESULT_RECONFIGURE) {
+                if (play_recreate_decoder(s, &media) != 0) {
                     result = -1;
                     break;
                 }
@@ -2428,6 +2676,9 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->sequential_seek = 0;
     s->sequential_seek_pts90k = 0;
     s->ready_count = 0;
+    s->reconfigure_requested = 0;
+    s->reconfigure_width = 0;
+    s->reconfigure_height = 0;
     // A quality restart clears the slot array; never let the draw path treat the old session's index as a frame.
     s->current_slot = -1;
     s->present_pending = 0;
@@ -2568,6 +2819,9 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     const char *switch_url = getenv("WILIWILI_VDEC_SWITCH_URL");
     const int is_switch_request = switch_url != NULL && strcmp(requested_url, switch_url) == 0;
     const char *source = !is_switch_request && override_url != NULL && override_url[0] != '\0' ? override_url : requested_url;
+    /* A test override replaces the media, so the B站 resume position no longer
+     * addresses anything in it; seeking to it would land past EOF. */
+    const int source_overridden = strcmp(source, requested_url) != 0;
     VdecPlaySession *s = &g_vdec_play;
     pthread_mutex_lock(&s->mutex);
     if (strlen(source) >= sizeof(s->source_url)) {
@@ -2588,8 +2842,11 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
     s->trace_latency    = play_gate_value("WILIWILI_VDEC_TRACE_LATENCY");
     s->adaptive_pending = 1;
     if (play_gate_value("WILIWILI_VDEC_FIXED_PENDING")) s->adaptive_pending = 0;
-    s->p010_enabled = play_gate_value("WILIWILI_VDEC_P010");
-    play_logf("vdec-play: p010-present=%d", s->p010_enabled);
+    const int p010_flag = play_env_flag("WILIWILI_VDEC_P010");
+    /* 10-bit presentation is part of the shipped C path now; the knob only
+     * exists to force the A path for a suspect stream. */
+    s->p010_enabled = p010_flag < 0 ? 1 : p010_flag;
+    play_logf("vdec-play: p010-present=%d%s", s->p010_enabled, p010_flag < 0 ? " (default)" : " (override)");
     const char *pending_limit = getenv("WILIWILI_VDEC_PENDING_LIMIT");
     if (pending_limit != NULL) {
         const int requested_limit = atoi(pending_limit);
@@ -2602,10 +2859,12 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
                       s->pending_limit);
         }
     }
-    if (start_seconds > 0) {
+    if (start_seconds > 0 && !source_overridden) {
         s->seek_requested = 1;
         ++s->seek_request_generation;
         s->seek_seconds = start_seconds;
+    } else if (start_seconds > 0) {
+        play_logf("vdec-play: start position ignored for overridden source start=%d", start_seconds);
     }
     s->start_wall_us = play_now_us();
     s->first_present_us = 0;
@@ -2845,7 +3104,11 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
     int uv_pitch = frame->pitch_bytes;
     int ten_bit = 0;
     int color_trc = 1;
-    const int native_p010_hdr = frame->p010 && (s->video_color_trc == 16 || s->video_color_trc == 18);
+    /* PQ P010 has a compiled pipe, so it goes straight in as 16-bit planes.
+     * 10-bit SDR/HLG is converted to NV12 first: the SDR blit pipe has no
+     * 16-bit variant, and presenting PQ output for an SDR transfer would
+     * shift every colour. */
+    const int native_p010_hdr = frame->p010 && s->decoder.p010_native;
     if (frame->p010 && !native_p010_hdr) {
         if (!s->decoder.p010_pool.address) {
             play_fail_locked(s, "p010-conversion-pool", -9027);
@@ -2887,6 +3150,11 @@ int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int 
                                         ? s->first_present_us - s->start_wall_us
                                         : 0;
         play_logf("vdec-play: first-presented elapsed_ms=%llu", (unsigned long long)(elapsed_us / 1000));
+        play_logf("vdec-play: first-frame codec=%s frame=%dx%d pitch=%d pitch_bytes=%d p010=%d path=%s ten_bit=%d "
+                  "trc=%d view=%d,%d %dx%d mode=%d",
+                  play_codec_name(s->decoder.codec), frame->width, frame->height, frame->pitch, frame->pitch_bytes,
+                  frame->p010, !frame->p010 ? "nv12" : native_p010_hdr ? "p010-native" : "p010-convert", ten_bit,
+                  color_trc, view_x, view_y, view_w, view_h, view_mode);
     }
     if (s->presented_count == 1 || s->presented_count % 120 == 0)
         play_logf(
