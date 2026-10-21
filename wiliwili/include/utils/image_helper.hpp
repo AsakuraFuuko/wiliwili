@@ -64,6 +64,21 @@ public:
 
     static std::string parseNoteImageUrl(const std::string& url, size_t w, size_t h);
 
+    /**
+     * Occupancy report for the render memory a page owns: texture cache,
+     * seek-preview sprite sheets and the video surface. `dumpEntries` also
+     * lists each cached texture with its reference count, which tells a
+     * still-visible cover from one a gone page forgot to release.
+     * Diagnostic only; verbose-line output goes to the title log.
+     */
+    static void logVideoMemory(const char* tag, bool dumpEntries = false);
+
+    /**
+     * Start the periodic (5 s) memory report when WILIWILI_MEM_TRACE is set in
+     * assets/wiliwili-options.txt. No-op otherwise. Idempotent.
+     */
+    static void startMemoryTrace();
+
     /// 图片请求后缀，用来控制图片大小
 #ifdef USE_WEBP
 #define IMAGE_EXT ".webp"

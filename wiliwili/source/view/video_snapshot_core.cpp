@@ -37,6 +37,26 @@ void VideoSnapshotCore::setSnapshotData(const bilibili::VideoSnapshotData& data)
 
 bool VideoSnapshotCore::isValid() const { return snapshotData.isValid(); }
 
+size_t VideoSnapshotCore::getTextureBytes() const {
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg) return 0;
+    size_t bytes = 0;
+    for (int tex : snapshotTextures) {
+        if (tex <= 0) continue;
+        int width = 0, height = 0;
+        nvgImageSize(vg, tex, &width, &height);
+        if (width > 0 && height > 0) bytes += (size_t)width * (size_t)height * 4;
+    }
+    return bytes;
+}
+
+size_t VideoSnapshotCore::getTextureCount() const {
+    size_t count = 0;
+    for (int tex : snapshotTextures)
+        if (tex > 0) ++count;
+    return count;
+}
+
 void VideoSnapshotCore::preloadForTime(float seekTimeSec) {
     if (!snapshotData.isValid()) return;
     int imageIdx = findIndex(seekTimeSec);

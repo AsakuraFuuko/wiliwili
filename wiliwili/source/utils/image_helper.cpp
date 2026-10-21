@@ -25,9 +25,14 @@
 #include <borealis/core/thread.hpp>
 #include <stb_image.h>
 
+#if defined(BOREALIS_USE_AGC)
+#include <borealis/extern/nanovg/agc/evo_direct_mem.h>
+#endif
+
 #include "utils/image_helper.hpp"
 #include "utils/string_helper.hpp"
 #include "api/bilibili/util/http.hpp"
+#include "view/video_snapshot_core.hpp"
 
 #ifdef USE_WEBP
 #include <webp/decode.h>
@@ -630,6 +635,7 @@ ImageHelper::ImageHelper(brls::Image* view) : imageView(view) {}
 ImageHelper::~ImageHelper() { brls::Logger::verbose("delete ImageHelper {}", (size_t)this); }
 
 std::shared_ptr<ImageHelper> ImageHelper::with(brls::Image* view) {
+    startMemoryTrace();
     std::lock_guard<std::mutex> lock(requestMutex);
     std::shared_ptr<ImageHelper> item;
     bool sameView = false;
@@ -1172,4 +1178,55 @@ std::string ImageHelper::parseGifImageUrl(const std::string& url, const std::str
 
 std::string ImageHelper::parseNoteImageUrl(const std::string& url, size_t w, size_t h) {
     return parseGifImageUrl(url, wiliwili::format(note_custom_ext, w, h));
+}
+
+void ImageHelper::logVideoMemory(const char* tag, bool dumpEntries) {
+#if defined(PS5_NATIVE_APP)
+    auto& textures    = brls::TextureCache::instance();
+    size_t directUsed = 0, directTotal = 0, directPeak = 0, directAllocs = 0;
+#if defined(BOREALIS_USE_AGC)
+    evo_direct_mem_stats_t direct{};
+    evo_direct_mem_get_stats(&direct);
+    directUsed   = direct.allocated_bytes;
+    directTotal  = direct.total_bytes;
+    directPeak   = direct.peak_bytes;
+    directAllocs = direct.num_allocations;
+#endif
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "mem-page: tag=%s cache=%zu/%zuB ref=%zuB unref=%zu snap=%zu/%zu pool=%zu/%zu peak=%zu allocs=%zu",
+                  tag, textures.getSize(), textures.getTotalBytes(), textures.getReferencedBytes(),
+                  textures.getUnreferencedCount(), VideoSnapshotCore::instance().getTextureBytes(),
+                  VideoSnapshotCore::instance().getTextureCount(), directUsed, directTotal, directPeak, directAllocs);
+    wiliwili_boot_log(line);
+
+    if (!dumpEntries) return;
+    NVGcontext* vg = brls::Application::getNVGContext();
+    for (const auto& item : textures.cache.getCacheList()) {
+        int width = 0, height = 0;
+        nvgImageSize(vg, (int)item.value, &width, &height);
+        const std::string& url = item.key;
+        std::snprintf(line, sizeof(line), "mem-page:  tex=%zu %dx%d bytes=%zu ref=%zu %s%s", item.value, width, height,
+                      item.bytes, item.count - 1, item.dirty ? "dirty " : "",
+                      url.size() > 56 ? url.c_str() + (url.size() - 56) : url.c_str());
+        wiliwili_boot_log(line);
+    }
+#endif
+}
+
+void ImageHelper::startMemoryTrace() {
+#if defined(PS5_NATIVE_APP)
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (std::getenv("WILIWILI_MEM_TRACE") == nullptr) return;
+        brls::Application::getRunLoopEvent()->subscribe([]() {
+            static auto last = std::chrono::steady_clock::now();
+            const auto now   = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::seconds(5)) return;
+            last = now;
+            logVideoMemory("periodic");
+        });
+        logVideoMemory("start", true);
+    });
+#endif
 }

@@ -15,10 +15,12 @@
 #include "utils/config_helper.hpp"
 #include "utils/dialog_helper.hpp"
 #include "utils/number_helper.hpp"
+#include "utils/image_helper.hpp"
 #include "presenter/comment_related.hpp"
 #include "utils/shortcut_helper.hpp"
 #include "view/qr_image.hpp"
 #include "view/video_view.hpp"
+#include "view/video_snapshot_core.hpp"
 #include "view/grid_dropdown.hpp"
 #include "view/subtitle_core.hpp"
 #include "view/mpv_core.hpp"
@@ -882,4 +884,13 @@ BasePlayerActivity::~BasePlayerActivity() {
     APP_E->unsubscribe(customEventSubscribeID);
     // 停止视频播放
     this->video->stop();
+    /* The page is going away. Release what belongs to it and would otherwise
+     * stay in the direct-memory pool for the rest of the session: the seek
+     * preview sprite sheets (one 3600x3600 sheet is 51.8 MB) and the video
+     * surface mpv keeps for its last frame. Both run on the main thread and
+     * are invalidated against in-flight callbacks by their own generations. */
+    ImageHelper::logVideoMemory("player-exit");
+    VideoSnapshotCore::instance().reset();
+    MPVCore::instance().releaseVideoSurface();
+    ImageHelper::logVideoMemory("player-exit-released");
 }

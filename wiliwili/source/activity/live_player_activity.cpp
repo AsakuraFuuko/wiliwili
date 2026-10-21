@@ -872,7 +872,10 @@ LiveActivity::~LiveActivity() {
     // 清空置顶SC数据
     this->pinnedSuperChats.clear();
     this->pinnedSuperChatViews.clear();
-    
+
+    // 释放播放器画布，避免退出直播间后仍占用直连内存
+    MPVCore::instance().releaseVideoSurface();
+
     brls::Logger::debug("LiveActivity: delete completed");
 }
 

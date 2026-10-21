@@ -52,7 +52,8 @@ extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int p
 extern "C" void wiliwili_vdec_play_restore_ui_state(void);
 extern "C" void wiliwili_boot_log(const char *message);
 /* App-owned audio path: FFmpeg decode + sceAudioOut, clock master for A/V sync. */
-extern "C" int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count,
+extern "C" int wiliwili_audio_available(void);
+extern "C" int wiliwili_audio_start(const char* video_url, const char* const* audio_urls, int audio_count,
                                     double start_seconds);
 extern "C" void wiliwili_audio_stop(void);
 extern "C" void wiliwili_audio_pause(int paused);
@@ -737,7 +738,7 @@ void VideoView::runNativeAudioAutotest() {
     /* 真机取证钩子：固定节奏跑一遍 seek / 暂停恢复 / 切音轨，日志里留下
      * audio-test:* 与漂移收据（WILIWILI_AUDIO_AUTOTEST=1 时启用）。 */
     if (std::getenv("WILIWILI_AUDIO_AUTOTEST") == nullptr) return;
-    if (!this->native_vdec_play_owner || !wiliwili_audio_is_active()) return;
+    if (!this->native_vdec_play_owner || this->fullscreen_mirror || !wiliwili_audio_is_active()) return;
     const uint64_t now = brls::getCPUTimeUsec();
     if (this->native_audio_autotest_start_us == 0) this->native_audio_autotest_start_us = now;
     const uint64_t elapsed_ms = (now - this->native_audio_autotest_start_us) / 1000;
@@ -759,7 +760,7 @@ void VideoView::runNativeAudioAutotest() {
         mpvCore->seek(5);
     } else if (this->native_audio_autotest_stage == 4 && elapsed_ms >= 21500) {
         this->native_audio_autotest_stage = 5;
-        const int tracks = wiliwili_audio_track_count();
+        const int tracks                  = wiliwili_audio_track_count();
         char line[128];
         if (tracks > 1) {
             std::snprintf(line, sizeof(line), "audio-test: switch-track %d/%d", 1, tracks);
@@ -1143,8 +1144,8 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::ve
      * DASH 用独立的音频轨；非 DASH（单文件/FLV）则由该模块从同一 URL 里选
      * 音轨。EDL 拼接没有稳定时间线，直接留在 mpv 音频。 */
     const bool audioCandidate = url.rfind("edl://", 0) != 0;
-    int audioStarted         = 0;
-    if (audioCandidate) {
+    int audioStarted          = 0;
+    if (audioCandidate && !mpvCore->isMpvAudioFallback() && wiliwili_audio_available()) {
         std::vector<std::string> audioSources = audios;
         if (audioOverride != nullptr && audioOverride[0] != '\0') audioSources.assign(1, audioOverride);
         std::vector<const char*> audioPtrs;
@@ -1160,7 +1161,7 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::ve
         } else {
             mpvCore->fallbackToMpvAudio("start-rejected");
         }
-    } else {
+    } else if (!audioCandidate) {
         mpvCore->fallbackToMpvAudio("edl-url");
     }
 #endif

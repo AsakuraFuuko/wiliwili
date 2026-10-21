@@ -396,7 +396,7 @@ private:
     void runNativeVdecStress();
     void runNativeAudioAutotest();
     // WILIWILI_AUDIO_AUTOTEST 的节奏状态（seek / 暂停恢复 / 切音轨）
-    int native_audio_autotest_stage = 0;
+    int native_audio_autotest_stage         = 0;
     uint64_t native_audio_autotest_start_us = 0;
 
     bool is_seeking     = false;  // 是否正在请求跳转

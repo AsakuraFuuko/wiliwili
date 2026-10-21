@@ -38,8 +38,10 @@ output thread: ring -> 音量 -> sceAudioOutOutput(阻塞) / SDL_QueueAudio + �
 
 ### 2.2 回退链
 
-1. 启动时 `wiliwili_audio_available()` 探测 `sceAudioOutInit` + 开/关一个 512 帧端口；失败则 mpv 直接用 `ao=sdl`。
-2. 每次起播 `wiliwili_audio_start()`（非阻塞）；线程创建/URL 为空等同步失败 → 当场 `FALLBACK_MPV_AO reason=start-rejected`。
+1. 启动时 `wiliwili_audio_available()` 只探测一次 `sceAudioOutInit`（`sceAudioOutInit` 是进程级一次性初始化，
+   重复调用会返回错误）；失败则 mpv 直接用 `ao=sdl`。真实端口在每次起播时同步打开，失败立刻回退。
+2. 每次起播 `wiliwili_audio_start()`：网络/解码在线程里，但端口在调用线程同步打开；线程创建、URL 为空、
+   端口被拒等同步失败 → 当场 `FALLBACK_MPV_AO reason=start-rejected`，此后本进程不再尝试新路径（避免双路出声）。
 3. 运行中打开/解码/端口失败由 `wiliwili_audio_take_failure()` 上报（在 `VideoView::draw` 轮询）→ 停新路径 + `ao=sdl`/`ao-reload`，mpv 的音频链在当前位置继续出声。
 4. mpv 播放列表自动前进（备用视频 URL 接管）时，`MPV_EVENT_FILE_LOADED` 发现 `path` 与起播 URL 不同 → 同样交还 mpv。
 
@@ -62,11 +64,35 @@ flock -w 3600 /tmp/ps5-dev.lock -c 'bash scripts/ps5/native/test-cycle.sh PPSA99
 
 ## 4. 证据
 
-（真机测试后回填）
+### 4.1 旁证（**来自含 C 路半成品代码的别人构建**，只能证明音频链路在跑，不作为最终验收）
+
+构建 marker `Oct 21 2026 19:52:02`，视频 `BV`/cid `42689235040`（63 s，HEVC DASH，A 路），日志：
+
+- `audio: probe ps5 audio available`、`audio: mpv ao=null (app audio path owns output)`
+- `audio: start tracks=3 start=-1.000`（3 个 DASH 音频镜像 URL）
+- `audio: demux ready codec=aac rate=44100 ch=2 tb=0.000023 duration=63.065 streams=1`
+- `audio: output backend=sdl`（**直连 sceAudioOut 未成功**；当时 `audio_ps5_open` 与探测各调用了一次
+  `sceAudioOutInit()`，第二次返回错误被当成失败。SDL 驱动因此接管，`blocks` 持续增长、`underrun=0`）
+- 2 s 采样的 `audio: clock=… mpv=… drift_ms=…`，`blocks≈47/s`；`max_ms=137.3` 出现在起播后 2 s 内，
+  之后长期在 ±20–70 ms 摆动。摆动主要来自 `playback-time` 属性 ~100 ms 的更新粒度（本次改动已改为
+  用挂钟外推后再比较）。
+
+## 4.2 待补（最终构建）
+
+- 短/长视频有声（`backend=ps5` 或 `backend=sdl driver=ps5`）
+- `WILIWILI_AUDIO_AUTOTEST`：seek 20 → pause → resume → seek 5 → switch-track 的日志与漂移
+- EOF：`audio: eof` + `audio: output drained`，画面定格、无后续 `audio: clock` 增长
+- 退出：`audio: summary`，之后无音频日志
+- 长视频 10 分钟：`drift_ms` / `max_ms` < 100 ms
+- 回归：health 三项 0、无 `FALLBACK_A`、无 crash、封面/HUD/全屏/EOF 行为不变
 
 ## 5. 已知边界 / 未验证
 
 - 倍速播放是重采样（音高随速度变化），没有做 `atempo`/time-stretch。
 - FLV/单文件走两条 FFmpeg 连接（视频一条、音频一条），网络开销按音轨码率增加；DASH 本来就是分轨。
 - 音频设备的实际吞吐若与标称 48 kHz 有偏差，漂移会体现在 `drift_ms`；校正只作用于 mpv 时钟，不改音频时钟。
+- 漂移指标同时记录 `max_ms`（含起播瞬态）与 `settle_max_ms`（起播 10 s 之后、且跳过每次 seek/切轨后 4 s 的取流期），
+  验收以 `settle_max_ms` 为准。
+- seek/切轨后音频要重开 demuxer，声音会短暂落后；此时把 mpv `speed` 压到 0.25x 等声音追上（`audio: sync hold/release`），
+  不碰 pause 状态。A 路画面在这 1 s 左右会接近定格，属预期。
 - 未能直接录制主机声音：EOF/退出的“无残留”以端口关闭日志 + 线程 join 为证据，主观听感未验证。

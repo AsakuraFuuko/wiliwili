@@ -66,6 +66,12 @@ public:
     void draw(NVGcontext* vg, float x, float y, float width, float height, float progress, float snapShotWidth,
               float positionX, float positionY);
 
+    /// Bytes held by the loaded sprite sheets (diagnostics; main thread only).
+    size_t getTextureBytes() const;
+
+    /// Number of loaded sprite sheets.
+    size_t getTextureCount() const;
+
 private:
     bilibili::VideoSnapshotData snapshotData;
     std::vector<int> snapshotTextures;   // NVG 纹理 ID，每个精灵图对应一个

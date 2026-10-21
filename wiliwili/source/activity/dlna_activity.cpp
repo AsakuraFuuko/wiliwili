@@ -209,4 +209,6 @@ DLNAActivity::~DLNAActivity() {
     DLNA_EVENT.unsubscribe(dlnaEventSubscribeID);
     dlna->stop();
     video->stop();
+    // 释放播放器画布，避免退出投屏页面后仍占用直连内存
+    MPVCore::instance().releaseVideoSurface();
 }

@@ -52,9 +52,9 @@ extern void wiliwili_boot_log(const char *message);
 /* ---------------------------------------------------------------- device --- */
 /* The payload SDK ships no audio headers; these are the verified PS5 entry
  * points (same ABI and constants the patched SDL2 ps5 driver uses). */
-#define AUDIO_PORT_MAIN          0
-#define AUDIO_FORMAT_S16_STEREO  1
-#define AUDIO_USER_ID_SYSTEM     0xFF
+#define AUDIO_PORT_MAIN 0
+#define AUDIO_FORMAT_S16_STEREO 1
+#define AUDIO_USER_ID_SYSTEM 0xFF
 
 extern int32_t sceAudioOutInit(void);
 extern int32_t sceAudioOutOpen(int32_t userId, int32_t type, int32_t index, uint32_t len, uint32_t freq,
@@ -62,14 +62,14 @@ extern int32_t sceAudioOutOpen(int32_t userId, int32_t type, int32_t index, uint
 extern int32_t sceAudioOutOutput(int32_t handle, const void *p);
 extern int32_t sceAudioOutClose(int32_t handle);
 
-#define AUDIO_OUT_RATE     48000
+#define AUDIO_OUT_RATE 48000
 #define AUDIO_BLOCK_FRAMES 1024
-#define AUDIO_RING_BLOCKS  32
+#define AUDIO_RING_BLOCKS 32
 /* Decode stays a few blocks (≈85 ms) ahead of the port. A deep ring would put
  * the audible position far behind the demuxer, which shows up as a tail of
  * sound after the last frame when the file ends. */
 #define AUDIO_DECODE_AHEAD 4
-#define AUDIO_CHANNELS     2
+#define AUDIO_CHANNELS 2
 
 enum {
     AUDIO_BACKEND_NONE = 0,
@@ -78,10 +78,10 @@ enum {
 };
 
 typedef struct {
-    double pts;   /* media seconds at the first frame */
-    double span;  /* media seconds covered by `frames` (speed-scaled) */
+    double pts;  /* media seconds at the first frame */
+    double span; /* media seconds covered by `frames` (speed-scaled) */
     int frames;
-    int gen;      /* seek/track generation: blocks from an older one are dropped */
+    int gen; /* seek/track generation: blocks from an older one are dropped */
     int16_t pcm[AUDIO_BLOCK_FRAMES * AUDIO_CHANNELS];
 } AudioBlock;
 
@@ -103,10 +103,12 @@ typedef struct {
     volatile int track_request;
     volatile int volume; /* 0..100 */
     volatile double speed;
+    int output_errors;
 
     /* playlist: separate DASH audio URLs, or the muxed video URL when empty */
     char **urls;
     int url_count;
+    int url_is_audio_list; /* 1: urls[] are DASH audio tracks; 0: one muxed file */
     int track;
 
     /* ring */
@@ -163,6 +165,9 @@ typedef struct {
     /* drift meter (vs. mpv playback-time), updated by the app frame hook */
     int drift_valid;
     double drift_max_ms;
+    double drift_max_settle_ms; /* 10 s 之后的最大值：排除起播瞬态 */
+    /* seek/切轨后音频要重新取流，这段时间的位置差不计入最大漂移 */
+    volatile uint64_t drift_ignore_until_us;
     uint64_t drift_last_log_us;
     uint64_t started_us;
 } AudioSession;
@@ -222,7 +227,7 @@ static double audio_clamp(double value, double low, double high) {
 static double audio_clock_locked(AudioSession *s) {
     if (!s->clock_valid) return -1.0;
     if (s->paused) return s->clock_frozen_pts;
-    double pts = s->clock_anchor_pts;
+    double pts         = s->clock_anchor_pts;
     const uint64_t now = audio_now_us();
     if (now > s->clock_anchor_us) {
         double advance = (double)(now - s->clock_anchor_us) * 1e-6 * (s->speed > 0.0 ? s->speed : 1.0);
@@ -279,13 +284,25 @@ static int audio_sdl_open(AudioSession *s) {
         return -1;
     }
     SDL_PauseAudioDevice(dev, 0);
-    audio_log("audio: output sdl driver=%s", SDL_GetCurrentAudioDriver() != NULL ? SDL_GetCurrentAudioDriver() : "?");
+    const char *driver = SDL_GetCurrentAudioDriver();
+    /* "dummy"/"disk" consume the queue without producing sound; using them
+     * would look like a working audio path in the logs while the console is
+     * silent, so refuse and let mpv's AO take over. */
+    if (driver == NULL || strcmp(driver, "dummy") == 0 || strcmp(driver, "disk") == 0) {
+        audio_log("audio: output sdl driver=%s unusable", driver != NULL ? driver : "?");
+        SDL_CloseAudioDevice(dev);
+        s->sdl_device = NULL;
+        return -1;
+    }
+    audio_log("audio: output sdl driver=%s", driver);
     s->sdl_device = (void *)(uintptr_t)dev;
     s->backend    = AUDIO_BACKEND_SDL;
     return 0;
 }
 
-static int audio_output_open(AudioSession *s) {
+/* Both the caller thread (start) and the output thread may try to open the
+ * port; the session mutex makes that a single open. */
+static int audio_output_open_locked(AudioSession *s) {
     if (s->backend != AUDIO_BACKEND_NONE) return 0;
     if (audio_ps5_open(s) == 0) {
         audio_log("audio: output backend=ps5 handle=%d", (int)s->device);
@@ -299,7 +316,14 @@ static int audio_output_open(AudioSession *s) {
     return -1;
 }
 
-static void audio_output_close(AudioSession *s) {
+static int audio_output_open(AudioSession *s) {
+    pthread_mutex_lock(&s->mutex);
+    const int rc = audio_output_open_locked(s);
+    pthread_mutex_unlock(&s->mutex);
+    return rc;
+}
+
+static void audio_output_close_locked(AudioSession *s) {
     if (s->backend == AUDIO_BACKEND_PS5 && s->device >= 1) {
         const int32_t rc = sceAudioOutClose(s->device);
         if (rc != 0) audio_log("audio: output close rc=%d", (int)rc);
@@ -313,9 +337,13 @@ static void audio_output_close(AudioSession *s) {
     s->backend = AUDIO_BACKEND_NONE;
 }
 
-static int audio_block_bytes(const AudioBlock *block) {
-    return block->frames * AUDIO_CHANNELS * (int)sizeof(int16_t);
+static void audio_output_close(AudioSession *s) {
+    pthread_mutex_lock(&s->mutex);
+    audio_output_close_locked(s);
+    pthread_mutex_unlock(&s->mutex);
 }
+
+static int audio_block_bytes(const AudioBlock *block) { return block->frames * AUDIO_CHANNELS * (int)sizeof(int16_t); }
 
 /* Blocking write: sceAudioOutOutput paces on the port, the SDL fallback paces on
  * the queued byte count. */
@@ -323,12 +351,23 @@ static void audio_output_write(AudioSession *s, AudioBlock *block) {
     const int bytes = audio_block_bytes(block);
     if (bytes <= 0) return;
     if (s->backend == AUDIO_BACKEND_PS5 && s->device >= 1) {
-        sceAudioOutOutput(s->device, block->pcm);
+        const int32_t rc = sceAudioOutOutput(s->device, block->pcm);
+        if (rc < 0) {
+            if (++s->output_errors <= 3) audio_log("audio: output write rc=%d", (int)rc);
+            if (s->output_errors >= 8) s->failed = 1;
+        } else {
+            s->output_errors = 0;
+        }
         return;
     }
     if (s->backend == AUDIO_BACKEND_SDL && s->sdl_device != NULL) {
         SDL_AudioDeviceID dev = (SDL_AudioDeviceID)(uintptr_t)s->sdl_device;
-        SDL_QueueAudio(dev, block->pcm, (uint32_t)bytes);
+        if (SDL_QueueAudio(dev, block->pcm, (uint32_t)bytes) != 0) {
+            if (++s->output_errors <= 3) audio_log("audio: output queue err=%s", SDL_GetError());
+            if (s->output_errors >= 8) s->failed = 1;
+        } else {
+            s->output_errors = 0;
+        }
         /* Keep at most three blocks queued: ~64 ms of latency, and it gives the
          * queueing call the same blocking character as sceAudioOutOutput. */
         while (!s->stop && SDL_GetQueuedAudioSize(dev) > (uint32_t)(bytes * 3)) usleep(1000);
@@ -346,7 +385,7 @@ static void audio_apply_volume(AudioBlock *block) {
     const int scale = volume * 32768 / 100;
     for (int i = 0; i < samples; ++i) {
         const int value = ((int)block->pcm[i] * scale) >> 15;
-        block->pcm[i]     = (int16_t)(value > 32767 ? 32767 : (value < -32768 ? -32768 : value));
+        block->pcm[i]   = (int16_t)(value > 32767 ? 32767 : (value < -32768 ? -32768 : value));
     }
 }
 
@@ -359,7 +398,7 @@ static int audio_bili_media_url(const char *url) {
     if (end == NULL) end = authority + strlen(authority);
     const char *port = memchr(authority, ':', (size_t)(end - authority));
     if (port != NULL) end = port;
-    const size_t host_length = (size_t)(end - authority);
+    const size_t host_length            = (size_t)(end - authority);
     static const char *const suffixes[] = {"bilivideo.com", "bilivideo.cn", "bilibili.com", "hdslb.com"};
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
         const size_t suffix_length = strlen(suffixes[i]);
@@ -371,9 +410,7 @@ static int audio_bili_media_url(const char *url) {
     return 0;
 }
 
-static int audio_json_space(char value) {
-    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
-}
+static int audio_json_space(char value) { return value == ' ' || value == '\t' || value == '\r' || value == '\n'; }
 
 static int audio_json_string(const char *begin, const char *end, const char *key, char *value, size_t capacity) {
     char needle[64];
@@ -413,27 +450,26 @@ static int audio_json_string(const char *begin, const char *end, const char *key
 
 static int audio_load_bili_cookie(char *cookie, size_t capacity) {
     cookie[0] = '\0';
-    int fd = open("/download0/wiliwili/config/wiliwili_config.json", O_RDONLY, 0);
+    int fd    = open("/download0/wiliwili/config/wiliwili_config.json", O_RDONLY, 0);
     if (fd < 0) return 0;
     char json[16384];
     const long size = read(fd, json, sizeof(json) - 1);
     close(fd);
     if (size <= 0 || size >= (long)sizeof(json)) return 0;
-    json[size]        = '\0';
-    const char *key  = strstr(json, "\"cookie\"");
+    json[size]      = '\0';
+    const char *key = strstr(json, "\"cookie\"");
     if (key == NULL) return 0;
     const char *object = strchr(key, '{');
     if (object == NULL) return 0;
     const char *object_end = strchr(object + 1, '}');
     if (object_end == NULL) return 0;
     static const char *const names[] = {"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5",
-                                        "_uuid", "buvid3", "sid"};
-    size_t used  = 0;
-    int fields   = 0;
+                                        "_uuid",    "buvid3",   "sid"};
+    size_t used                      = 0;
+    int fields                       = 0;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         char value[512];
-        if (!audio_json_string(object + 1, object_end, names[i], value, sizeof(value)) || value[0] == '\0')
-            continue;
+        if (!audio_json_string(object + 1, object_end, names[i], value, sizeof(value)) || value[0] == '\0') continue;
         const int written = snprintf(cookie + used, capacity - used, "%s%s=%s", fields ? "; " : "", names[i], value);
         if (written < 0 || (size_t)written >= capacity - used) {
             cookie[0] = '\0';
@@ -504,8 +540,8 @@ static int audio_swr_configure(AudioSession *s, const AVFrame *frame) {
     }
     AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
     SwrContext *fresh          = NULL;
-    const int rc = swr_alloc_set_opts2(&fresh, &out_layout, AV_SAMPLE_FMT_S16, out_rate, &in_layout,
-                                      (enum AVSampleFormat)frame->format, frame->sample_rate, 0, NULL);
+    const int rc               = swr_alloc_set_opts2(&fresh, &out_layout, AV_SAMPLE_FMT_S16, out_rate, &in_layout,
+                                                     (enum AVSampleFormat)frame->format, frame->sample_rate, 0, NULL);
     if (rc < 0 || fresh == NULL) {
         audio_log("audio: swr config failed rc=%d", rc);
         if (fresh) swr_free(&fresh);
@@ -560,7 +596,7 @@ static void audio_push_block(AudioSession *s, AudioBlock *block) {
 /* Append converted S16 stereo frames to the pending block, splitting on block
  * boundaries. Media starts at *pts* and advances by 1/(48000*speed) per frame. */
 static void audio_append_samples(AudioSession *s, const int16_t *samples, int frames, double *pts) {
-    const double speed         = s->speed > 0.0 ? s->speed : 1.0;
+    const double speed           = s->speed > 0.0 ? s->speed : 1.0;
     const double media_per_frame = 1.0 / ((double)AUDIO_OUT_RATE * speed);
     int index                    = 0;
     while (index < frames) {
@@ -568,8 +604,8 @@ static void audio_append_samples(AudioSession *s, const int16_t *samples, int fr
         int run         = frames - index;
         if (run > space) run = space;
         if (s->pending_frames == 0) s->pending_pts = *pts;
-        memcpy(&s->pending[(size_t)s->pending_frames * AUDIO_CHANNELS],
-               &samples[(size_t)index * AUDIO_CHANNELS], (size_t)run * AUDIO_CHANNELS * sizeof(int16_t));
+        memcpy(&s->pending[(size_t)s->pending_frames * AUDIO_CHANNELS], &samples[(size_t)index * AUDIO_CHANNELS],
+               (size_t)run * AUDIO_CHANNELS * sizeof(int16_t));
         s->pending_frames += run;
         index += run;
         *pts += (double)run * media_per_frame;
@@ -638,8 +674,7 @@ static void audio_decode_frame_to_ring(AudioSession *s, AVFrame *frame) {
             s->prod_pts = end;
             return;
         }
-        if (pts < s->discard_until)
-            skip = (int)ceil((s->discard_until - pts) * (double)AUDIO_OUT_RATE * speed) - 1;
+        if (pts < s->discard_until) skip = (int)ceil((s->discard_until - pts) * (double)AUDIO_OUT_RATE * speed) - 1;
         if (skip < 0) skip = 0;
         if (skip > converted) skip = converted;
         s->discard_until = -1.0;
@@ -677,7 +712,7 @@ static int audio_open_input(AudioSession *s, double start_seconds, int seek_only
         if (fmt == NULL) return -1;
         fmt->interrupt_callback.callback = audio_interrupt;
         fmt->interrupt_callback.opaque   = s;
-        AVDictionary *options = NULL;
+        AVDictionary *options            = NULL;
         av_dict_set(&options, "rw_timeout", "5000000", 0);
         av_dict_set(&options, "timeout", "5000000", 0);
         av_dict_set(&options, "reconnect", "1", 0);
@@ -685,14 +720,13 @@ static int audio_open_input(AudioSession *s, double start_seconds, int seek_only
         av_dict_set(&options, "reconnect_on_network_error", "1", 0);
         av_dict_set(&options, "multiple_requests", "1", 0);
         char cookie[2048];
-        const int bili_url     = audio_bili_media_url(url);
+        const int bili_url      = audio_bili_media_url(url);
         const int cookie_fields = bili_url ? audio_load_bili_cookie(cookie, sizeof(cookie)) : 0;
         char headers[4096];
         const int header_length = snprintf(headers, sizeof(headers),
                                            "Referer: https://www.bilibili.com\r\nUser-Agent: Mozilla/5.0\r\n%s%s\r\n",
                                            cookie_fields > 0 ? "Cookie: " : "", cookie_fields > 0 ? cookie : "");
-        if (header_length > 0 && (size_t)header_length < sizeof(headers))
-            av_dict_set(&options, "headers", headers, 0);
+        if (header_length > 0 && (size_t)header_length < sizeof(headers)) av_dict_set(&options, "headers", headers, 0);
         int rc = avformat_open_input(&fmt, url, NULL, &options);
         av_dict_free(&options);
         if (rc < 0) {
@@ -706,13 +740,13 @@ static int audio_open_input(AudioSession *s, double start_seconds, int seek_only
             avformat_close_input(&fmt);
             return -1;
         }
-        const int stream_index = audio_pick_stream(fmt, s->url_count > 0 ? 0 : s->track);
+        const int stream_index = audio_pick_stream(fmt, s->url_is_audio_list ? 0 : s->track);
         if (stream_index < 0) {
             audio_log("audio: no audio stream");
             avformat_close_input(&fmt);
             return -1;
         }
-        AVStream *stream = fmt->streams[stream_index];
+        AVStream *stream     = fmt->streams[stream_index];
         const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
         if (codec == NULL) {
             audio_log("audio: no decoder id=%d", stream->codecpar->codec_id);
@@ -741,8 +775,8 @@ static int audio_open_input(AudioSession *s, double start_seconds, int seek_only
         s->sample_rate  = stream->codecpar->sample_rate;
         s->channels     = stream->codecpar->ch_layout.nb_channels;
         s->stream_count = audio_stream_count(fmt);
-        audio_log("audio: demux ready codec=%s rate=%d ch=%d tb=%.6f duration=%.3f streams=%d",
-                  codec->name, s->sample_rate, s->channels, s->time_base, s->duration, s->stream_count);
+        audio_log("audio: demux ready codec=%s rate=%d ch=%d tb=%.6f duration=%.3f streams=%d", codec->name,
+                  s->sample_rate, s->channels, s->time_base, s->duration, s->stream_count);
     }
 
     if (start_seconds > 0.0 && s->fmt != NULL && s->stream_index >= 0) {
@@ -774,7 +808,7 @@ static void audio_mark_failed(AudioSession *s, const char *reason, int rc) {
 }
 
 static void *audio_decode_main(void *arg) {
-    AudioSession *s = (AudioSession *)arg;
+    AudioSession *s  = (AudioSession *)arg;
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame   = av_frame_alloc();
     if (packet == NULL || frame == NULL) {
@@ -791,8 +825,9 @@ static void *audio_decode_main(void *arg) {
         av_frame_free(&frame);
         return NULL;
     }
-    audio_log("audio: start target=%.3f url=%.64s", target,
-              s->url_count > 0 ? (s->urls[s->track] ? s->urls[s->track] : "?") : (s->urls && s->urls[0] ? s->urls[0] : "?"));
+    audio_log(
+        "audio: start target=%.3f url=%.64s", target,
+        s->url_count > 0 ? (s->urls[s->track] ? s->urls[s->track] : "?") : (s->urls && s->urls[0] ? s->urls[0] : "?"));
 
     int read_errors = 0;
     while (!s->stop) {
@@ -801,6 +836,7 @@ static void *audio_decode_main(void *arg) {
             s->track_request  = -1;
             const double now  = audio_now_us() > s->started_us ? audio_clock_snapshot(s) : s->seek_target;
             const double at   = now >= 0.0 ? now : 0.0;
+            s->drift_ignore_until_us = audio_now_us() + 4000000ull;
             audio_log("audio: track switch %d -> %d at %.3f", s->track, request, at);
             const int previous = s->track;
             s->track           = request;
@@ -842,8 +878,7 @@ static void *audio_decode_main(void *arg) {
             if (s->fmt != NULL) avformat_flush(s->fmt);
             const int64_t ts = s->fmt != NULL && s->stream_index >= 0 ? (int64_t)llround(seek_to / s->time_base) : 0;
             int rc = s->fmt != NULL ? avformat_seek_file(s->fmt, s->stream_index, INT64_MIN, ts, INT64_MAX, 0) : -1;
-            if (rc < 0 && s->fmt != NULL)
-                rc = av_seek_frame(s->fmt, s->stream_index, ts, AVSEEK_FLAG_BACKWARD);
+            if (rc < 0 && s->fmt != NULL) rc = av_seek_frame(s->fmt, s->stream_index, ts, AVSEEK_FLAG_BACKWARD);
             if (s->dec) avcodec_flush_buffers(s->dec);
             s->swr_key_valid = 0;
             if (rc >= 0) {
@@ -885,10 +920,10 @@ static void *audio_decode_main(void *arg) {
                 if (s->pending_frames > 0) {
                     AudioBlock block;
                     const double speed = s->speed > 0.0 ? s->speed : 1.0;
-                    block.pts    = s->pending_pts;
-                    block.frames = s->pending_frames;
-                    block.span   = (double)s->pending_frames / ((double)AUDIO_OUT_RATE * speed);
-                    block.gen    = s->producer_gen;
+                    block.pts          = s->pending_pts;
+                    block.frames       = s->pending_frames;
+                    block.span         = (double)s->pending_frames / ((double)AUDIO_OUT_RATE * speed);
+                    block.gen          = s->producer_gen;
                     memcpy(block.pcm, s->pending, (size_t)block.frames * AUDIO_CHANNELS * sizeof(int16_t));
                     if (s->ring_count < AUDIO_RING_BLOCKS && block.gen == s->seek_gen) {
                         s->ring[s->ring_write] = block;
@@ -990,7 +1025,7 @@ static void *audio_output_main(void *arg) {
                     pthread_cond_timedwait(&s->cond, &s->mutex, &deadline);
                     continue;
                 }
-                block      = s->ring[s->ring_read];
+                block        = s->ring[s->ring_read];
                 s->ring_read = (s->ring_read + 1) % AUDIO_RING_BLOCKS;
                 --s->ring_count;
                 pthread_cond_broadcast(&s->cond);
@@ -1004,8 +1039,8 @@ static void *audio_output_main(void *arg) {
                  * nothing can ring out after the picture parks. */
                 pthread_mutex_unlock(&s->mutex);
                 audio_output_close(s);
-                audio_log("audio: output drained blocks=%llu underruns=%llu",
-                          (unsigned long long)s->blocks_out, (unsigned long long)s->underruns);
+                audio_log("audio: output drained blocks=%llu underruns=%llu", (unsigned long long)s->blocks_out,
+                          (unsigned long long)s->underruns);
                 pthread_mutex_lock(&s->mutex);
                 while (!s->stop && (s->eof_decoded || s->paused) && s->ring_count == 0) {
                     struct timespec deadline;
@@ -1045,19 +1080,14 @@ static void *audio_output_main(void *arg) {
 /* ------------------------------------------------------------- public API -- */
 int wiliwili_audio_available(void) {
     if (g_available >= 0) return g_available;
+    /* Probe with sceAudioOutInit only: opening a throwaway port here leaves the
+     * handle lifecycle of the real playback port as the only thing that can
+     * fail, and the start-time open reports it synchronously. */
     if (audio_ps5_init_once() != 0) {
         audio_log("audio: probe sceAudioOutInit failed");
         g_available = 0;
         return 0;
     }
-    const int32_t handle = sceAudioOutOpen(AUDIO_USER_ID_SYSTEM, AUDIO_PORT_MAIN, 0, 512, AUDIO_OUT_RATE,
-                                           AUDIO_FORMAT_S16_STEREO);
-    if (handle < 1) {
-        audio_log("audio: probe port open failed rc=%d", (int)handle);
-        g_available = 0;
-        return 0;
-    }
-    sceAudioOutClose(handle);
     g_available = 1;
     audio_log("audio: probe ps5 audio available");
     return 1;
@@ -1072,14 +1102,14 @@ static void audio_free_urls(char **urls, int count) {
 void wiliwili_audio_stop(void) {
     AudioSession *s = &g_audio;
     pthread_mutex_lock(&s->mutex);
-    const int live = s->threads_live;
-    s->stop         = 1;
-    s->paused       = 1;
-    s->failed       = 0;
-    s->seek_pending = 0;
+    const int live   = s->threads_live;
+    s->stop          = 1;
+    s->paused        = 1;
+    s->failed        = 0;
+    s->seek_pending  = 0;
     s->track_request = -1;
-    s->ring_count   = 0;
-    s->clock_valid  = 0;
+    s->ring_count    = 0;
+    s->clock_valid   = 0;
     pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->mutex);
     audio_output_close(s);
@@ -1094,32 +1124,34 @@ void wiliwili_audio_stop(void) {
     s->threads_live  = 0;
     s->stop          = 0;
     audio_free_urls(s->urls, s->url_count);
-    s->urls      = NULL;
-    s->url_count = 0;
-    s->track     = 0;
-    s->eof_decoded = 0;
-    s->pending_frames = 0;
-    s->have_audio = 0;
-    s->codec_name = NULL;
-    s->blocks_out = 0;
-    s->underruns  = 0;
-    s->seek_count = 0;
-    s->drift_valid = 0;
-    s->drift_max_ms = 0.0;
-    s->drift_last_log_us = 0;
+    s->urls              = NULL;
+    s->url_count         = 0;
+    s->track             = 0;
+    s->eof_decoded       = 0;
+    s->pending_frames    = 0;
+    s->have_audio        = 0;
+    s->codec_name        = NULL;
+    s->blocks_out        = 0;
+    s->underruns         = 0;
+    s->seek_count        = 0;
+    s->drift_valid       = 0;
+    s->drift_max_ms        = 0.0;
+    s->drift_max_settle_ms = 0.0;
+    s->drift_ignore_until_us = 0;
+    s->drift_last_log_us   = 0;
     audio_close_input(s);
     s->active = 0;
 }
 
-int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count,
-                         double start_seconds) {
+int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count, double start_seconds) {
     if (!wiliwili_audio_available()) return 0;
     if (!isfinite(start_seconds) || start_seconds < 0.0) start_seconds = 0.0;
     wiliwili_audio_stop();
     AudioSession *s = &g_audio;
-    s->urls    = (char **)calloc((size_t)(audio_count > 0 ? audio_count : 1), sizeof(char *));
+    s->urls         = (char **)calloc((size_t)(audio_count > 0 ? audio_count : 1), sizeof(char *));
     if (s->urls == NULL) return 0;
-    if (audio_count > 0 && audio_urls != NULL) {
+    s->url_is_audio_list = audio_count > 0 && audio_urls != NULL;
+    if (s->url_is_audio_list) {
         s->url_count = audio_count;
         for (int i = 0; i < audio_count; ++i) s->urls[i] = strdup(audio_urls[i] != NULL ? audio_urls[i] : "");
     } else {
@@ -1133,31 +1165,34 @@ int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, i
         s->url_count = 0;
         return 0;
     }
-    s->track         = 0;
-    s->paused        = 1;
-    s->failed        = 0;
-    s->stop          = 0;
-    s->seek_pending  = 0;
-    s->seek_gen      = 0;
-    s->seek_target   = start_seconds;
-    s->track_request = -1;
-    s->speed         = 1.0;
-    s->volume        = 100;
-    s->device        = -1;
-    s->sdl_device    = NULL;
-    s->backend       = AUDIO_BACKEND_NONE;
-    s->blocks_out    = 0;
-    s->decoded_frames = 0;
-    s->underruns     = 0;
-    s->eof_decoded   = 0;
-    s->pending_frames = 0;
-    s->clock_valid   = 0;
-    s->drift_valid   = 0;
-    s->drift_max_ms  = 0.0;
-    s->drift_last_log_us = 0;
-    s->started_us    = audio_now_us();
-    s->active        = 1;
-    s->threads_live  = 1;
+    s->track             = 0;
+    s->paused            = 1;
+    s->failed            = 0;
+    s->stop              = 0;
+    s->seek_pending      = 0;
+    s->seek_gen          = 0;
+    s->seek_target       = start_seconds;
+    s->track_request     = -1;
+    s->speed             = 1.0;
+    s->volume            = 100;
+    s->device            = -1;
+    s->sdl_device        = NULL;
+    s->backend           = AUDIO_BACKEND_NONE;
+    s->blocks_out        = 0;
+    s->decoded_frames    = 0;
+    s->underruns         = 0;
+    s->output_errors     = 0;
+    s->eof_decoded       = 0;
+    s->pending_frames    = 0;
+    s->clock_valid       = 0;
+    s->drift_valid       = 0;
+    s->drift_max_ms        = 0.0;
+    s->drift_max_settle_ms = 0.0;
+    s->drift_ignore_until_us = 0;
+    s->drift_last_log_us   = 0;
+    s->started_us        = audio_now_us();
+    s->active            = 1;
+    s->threads_live      = 1;
     if (pthread_create(&s->decode_thread, NULL, audio_decode_main, s) != 0) {
         s->threads_live = 0;
         s->active       = 0;
@@ -1212,12 +1247,13 @@ int wiliwili_audio_seek(double seconds) {
     if (!s->active || !isfinite(seconds)) return 0;
     if (seconds < 0.0) seconds = 0.0;
     pthread_mutex_lock(&s->mutex);
-    s->seek_target  = seconds;
-    s->seek_pending = 1;
+    s->seek_target           = seconds;
+    s->seek_pending          = 1;
+    s->drift_ignore_until_us = audio_now_us() + 4000000ull;
     ++s->seek_gen;
-    s->ring_count = 0;
-    s->ring_read  = 0;
-    s->ring_write = 0;
+    s->ring_count  = 0;
+    s->ring_read   = 0;
+    s->ring_write  = 0;
     s->clock_valid = 0;
     pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->mutex);
@@ -1261,7 +1297,7 @@ int wiliwili_audio_track_count(void) {
     if (!g_audio.active) return 0;
     /* DASH: one URL per mirror is one selectable track. Muxed file: the audio
      * streams are the tracks. */
-    if (g_audio.url_count > 1) return g_audio.url_count;
+    if (g_audio.url_is_audio_list) return g_audio.url_count;
     return g_audio.stream_count > 0 ? g_audio.stream_count : 1;
 }
 
@@ -1286,13 +1322,18 @@ void wiliwili_audio_observe(double mpv_time, double speed, int paused, int seeki
     const double clock = wiliwili_audio_clock();
     if (clock < 0.0 || !isfinite(mpv_time) || mpv_time <= 0.0 || paused || seeking) return;
     const double drift_ms = (clock - mpv_time) * 1000.0;
-    if (fabs(drift_ms) > s->drift_max_ms) s->drift_max_ms = fabs(drift_ms);
     const uint64_t now = audio_now_us();
+    if (now >= s->drift_ignore_until_us) {
+        if (fabs(drift_ms) > s->drift_max_ms) s->drift_max_ms = fabs(drift_ms);
+        if (now - s->started_us > 10000000ull && fabs(drift_ms) > s->drift_max_settle_ms)
+            s->drift_max_settle_ms = fabs(drift_ms);
+    }
     if (s->drift_last_log_us == 0 || now - s->drift_last_log_us >= 2000000ull) {
         s->drift_last_log_us = now;
-        audio_log("audio: clock=%.3f mpv=%.3f drift_ms=%.1f max_ms=%.1f blocks=%llu underrun=%llu track=%d speed=%.2f",
-                  clock, mpv_time, drift_ms, s->drift_max_ms, (unsigned long long)s->blocks_out,
-                  (unsigned long long)s->underruns, s->track, s->speed);
+        audio_log("audio: clock=%.3f mpv=%.3f drift_ms=%.1f max_ms=%.1f settle_max_ms=%.1f blocks=%llu "
+                  "underrun=%llu track=%d speed=%.2f",
+                  clock, mpv_time, drift_ms, s->drift_max_ms, s->drift_max_settle_ms,
+                  (unsigned long long)s->blocks_out, (unsigned long long)s->underruns, s->track, s->speed);
     }
 }
 
@@ -1300,17 +1341,18 @@ void wiliwili_audio_summary(void) {
     AudioSession *s = &g_audio;
     if (!s->active) return;
     const double elapsed = s->started_us != 0 ? (double)(audio_now_us() - s->started_us) / 1e6 : 0.0;
-    audio_log("audio: summary elapsed_s=%.1f blocks=%llu decoded=%llu underrun=%llu seeks=%llu drift_max_ms=%.1f",
+    audio_log("audio: summary elapsed_s=%.1f blocks=%llu decoded=%llu underrun=%llu seeks=%llu drift_max_ms=%.1f "
+              "settle_max_ms=%.1f",
               elapsed, (unsigned long long)s->blocks_out, (unsigned long long)s->decoded_frames,
-              (unsigned long long)s->underruns, (unsigned long long)s->seek_count, s->drift_max_ms);
+              (unsigned long long)s->underruns, (unsigned long long)s->seek_count, s->drift_max_ms,
+              s->drift_max_settle_ms);
 }
 
 #else /* !PS5_NATIVE_APP */
 
 int wiliwili_audio_available(void) { return 0; }
 void wiliwili_audio_stop(void) {}
-int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count,
-                         double start_seconds) {
+int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count, double start_seconds) {
     (void)video_url;
     (void)audio_urls;
     (void)audio_count;

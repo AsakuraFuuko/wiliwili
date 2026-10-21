@@ -234,6 +234,9 @@ public:
      * 调用前原生音频已被停止，mpv 的音频链仍在当前位置静音解码。
      */
     void fallbackToMpvAudio(const char *reason);
+
+    /// 本进程是否已经把音频输出交还 mpv（失败回退后不再尝试新路径，避免双路出声）
+    bool isMpvAudioFallback() const { return mpv_audio_fallback; }
 #endif
 
     void showOsdText(const std::string &value, int duration = 2000);
@@ -317,6 +320,15 @@ public:
     void reset();
 
     /**
+     * Release the software video surface (NVG texture plus CPU staging buffer).
+     * A player page that is popped would otherwise leave the whole render area
+     * resident in the direct-memory pool for the rest of the session, because
+     * mpv keeps the last frame's surface alive. Must run on the main thread,
+     * after the page stopped playing.
+     */
+    void releaseVideoSurface();
+
+    /**
      * 设置着色器配置
      * @param profile 配置名
      * @param shaders 着色器文件
@@ -361,8 +373,11 @@ public:
     uint64_t audio_sync_last_us  = 0;
     // playback-time 属性到达的挂钟时刻：用它外推 mpv 的当前播放位置，
     // 否则属性更新间隔（~100 ms）会被当成音画漂移。
-    uint64_t playback_time_us    = 0;
-    bool mpv_audio_fallback      = false;
+    uint64_t playback_time_us = 0;
+    bool mpv_audio_fallback   = false;
+    // 音频落后太多（seek/切轨后的取流延迟）时先把画面压到 0.25x 追上，
+    // 再回到用户倍速；避免用 ±8% 慢放十几秒。
+    bool audio_sync_hold = false;
     // 应用音频路径当前打开的主链接；mpv 播放列表切到别的条目时用于检测
     std::string nativeAudioSource;
 #endif

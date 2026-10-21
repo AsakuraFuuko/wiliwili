@@ -1183,6 +1183,35 @@ void MPVCore::setFrameSize(brls::Rect r) {
 
 bool MPVCore::isValid() { return mpv_context != nullptr; }
 
+void MPVCore::releaseVideoSurface() {
+#ifdef MPV_SW_RENDER
+    /* on_update()/draw() both bail out on a null `pixels`, and both run on the
+     * main thread, so clearing the pointer first is enough to keep the render
+     * path away from the buffer we are about to free. mpv only writes into it
+     * from mpvRenderContextRender(), also main thread. */
+    void *oldPixels    = pixels;
+    const int oldImage = nvg_image;
+    pixels             = nullptr;
+    nvg_image          = 0;
+    mpv_params[3].data = nullptr;
+    sw_size[0]         = 0;
+    sw_size[1]         = 0;
+    pitch              = 0;
+    redraw             = false;
+    if (oldImage != 0) nvgDeleteImage(brls::Application::getNVGContext(), oldImage);
+    if (oldPixels != nullptr) free(oldPixels);
+    if (oldImage != 0 || oldPixels != nullptr) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "mpv-sw: released surface image=%d cpu=%s", oldImage,
+                      oldPixels != nullptr ? "freed" : "none");
+#if defined(PS5) || defined(PS5_NATIVE_APP)
+        wiliwili_boot_log(line);
+#endif
+        brls::Logger::info("{}", line);
+    }
+#endif
+}
+
 void MPVCore::draw(brls::Rect area, float alpha) {
     if (mpv_context == nullptr) return;
     if (!(this->rect == area)) setFrameSize(area);
@@ -1682,10 +1711,11 @@ void MPVCore::reset() {
     this->mpv_error_code = 0;
     this->video_eof      = false;
 #if defined(PS5_NATIVE_APP)
-    this->playback_time_us       = 0;
-    this->audio_sync_last_us     = 0;
-    this->audio_sync_drift_ms    = 0.0;
-    this->audio_sync_correction  = 0.0;
+    this->playback_time_us      = 0;
+    this->audio_sync_last_us    = 0;
+    this->audio_sync_drift_ms   = 0.0;
+    this->audio_sync_correction = 0.0;
+    this->audio_sync_hold       = false;
 #endif
     this->video_aspect   = aspectConverter(MPVCore::VIDEO_ASPECT);
 
@@ -1804,8 +1834,9 @@ double MPVCore::getSpeed() const { return video_speed; }
 void MPVCore::setSpeed(double value) {
     if (video_speed != value) command_async("set", "speed", value);
 #if defined(PS5_NATIVE_APP)
-    /* 用户改了倍速：漂移校正归零，避免把旧校正乘进新速度。 */
+    /* 用户改了倍速：漂移校正/追赶都归零，避免把旧校正乘进新速度。 */
     audio_sync_correction = 0.0;
+    audio_sync_hold       = false;
     wiliwili_audio_set_speed(value);
 #endif
 }
@@ -1844,16 +1875,45 @@ void MPVCore::updateNativeAudioSync() {
     wiliwili_audio_observe(mpv_now, speed, paused ? 1 : 0, video_seeking ? 1 : 0);
     if (clock < 0.0 || playback_time <= 0.0 || paused || video_seeking) {
         this->audio_sync_drift_ms = 0.0;
+        this->audio_sync_hold     = false;
         if (audio_sync_correction != 0.0) {
             audio_sync_correction = 0.0;
             command_async("set", "speed", fmt::format("{:.6f}", speed));
         }
         return;
     }
+    /* 取流延迟（seek/切轨重开 demuxer）会让声音暂时落后 0.3–1 s。用 8%
+     * 慢放追赶要十几秒，所以先把画面压到 0.25x 等声音，追上 80 ms 内再
+     * 回到用户倍速。这里只改 mpv speed，不碰 pause 状态，UI 不会闪暂停。 */
+    {
+        static constexpr double HOLD_FACTOR = 0.25;
+        const double live_drift             = clock - mpv_now;
+        if (!audio_sync_hold && live_drift < -0.300) {
+            audio_sync_hold       = true;
+            audio_sync_correction = HOLD_FACTOR - 1.0;
+            audio_sync_last_us    = now;
+            command_async("set", "speed", fmt::format("{:.6f}", speed * HOLD_FACTOR));
+            char line[160];
+            std::snprintf(line, sizeof(line), "audio: sync hold drift_ms=%.1f", live_drift * 1000.0);
+            wiliwili_boot_log(line);
+            return;
+        }
+        if (audio_sync_hold) {
+            if (live_drift >= -0.080) {
+                audio_sync_hold       = false;
+                audio_sync_correction = 0.0;
+                command_async("set", "speed", fmt::format("{:.6f}", speed));
+                char line[160];
+                std::snprintf(line, sizeof(line), "audio: sync release drift_ms=%.1f", live_drift * 1000.0);
+                wiliwili_boot_log(line);
+            }
+            return;
+        }
+    }
     /* 2.5 Hz is plenty: the loop is first order and the audible error is what
      * matters, not the property update cadence. */
     if (audio_sync_last_us != 0 && now - audio_sync_last_us < 400000) return;
-    audio_sync_last_us = now;
+    audio_sync_last_us     = now;
     const double drift_raw = clock - mpv_now;  // > 0: the sound is ahead of mpv
     /* 一阶低通压住测量噪声；跳变（seek/切集）直接采用新值。 */
     if (std::fabs(drift_raw - this->audio_sync_drift_ms * 0.001) > 0.2)
@@ -1869,8 +1929,10 @@ void MPVCore::updateNativeAudioSync() {
          * Large offsets close at up to 8% for a few seconds, then the loop
          * falls back to the inaudible 0.5% band. */
         double limit = 0.005;
-        if (magnitude > 0.15) limit = 0.080;
-        else if (magnitude > 0.05) limit = 0.020;
+        if (magnitude > 0.15)
+            limit = 0.080;
+        else if (magnitude > 0.05)
+            limit = 0.020;
         double gain = (magnitude - 0.010) * 0.5;
         if (gain > limit) gain = limit;
         target = drift > 0.0 ? gain : -gain;
