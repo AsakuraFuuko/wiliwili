@@ -1353,6 +1353,12 @@ void MPVCore::eventMainLoop() {
             case MPV_EVENT_START_FILE:
                 // event 6: 开始加载文件
                 brls::Logger::info("========> MPV_EVENT_START_FILE");
+                /* `eof-reached` is a property of the previous file until the new one
+                 * resets it; a late property-change carrying the old value fires
+                 * END_OF_FILE for a file that just started, and the player then
+                 * offers "replay" (seek 0) in the middle of playback. A new file is
+                 * never already at its end. */
+                video_eof = false;
 
                 // show osd for a really long time
                 mpvCoreEvent.fire(MpvEventEnum::START_FILE);
@@ -1611,6 +1617,7 @@ void MPVCore::reset() {
     this->playback_time  = 0;
     this->video_progress = 0;
     this->mpv_error_code = 0;
+    this->video_eof      = false;
     this->video_aspect   = aspectConverter(MPVCore::VIDEO_ASPECT);
 
     // 软硬解切换后应该手动设置一次渲染尺寸

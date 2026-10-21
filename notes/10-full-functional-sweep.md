@@ -393,3 +393,31 @@
 **未验证**
 - 降档/保留旧面的兜底分支未在真机触发（池扩到 256MB 后 1920×1080 面一次创建成功）；该路径仅经代码审查，若日后仍出现纹理创建失败，日志会打出 `mpv-sw: surface allocate failed -> keep …` 或 `EVO tex: …`。
 - `BV1kK4y167e6` 本身是 A 路（`auto-gate=A`），其 `native-loading: FALLBACK_A before first frame` 是 native 能力门按尺寸判定的预期结果，不是故障回退；C 路样本无 `FALLBACK_A`。
+
+## 切全屏触发的 seek(0)/从头重播修复（2026-10-21）
+
+**用户现象**：切全屏后画面先白一下再出来，实际是从头重播。日志：全屏 `rect logical=0,0 1280x720 physical=0,0 1920x1080` 两秒后出现 `seek requested target=0.000` → `seek reset target=0.000 rc=0 reopen=1` → `mpv: playback restart`；**没有** `native-loading: start`、**没有** `mpv: start file`，说明不是重新取流，而是在活动会话上 seek 到 0。
+
+**定位**
+- `seek requested` 只可能来自 `wiliwili_vdec_play_seek()`，其调用方只有 `MPVCore::seek(int64_t)`、`seek(string)`、`seekRelative`、`seekPercent` 四个入口；逐个加标签在真机对照后，正常播放期间只有“位置恢复事件”与“用户动作”两类来源。
+- 对照实验：活动会话里连续 `小窗→全屏→小窗→全屏` 以及暂停/恢复（C 路 1662×1080）**没有任何 seek / playback restart**，说明全屏视图本身不会 seek。
+- 可复现的静默 `seek(0)` 路径是 `VideoView::togglePlay()` 的重播分支（`isPaused() && showReplay` → `seek(0)+resume()`）。`showReplay` 由 `REPLAY` 置位，只在 `MPV_RESUME` 或真正重播时清除，**新文件开始播放时不会复位**；`MPVCore::video_eof` 也没有在 `MPV_EVENT_START_FILE`/`reset()` 复位，旧文件的 `eof-reached` 属性变化足以让新文件收到一次伪 `END_OF_FILE` 而点亮重播标志。这样一次“播放/暂停”按键就会变成从头重播。
+- 另有 `LAST_TIME` 竞态：`VideoDetail::requestVideoPageDetail()` 的历史回调没有活动页/请求代际保护，可与视频 URL 竞速；晚到时把 `last_play_time`（小于 1s 时整除为 0）当作恢复点 seek，等于播放中途回 0。
+
+**修复**
+- `video_view.cpp::togglePlay()`：重播分支要求确实在片尾（`duration > 0 && position + 2 < duration` 时忽略重播标志、只恢复播放，并打 `app: replay ignored, not at end`）。
+- `video_view.cpp`：`START_FILE` 与 `setUrl()` 清除 `showReplay` 并刷新按钮图标——新文件不是“播完”。
+- `video_view.cpp` LAST_TIME：只在“尚未开始（≤2s）或提示位置在前方”时应用；新增 `fullscreen_mirror`（`setFullScreen(true)` 设置），镜像视图永不应用；被忽略时打 `app: last-time ignored p=… current=… mirror=…` 并丢弃提示，防止后续 `MPV_LOADED` 再应用。
+- `video_view.cpp` MPV_LOADED：镜像视图不应用恢复位置。
+- `mpv_core.cpp`：`MPV_EVENT_START_FILE` 与 `reset()` 复位 `video_eof`，旧文件的 eof 属性不能把新文件判成片尾。
+
+**真机证据（构建 `Oct 21 2026 07:50:50`；最终提交构建 `Oct 21 2026 08:02:58` 复验，`PPSA99233`）**
+- C 路 `BV1XHnA67Exy`（1662×1080，`auto-gate=pass`）：`/tmp/fs/v-small.png` 小窗播放 → `/tmp/fs/v-full1.png` 全屏（07:53:20）→ 退出再进 `/tmp/fs/v-full2.png`（07:53:28）→ 暂停/恢复 `/tmp/fs/v-playpause.png`（01:04/19:00）。该段日志 **0 次** `seek requested`、**0 次** `mpv: playback restart`（首次加载除外），OSD 时间连续。
+- 最终构建 `08:02:58` 复验同一样本：全屏进（08:05:56）→ 退出（08:06:04）→ 再进（08:06:05），日志仍无 seek/restart；`/tmp/fs/ab-full1.png`、`/tmp/fs/ab-full2.png` 分别为 `01:18/19:00`、`01:24/19:00`，时间连续。
+- A 路 `BV1kK4y167e6`（1080×1440，`auto-gate=A`）：全屏 `mpv-sw: surface=188 … 1920x1080`（非 0），`/tmp/fs/y2.png`、`/tmp/fs/y3.png` 全屏有画面并停在 `00:12/00:12`；小窗 `/tmp/fs/x-eof2.png` 同一帧；无 seek / restart。
+- AGC health 全程 `dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`，`direct_mem` 峰值约 131.5MB/256MB，无 crash / GPU_FAULT。
+
+**未验证**
+- 用户日志里 07:03:13 的“历史回调晚到”时序未在本地复现；`app: last-time ignored` 分支只做了代码级封堵，真机未命中。
+- 伪 `END_OF_FILE`（旧 `eof-reached`）未在真机复现，`app: replay ignored, not at end` 分支同样未触发。
+- 本轮真机日志中正常播放期间 `showReplay` 始终为 0，因此“重播标志导致 seek(0)”的直接复现仍缺；已证明的是全屏/暂停路径不再 seek，且所有已知能产生 `seek(0)` 的路径都被限制在“确实在片尾”或“尚未开始”。

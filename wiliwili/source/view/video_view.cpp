@@ -531,6 +531,25 @@ VideoView::VideoView() {
                 this->setLastPlayedPosition(VideoView::POSITION_DISCARD);
             else if (this->getLastPlayedPosition() != VideoView::POSITION_DISCARD) {
                 int64_t p = *(int64_t*)data / 1000;
+                /* LAST_TIME is the "resume from here" hint for a file that has not
+                 * started yet. The page-detail/history request races the video URL,
+                 * so the hint can arrive seconds later; seeking then restarts the
+                 * native decoder (and mpv) mid-playback, which is the "switching to
+                 * fullscreen replays from 0" report (observed seek target=0.000 two
+                 * seconds after the fullscreen rect). A hint is only useful before
+                 * playback advances or when it points forward; a fullscreen mirror
+                 * never owns the file, so it never applies one. */
+                const int64_t current  = mpvCore->video_progress;
+                const bool hint_useful = current <= 2 || p > current + 2;
+                if (this->fullscreen_mirror || !hint_useful) {
+                    char line[160];
+                    std::snprintf(line, sizeof(line), "app: last-time ignored p=%lld current=%lld mirror=%d",
+                                  (long long)p, (long long)current, this->fullscreen_mirror ? 1 : 0);
+                    wiliwili_boot_log(line);
+                    /* Drop the hint so a later MPV_LOADED cannot apply it either. */
+                    this->setLastPlayedPosition(0);
+                    return;
+                }
                 this->setLastPlayedPosition(p);
                 mpvCore->seek(p);
             }
@@ -1010,6 +1029,10 @@ void VideoView::setUrl(const std::string& url, int start, int end, const std::ve
 #endif
 
     std::string extra = genExtraUrlParam(start, end, audios);
+    /* A new URL is a new playback, so any replay affordance from the previous
+     * one is stale; a play/pause press would otherwise seek this file to 0. */
+    this->showReplay = false;
+    this->refreshToggleIcon();
 #if defined(PS5_NATIVE_APP)
     const char* audioOverride = getenv("WILIWILI_VDEC_AUDIO_URL");
     if (nativeVdec && audioOverride != nullptr && audioOverride[0] != '\0')
@@ -1096,6 +1119,19 @@ void VideoView::togglePlay() {
     if (customToggleAction != nullptr) return customToggleAction();
     if (this->mpvCore->isPaused()) {
         if (showReplay) {
+            /* A play/pause press must never restart a video that is not at its end.
+             * A REPLAY left over from another playback (or a stale mpv eof-reached
+             * flag) used to make this a seek(0)+resume in the middle of a video,
+             * which reads as "switching to fullscreen replayed from the start". */
+            const double duration = (double)mpvCore->duration;
+            const double position = (double)mpvCore->video_progress;
+            if (duration > 0 && position + 2.0 < duration) {
+                showReplay = false;
+                this->refreshToggleIcon();
+                wiliwili_boot_log("app: replay ignored, not at end");
+                this->mpvCore->resume();
+                return;
+            }
             this->mpvCore->seek(0);
             this->mpvCore->resume();
         } else {
@@ -1475,6 +1511,9 @@ void VideoView::setFullScreen(bool fs) {
          * original player view own decoder shutdown when the fullscreen clone is popped. */
         video->native_vdec_mpv_suppressed = this->native_vdec_mpv_suppressed;
         video->native_vdec_play_owner     = !this->native_vdec_mpv_suppressed;
+        /* This view mirrors a session that is already playing: it must not apply
+         * start-position/restore events (they would seek the live decoder). */
+        video->fullscreen_mirror = true;
         if (this->native_vdec_mpv_suppressed) {
             video->native_vdec_loading          = this->native_vdec_loading;
             video->native_vdec_loading_start_us = this->native_vdec_loading_start_us;
@@ -1849,6 +1888,9 @@ void VideoView::registerMpvEvent() {
                 break;
             case MpvEventEnum::START_FILE:
                 this->showOSD(false);
+                /* A new file starts at position 0, not at a previous file's end. */
+                this->showReplay = false;
+                this->refreshToggleIcon();
 #if defined(PS5_NATIVE_APP)
                 wiliwili_boot_log("mpv: start file");
 #endif
@@ -1877,7 +1919,9 @@ void VideoView::registerMpvEvent() {
                 break;
             case MpvEventEnum::MPV_LOADED:
                 this->setPlaybackTime(wiliwili::sec2Time(this->mpvCore->video_progress));
-                if (lastPlayedPosition <= 0) break;
+                /* A fullscreen mirror did not load a file of its own; applying the
+                 * source's restore position here would seek under an active playback. */
+                if (this->fullscreen_mirror || lastPlayedPosition <= 0) break;
                 if (abs(getRealDuration() - lastPlayedPosition) <= 5) {
                     mpvCore->seek(0);
                 } else {
