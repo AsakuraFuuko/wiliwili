@@ -455,3 +455,26 @@
 - 快速滚动门控先用“速度 >1600 px/s”判定，离散 D-pad 未触发（A/B 那轮内存收益来自字节预算）；最终代码改为“连续移动 >300ms”，并在最终构建上真机复测：45 次快速 down 产生 `img-load: deferred (fast scroll)` → `img-load: resumed=16 cache=44/33,108,304B`（16 个请求补载、缓存 44 项 31.6 MiB，低于 32 MiB 预算），截图 `/tmp/final-fastscroll2.png` 全部封面正常。
 - 详情页/评论/相关推荐会缓存更多图（全屏播放时 direct_mem 81.6 MB / 70 allocs），隐藏页面的 cell 仍持有引用，字节预算不能回收它们；本轮未处理，属后续可优化项。
 - 为测试片尾连续 R1 快进 78 次后，seek 目标 1644.6 s 超过实际片长，C 路按既有契约 `demux EOF` → 干净 `FALLBACK_A reason=stream-count-mismatch rc=-9019`，A 路继续并定格；该路径未触及本次改动。随之 A 路 direct_mem 升到 184.2 MB（78 次 seek/缩略图精灵），属既有 seek 路径开销，本次未处理。
+
+## 底部 HUD 增加内存显示（2026-10-21）
+
+**目标**：在原有 FPS 显示旁边显示内存占用，刷新节奏与 FPS 一致（1 秒），不进入渲染热路径。
+
+**实现**
+- 新增 `borealis/core/perf_stats.{hpp,cpp}`：`getMemoryStats()` 用单调时钟把采样限制在 **1 秒一次**（快路径只读时钟），`formatMemoryStats()` 只在该秒生成字符串。
+  - AGC 直连池：`evo_direct_mem_get_stats()` 的 `allocated_bytes/total_bytes`（`EVO_TARGET_PS5`）。池未初始化时 `total_bytes=0`，该计数不显示。
+  - 进程内存：先试 `sysctl(KERN_PROC_PID)` 的 `ki_rssize`（当前 RSS）；标题沙箱拒绝该 sysctl（真机 HUD 上 RSS 从未出现），改用 `getrusage(RUSAGE_SELF).ru_maxrss` 的峰值，显示为 `PEAK:`。两者都不阻塞渲染线程。
+- `views/bottom_bar.cpp`：底栏文本变为 `HH:MM:SS | FPS:60 | MEM:<used>/<total>MB PEAK:<mb>MB`，只在秒数变化时更新（与 FPS 同一节奏）。
+- 全屏（`VideoView::setFullScreen(true)` 会压入只含 VideoView 的 Activity，底栏不存在）：`resources/xml/views/video_view.xml` 增加绝对定位的 `video/perf/hud/box`（左下，`positionLeft=55`、`positionBottom=130`，位于 OSD 底栏上方），`VideoView::updatePerfHud()` 仅在 `getFPSStatus() && isFullscreen()` 时显示，同样 1 秒刷新，OSD 隐藏时仍常驻；小窗内嵌播放不显示（底栏已经显示同一份数值）。
+
+**真机证据（PPSA99233，构建 `Oct 21 2026 18:06:43`）**
+- 首页 `/tmp/final-home.png`：底栏 `18:10 | FPS:60 | MEM:22.2/256MB PEAK:1146MB`。
+- 滚动/历史页 `/tmp/final-scroll.png`：8×down 后 `MEM:58.6/256MB`（封面陆续装载），`PEAK:1146MB`。
+- 小窗播放 `/tmp/final-small3.png`：`MEM:111.0/256MB PEAK:1255MB`（解码/视频暂存进入直连池，峰值随播放增长），FPS 60。
+- 全屏 `/tmp/final-full.png`：左下角药丸 `FPS:60  MEM:111.0/256MB  PEAK:1255MB`，位于进度条上方，不遮挡进度条/时间/右侧按钮；OSD 自动隐藏后 `/tmp/final-full-nosd.png` 仍显示（字幕居中，不重叠）。
+- 回归：`agc health frame=24000 … dcb_full=0 ring_fail=0 tex_fail=0 timeouts=0`；会话内 `FALLBACK_A`/`crash:`/`terminate`/`GPU_FAULT` 均为 0；播放只出现一次历史恢复位置 `seek requested target=924.000`（即打开视频的起始位置），之后无 seek/restart。
+- 片尾 `/tmp/final-eof.png`：`17:16/17:16` 停在最后一帧（播放图标、无重播），全屏在 EOF 时按既有逻辑退出，底栏 HUD 正常。
+
+**已知/未验证**
+- `sysctl(KERN_PROC)` 在标题沙箱内不可用（无 RSS 值），因此进程内存显示的是 `ru_maxrss` 峰值（`PEAK`），不会回落；如需当前 RSS，需要内核层接口。
+- 未重新验证封面快速滚动门控以外的既有项（本次改动不触碰缓存/播放路径）。

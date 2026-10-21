@@ -13,6 +13,7 @@
 #include <borealis/views/progress_spinner.hpp>
 #include <borealis/core/touch/tap_gesture.hpp>
 #include <borealis/core/thread.hpp>
+#include <borealis/core/perf_stats.hpp>
 #include <borealis/views/slider.hpp>
 #include <borealis/views/applet_frame.hpp>
 #include <pystring.h>
@@ -729,6 +730,31 @@ VideoView::~VideoView() {
     brls::Logger::debug("Delete VideoView done");
 }
 
+void VideoView::updatePerfHud() {
+    /* Only the fullscreen clone owns the bottom of the screen; the inline
+     * player keeps the applet frame footer, which renders the same values. */
+    const bool show = brls::Application::getFPSStatus() && this->isFullscreen();
+    if (!show) {
+        if (perfHudBox->getVisibility() != brls::Visibility::GONE) perfHudBox->setVisibility(brls::Visibility::GONE);
+        return;
+    }
+
+    if (perfHudBox->getVisibility() != brls::Visibility::VISIBLE) perfHudBox->setVisibility(brls::Visibility::VISIBLE);
+
+    /* Same 1 Hz cadence as the FPS counter: no string work on the other frames. */
+    uint64_t second = (uint64_t)(brls::getCPUTimeUsec() / 1000000);
+    if (second == this->perfHudSecond) return;
+    this->perfHudSecond = second;
+
+    std::string text   = "FPS:" + std::to_string(brls::Application::getFPS());
+    std::string memory = brls::formatMemoryStats(brls::getMemoryStats());
+    if (!memory.empty()) text += "  " + memory;
+    if (text != this->perfHudText) {
+        this->perfHudText = text;
+        perfHudLabel->setText(text);
+    }
+}
+
 void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height, brls::Style style,
                      brls::FrameContext* ctx) {
     if (!mpvCore->isValid()) return;
@@ -909,6 +935,10 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
 
     // center hint
     osdCenterBox2->frame(ctx);
+
+    // fullscreen performance HUD (FPS + memory), mirrors the bottom-bar counter
+    updatePerfHud();
+    if (perfHudBox->getVisibility() == brls::Visibility::VISIBLE) perfHudBox->frame(ctx);
 
     // draw video profile
     videoProfile->frame(ctx);

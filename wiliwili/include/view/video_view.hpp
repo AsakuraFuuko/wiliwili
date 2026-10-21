@@ -348,6 +348,9 @@ private:
     BRLS_BIND(VideoProfile, videoProfile, "video/profile");
     BRLS_BIND(brls::Box, osdLockBox, "video/osd/lock/box");
     BRLS_BIND(SVGImage, osdLockIcon, "video/osd/lock/icon");
+    // 全屏下的性能 HUD（FPS + 内存），与小窗底栏共用同一份数值
+    BRLS_BIND(brls::Box, perfHudBox, "video/perf/hud/box");
+    BRLS_BIND(brls::Label, perfHudLabel, "video/perf/hud");
 
     // OSD
     brls::Time osdLastShowTime = 0;
@@ -395,6 +398,11 @@ private:
     bool is_seeking     = false;  // 是否正在请求跳转
     int seeking_range   = 0;      // 跳转的目标进度, 跳转结束后归零
     size_t seeking_iter = 0;      // 请求跳转的延迟函数 handle
+
+    // 全屏性能 HUD 的刷新状态：与 FPS 一样每秒更新一次
+    uint64_t perfHudSecond = 0;
+    std::string perfHudText;
+    void updatePerfHud();
 
     /**
      *  预览视频音量调节，实时调节

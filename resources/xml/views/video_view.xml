@@ -414,4 +414,26 @@
                 SVG="@res/svg/player-unlock.svg"/>
     </brls:Box>
 
+    <brls:Box
+            width="auto"
+            height="auto"
+            alignItems="center"
+            justifyContent="center"
+            backgroundColor="#303030A0"
+            cornerRadius="6"
+            paddingLeft="12"
+            paddingRight="12"
+            paddingTop="4"
+            paddingBottom="4"
+            positionLeft="55"
+            positionBottom="130"
+            positionType="absolute"
+            visibility="gone"
+            id="video/perf/hud/box">
+        <brls:Label
+                id="video/perf/hud"
+                textColor="#FFFFFF"
+                fontSize="20"/>
+    </brls:Box>
+
 </brls:Box>
