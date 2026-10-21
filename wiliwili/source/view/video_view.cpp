@@ -730,10 +730,12 @@ VideoView::~VideoView() {
     brls::Logger::debug("Delete VideoView done");
 }
 
-void VideoView::updatePerfHud() {
+void VideoView::updatePerfHud(bool osdVisible) {
     /* Only the fullscreen clone owns the bottom of the screen; the inline
-     * player keeps the applet frame footer, which renders the same values. */
-    const bool show = brls::Application::getFPSStatus() && this->isFullscreen();
+     * player keeps the applet frame footer, which renders the same values.
+     * The HUD follows the OSD: it disappears together with the auto-hidden
+     * control bar and comes back the moment the OSD does. */
+    const bool show = brls::Application::getFPSStatus() && this->isFullscreen() && osdVisible;
     if (!show) {
         if (perfHudBox->getVisibility() != brls::Visibility::GONE) perfHudBox->setVisibility(brls::Visibility::GONE);
         return;
@@ -936,8 +938,8 @@ void VideoView::draw(NVGcontext* vg, float x, float y, float width, float height
     // center hint
     osdCenterBox2->frame(ctx);
 
-    // fullscreen performance HUD (FPS + memory), mirrors the bottom-bar counter
-    updatePerfHud();
+    // fullscreen performance HUD (FPS + memory), mirrors the bottom-bar counter and follows the OSD
+    updatePerfHud(drawOSD);
     if (perfHudBox->getVisibility() == brls::Visibility::VISIBLE) perfHudBox->frame(ctx);
 
     // draw video profile

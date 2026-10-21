@@ -402,7 +402,7 @@ private:
     // 全屏性能 HUD 的刷新状态：与 FPS 一样每秒更新一次
     uint64_t perfHudSecond = 0;
     std::string perfHudText;
-    void updatePerfHud();
+    void updatePerfHud(bool osdVisible);
 
     /**
      *  预览视频音量调节，实时调节
