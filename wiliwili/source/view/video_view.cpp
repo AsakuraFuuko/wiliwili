@@ -769,6 +769,12 @@ void VideoView::runNativeAudioAutotest() {
     const uint64_t now = brls::getCPUTimeUsec();
     if (this->native_audio_autotest_start_us == 0) this->native_audio_autotest_start_us = now;
     const uint64_t elapsed_ms = (now - this->native_audio_autotest_start_us) / 1000;
+    /* 暂停时长可调：跨 30 s 的暂停恢复需要比默认 3 s 更长的窗口
+     * （WILIWILI_AUDIO_AUTOTEST_PAUSE_MS）。 */
+    const char* pause_option = std::getenv("WILIWILI_AUDIO_AUTOTEST_PAUSE_MS");
+    const uint64_t pause_ms =
+        pause_option != nullptr && std::atoi(pause_option) > 0 ? (uint64_t)std::atoi(pause_option) : 3000;
+    const uint64_t resume_ms = 10500 + pause_ms;
     if (this->native_audio_autotest_stage == 0 && elapsed_ms >= 6000) {
         this->native_audio_autotest_stage = 1;
         wiliwili_boot_log("audio-test: seek target=20");
@@ -777,15 +783,15 @@ void VideoView::runNativeAudioAutotest() {
         this->native_audio_autotest_stage = 2;
         wiliwili_boot_log("audio-test: pause");
         mpvCore->pause();
-    } else if (this->native_audio_autotest_stage == 2 && elapsed_ms >= 13500) {
+    } else if (this->native_audio_autotest_stage == 2 && elapsed_ms >= resume_ms) {
         this->native_audio_autotest_stage = 3;
         wiliwili_boot_log("audio-test: resume");
         mpvCore->resume();
-    } else if (this->native_audio_autotest_stage == 3 && elapsed_ms >= 17500) {
+    } else if (this->native_audio_autotest_stage == 3 && elapsed_ms >= resume_ms + 4000) {
         this->native_audio_autotest_stage = 4;
         wiliwili_boot_log("audio-test: seek target=5");
         mpvCore->seek(5);
-    } else if (this->native_audio_autotest_stage == 4 && elapsed_ms >= 21500) {
+    } else if (this->native_audio_autotest_stage == 4 && elapsed_ms >= resume_ms + 8000) {
         this->native_audio_autotest_stage = 5;
         const int tracks                  = wiliwili_audio_track_count();
         char line[128];
@@ -797,7 +803,7 @@ void VideoView::runNativeAudioAutotest() {
             std::snprintf(line, sizeof(line), "audio-test: switch-track skipped tracks=%d", tracks);
             wiliwili_boot_log(line);
         }
-    } else if (this->native_audio_autotest_stage == 5 && elapsed_ms >= 27500) {
+    } else if (this->native_audio_autotest_stage == 5 && elapsed_ms >= resume_ms + 14000) {
         this->native_audio_autotest_stage = 6;
         wiliwili_boot_log("audio-test: summary");
         wiliwili_audio_summary();

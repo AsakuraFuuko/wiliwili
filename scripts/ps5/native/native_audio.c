@@ -337,6 +337,10 @@ static void audio_output_close_locked(AudioSession *s) {
         SDL_CloseAudioDevice(dev);
         s->sdl_device = NULL;
     }
+    /* The port is the only thing that can still make noise once the app left the
+     * player; record its release so "no residual audio on exit" is checkable. */
+    if (s->backend != AUDIO_BACKEND_NONE)
+        audio_log("audio: output closed backend=%d blocks=%llu", s->backend, (unsigned long long)s->blocks_out);
     s->backend = AUDIO_BACKEND_NONE;
 }
 
@@ -1157,6 +1161,12 @@ void wiliwili_audio_stop(void) {
 
 int wiliwili_audio_start(const char *video_url, const char *const *audio_urls, int audio_count, double start_seconds) {
     if (!wiliwili_audio_available()) return 0;
+    /* Diagnostic: take the synchronous rejection branch without breaking the
+     * device, so the mpv-ao fallback stays reproducible on hardware. */
+    if (getenv("WILIWILI_AUDIO_FORCE_FALLBACK") != NULL) {
+        audio_log("audio: start rejected by WILIWILI_AUDIO_FORCE_FALLBACK");
+        return 0;
+    }
     if (!isfinite(start_seconds) || start_seconds < 0.0) start_seconds = 0.0;
     wiliwili_audio_stop();
     AudioSession *s = &g_audio;
@@ -1244,14 +1254,21 @@ void wiliwili_audio_pause(int paused) {
     AudioSession *s = &g_audio;
     if (!s->active) return;
     pthread_mutex_lock(&s->mutex);
+    const int changed = (paused != 0) != (s->paused != 0);
     if (paused && !s->paused) s->clock_frozen_pts = audio_clock_locked(s);
     if (!paused && s->paused) {
         s->clock_anchor_pts = s->clock_frozen_pts;
         s->clock_anchor_us  = audio_now_us();
     }
     s->paused = paused != 0;
+    const unsigned long long blocks = (unsigned long long)s->blocks_out;
+    const int ring                  = s->ring_count;
+    const int eof                   = s->eof_decoded;
     pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->mutex);
+    /* A paused session samples nothing, which is what "no residual sound" at EOF
+     * and on exit means; record the transition so it is observable. */
+    if (changed) audio_log("audio: pause=%d blocks=%llu ring=%d eof=%d", paused != 0, blocks, ring, eof);
 }
 
 int wiliwili_audio_seek(double seconds) {
