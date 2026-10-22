@@ -1150,7 +1150,13 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
         play_latency_record(s, 0, decode_us);
     }
     int did_flush = 0;
-    if (!is_flush && rc == 0 && !output.valid && (s->flush_each_decode || s->pending_count >= s->pending_limit)) {
+    /* An AU the decoder accepted (frame.accepted) but has not output yet can
+     * return a status code instead of 0 while it buffers. HEVC first-AU case:
+     * accepted=1, valid=0, rc=0x81…; draining with Flush yields the picture.
+     * Only treat the status as fatal when the drain also produces nothing. */
+    const int drain_on_error = !is_flush && !output.valid && rc != 0 && frame.accepted != 0;
+    if (!is_flush && (rc == 0 || drain_on_error) && !output.valid &&
+        (s->flush_each_decode || drain_on_error || s->pending_count >= s->pending_limit)) {
         memset(&output, 0, sizeof(output));
         output.size = sizeof(output);
         const uint64_t begin = play_now_us();
@@ -2126,6 +2132,10 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
         av_packet_free(&filtered);
         return -1;
     }
+    play_logf("vdec-play: loop entry prebuffer=%d seek=%d stop=%d eof=%d",
+              media->prebuffer_count, __atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE),
+              play_stop_requested(s), media->format != NULL && media->format->pb != NULL ? media->format->pb->eof_reached : -1);
+    int dbg_reads = 0;
     while (!play_stop_requested(s)) {
         play_wait_if_paused(s);
         if (play_stop_requested(s)) break;
@@ -2148,6 +2158,11 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
             const uint64_t read_begin = play_now_us();
             read_rc = av_read_frame(media->format, input);
             read_us = play_now_us() - read_begin;
+            if (++dbg_reads <= 5 || read_rc < 0)
+                play_logf("vdec-play: read#%d rc=%d bytes=%d stream=%d pb_eof=%d seek=%d", dbg_reads, read_rc,
+                          input->size, input->stream_index,
+                          media->format->pb != NULL ? media->format->pb->eof_reached : -1,
+                          __atomic_load_n(&s->seek_requested, __ATOMIC_ACQUIRE));
             pthread_mutex_lock(&s->mutex);
             s->last_demux_wait_us = read_us;
             if (read_us > s->max_demux_wait_us) s->max_demux_wait_us = read_us;
