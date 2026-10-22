@@ -626,8 +626,19 @@ static int play_param_depth(const AVCodecParameters *par) {
 static uint32_t play_codec_level(uint32_t codec, int height, int ffmpeg_level) {
     /* HEVC: the decoder only accepts the ABI's level set (123/150/153 for
      * 1080/1440/2160). FFmpeg reports e.g. 120 (L4.0), which the instance
-     * rejects at the first Decode call even though CreateDecoder succeeds. */
-    if (codec == VDEC_PLAY_CODEC_HEVC) return height > 1440 ? 153 : height > 1080 ? 150 : 123;
+     * rejects at the first Decode call even though CreateDecoder succeeds.
+     * max_level is a ceiling, so a stream that declares more than the height
+     * floor must raise it: B站 1080p HEVC declares L5.0 (150) and failed AU0
+     * with 0x811D0302 (OVERSIZE_DECODE) while max_level was 123. Map to the
+     * smallest verified level that covers both the surface and the stream. */
+    if (codec == VDEC_PLAY_CODEC_HEVC) {
+        uint32_t level = height > 1440 ? 153 : height > 1080 ? 150 : 123;
+        if (ffmpeg_level >= 153)
+            level = 153;
+        else if (ffmpeg_level >= 150 && level < 150)
+            level = 150;
+        return level;
+    }
     /* VP9 carries no general_level_idc the service would accept: a WebM
      * without level metadata reports -99 and the ABI takes an AVC-style
      * level x10 (41 = 4.1 for 1080p, 51 = 5.1 for the 4K surface). A zero
@@ -1203,6 +1214,10 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
      * accepted=1, valid=0, rc=0x81…; draining with Flush yields the picture.
      * Only treat the status as fatal when the drain also produces nothing. */
     const int drain_on_error = !is_flush && !output.valid && rc != 0 && frame.accepted != 0;
+    if (drain_on_error)
+        play_logf("vdec-play: decode-drain au=%llu rc=%d accepted=%u valid=%d picture_count=%d decode_us=%llu",
+                  (unsigned long long)au_index, rc, frame.accepted, output.valid, output.picture_count,
+                  (unsigned long long)decode_us);
     if (!is_flush && (rc == 0 || drain_on_error) && !output.valid &&
         (s->flush_each_decode || drain_on_error || s->pending_count >= s->pending_limit)) {
         memset(&output, 0, sizeof(output));
@@ -1888,14 +1903,15 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
             media->nal_length_size = (stream->codecpar->extradata[length_offset] & 3) + 1;
         if (media->nal_length_size < 1 || media->nal_length_size > 4) media->nal_length_size = 4;
     }
-    play_logf("vdec-play: demux ready stream=%d codec=%s size=%dx%d fps=%d/%d profile=%d format=%d bits=%d depth=%d "
-              "trc=%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
-              stream_index, play_codec_name(media->codec), stream->codecpar->width, stream->codecpar->height,
-              stream->avg_frame_rate.num, stream->avg_frame_rate.den, stream->codecpar->profile, stream->codecpar->format,
-              stream->codecpar->bits_per_raw_sample, play_param_depth(stream->codecpar), media->color_trc,
-              media->time_base.num, media->time_base.den, stream->codecpar->codec_tag,
-              stream->codecpar->extradata_size, media->nal_length_size, filter_name ? filter_name : "none",
-              media->has_reorder);
+    play_logf(
+        "vdec-play: demux ready stream=%d codec=%s size=%dx%d fps=%d/%d profile=%d level=%d format=%d bits=%d "
+        "depth=%d trc=%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
+        stream_index, play_codec_name(media->codec), stream->codecpar->width, stream->codecpar->height,
+        stream->avg_frame_rate.num, stream->avg_frame_rate.den, stream->codecpar->profile, stream->codecpar->level,
+        stream->codecpar->format, stream->codecpar->bits_per_raw_sample, play_param_depth(stream->codecpar),
+        media->color_trc, media->time_base.num, media->time_base.den, stream->codecpar->codec_tag,
+        stream->codecpar->extradata_size, media->nal_length_size, filter_name ? filter_name : "none",
+        media->has_reorder);
     return 0;
 }
 static int play_prebuffer_network(VdecPlaySession *s, VdecPlayMedia *media, AVPacket *input) {

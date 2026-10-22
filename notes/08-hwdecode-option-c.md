@@ -63,7 +63,7 @@
 |H.264 AVC 8-bit 4:2:0|**4K 连续解码通过**：3840×2160，60/60 AU，NV12，平均 16.504 ms、P95 20.195 ms；未测端到端 4K60 present|EVO `README.md:51-58` 与 validation 对 4K60 的口径冲突，仍只作参考|decoder 能力成立；4K60 播放仍需独立 present/时钟验收|
 |HEVC Main 8-bit|**4K 连续解码 + PTS/reorder gate 通过**：3840×2160，60/60 AU，NV12，平均 6.509 ms、P95 8.372 ms；未接呈现|EVO `README.md:53-56`、`docs/codec-support.md:13-20` 的 4K 结论与本机 decoder 方向一致，但不能替代 present 验收|可进入受 watchdog/fallback 保护的 8-bit C P1；仍未证明 4K60 present|
 |HEVC Main10 / P010|**1080p 连续解码通过**：1920×1088 coded、60/60 AU，`pitch=1920,pitch_bytes=3840`，P010 60/60，平均 2.477 ms、P95 3.245 ms|参考 README 只可靠列到 1080p；后续文档对 4K Main10 仍有未完整测量说明|10-bit decoder 能力成立；4K Main10 与 HDR/present 仍未知|
-|HEVC Main10 4K|未测|参考项目文档本身也存在 4K Main10 吞吐/呈现未收口的记录|不进入当前 P0；若继续 C，另立能力测试|
+|HEVC Main10 4K|**已通过（呈现路径）**：3840×2160 P010-native，2700/2700 AU，`presented=8040 dropped=0`，见 §11.5|参考项目文档本身也存在 4K Main10 吞吐/呈现未收口的记录|C 路 4K Main10 可交付；HDR10 输出元数据仍未做|
 |VP9 Profile 0/2|未测|参考文档版本间口径不一致|不放进第一原型|
 |AV1|无 `sceVideodec2` 路线|参考项目走软件 dav1d|C 不覆盖 AV1|
 
@@ -675,7 +675,7 @@ M1 已保留 `videodec2_probe.c` 的既有 P0/PTS 门控，并新增 `WILIWILI_T
 
 ### 10.3 待补（第二批及以后）
 
-- 4K H.264、4K HEVC、2K(2560×1440) HEVC、HEVC Main10（10bit SDR 与 HDR10/PQ）、VP9、mid-stream 分辨率变化：本地测试流已生成（`/tmp/vdec-media/`，见 10.4），待主机轮次。
+- 4K H.264、4K HEVC、2K(2560×1440) HEVC、HEVC Main10（10bit SDR 与 HDR10/PQ）、VP9、mid-stream 分辨率变化：本地测试流已生成（`/tmp/vdec-media/`，见 10.4）。其中 4K HEVC8 / 4K Main10(PQ) / 4K VP9 与真实 B 站 HEVC 已在真机收口，见 §11.5 / §11.6；4K H.264 与 2K HEVC 仍只有早期 1080p 轮次之外的解码探针证据。
 - 小窗/全屏/EOF 定格截图与 `direct_mem` 峰值：随上项一并采集。
 
 ## 11. C 路 HEVC8 / HEVC Main10（P010/HDR）/ VP9 打通（2026-10-22）
@@ -719,7 +719,41 @@ M1 已保留 `videodec2_probe.c` 的既有 P0/PTS 门控，并新增 `WILIWILI_T
 
 ### 11.4 未验证 / 已知限制
 
-- 4K HEVC、4K HEVC Main10、4K VP9 本轮**未跑**（本轮只用 1080p 流；4K 的 `max_level` 映射与 P010 池大小仍需真机）。
+- 4K HEVC、4K HEVC Main10、4K VP9 已在真机跑通，见 §11.5；仍未覆盖的是 4K 的 60 fps、4K 长测（≥10 min）与真实 B 站 4K 轨道（本账号非大会员，不可得）。
 - 10bit SDR（`trc!=16`）走 `p010_to_nv12` 软转路径本轮没有独立测试流（`test-4k-hevc10-hdr.mp4` 仅 6 s）。
 - VP9 的隐藏帧（`show_frame=0`）分支在已测流里**未触发**（`vp9_superframe_split` 输出全部 `hidden=0`，`hidden-au` 计数 0）；该分支按 EVO 实现编写，只有代码路径可信度。
-- 真 B 站 VP9/HEVC 流（带 B 帧 reorder、分段 CDN、多清晰度切换）本轮仍用本地测试流代替；VP9 的 `vp9_superframe_split` 在真实 B 站流上是否出现隐藏帧、`picture-error` 频率如何，需线上回归。
+- 真 B 站 **HEVC** 流已回归（§11.6：1080P/720P/480P 三级 + 两次 OSD 切换）；真 B 站 **VP9** 流仍未取得（B 站 `codecid=13` 是 AV1 不是 VP9），VP9 的隐藏帧与 `picture-error` 仍只有本地流证据。
+
+### 11.5 4K 三类码流（build `Oct 22 2026 15:18:01`，主机 `192.168.102.118`，`PPSA99233`）
+
+测试流由本机 ffmpeg 生成并放在 `test-media/`，经 `python3 /tmp/vdec-serve.py 8125 /root/workspace/ps5wiliwili/test-media`（支持 Range）提供；三类各 90 s / 30 fps，options 见 `/tmp/opt-4k-hevc8.txt`、`/tmp/opt-4k-hevc10.txt`、`/tmp/opt-4k-vp9.txt`。
+
+| 码流 | 测试流 | config / decoder ready | first-frame | 汇总（68 条 stats 的末条） |
+|---|---|---|---|---|
+| HEVC 8bit 4K | `t-4k-hevc8.mp4`（x265 ultrafast，流声明 level 150） | `profile=1 level=153 max=3840x2160 visible=3840x2160 depth=8 dpb=-1`；`p010=off frame_size=0xbe0000 au=0x1800000 frame=0x23a0000 direct_mem=317669376` | `frame=3840x2160 pitch=3840 pitch_bytes=3840 path=nv12 ten_bit=0` | `presented=8040 dropped=0 eof=1 limit=6 peak=3 inputs=2700 accepted=2700 outputs=2700 errors=0 order_errors=0` |
+| HEVC Main10 HDR10(PQ) 4K | `t-4k-hevc10-hdr.mp4`（`yuv420p10le` + `hdr10=1` + bt2020/smpte2084，流声明 level 150） | `profile=2 level=153 depth=10 dpb=-1`；`p010=native frame_size=0x17bc000 frame=0x4734000 p010_pool=0x0 direct_mem=537444352` | `frame=3840x2160 pitch=3840 pitch_bytes=7680 p010=1 path=p010-native ten_bit=1 trc=16` | 同上：`presented=8040 dropped=0 eof=1 inputs=2700 accepted=2700 outputs=2700 errors=0 order_errors=0` |
+| VP9 Profile0 4K | `t-4k-vp9.webm`（libvpx realtime 20M；WebM 无 level 元数据，ffmpeg 报 -99） | `profile=0 level=51 max=3840x2160 depth=8`；`bsf=vp9_superframe_split frame_size=0xbf8000 au=0x1800000 direct_mem=472612864` | `frame=3840x2160 pitch=3840 path=nv12 ten_bit=0` | 同上，另 `limit=4 peak=1` |
+
+- 三类各 14 条 health：`dcb_full=0 ring_fail=0 tex_fail=0`、`timeouts=0`、`vo_rc=0`；全程 **0 次 `FALLBACK_A`**。
+- 定格截图（90 s 片尾，FPS 60 稳定、无 spinner）：`/tmp/final-4k-hevc8.png`、`/tmp/final-4k-hevc10.png`、`/tmp/final-4k-vp9.png`；日志 `/tmp/run-final-4k-{hevc8,hevc10,vp9}.log`。
+- 4K 的 direct-memory 池余量实测足够：NV12 4K `frame_size=0xbe0000`（12.2 MiB/帧）、P010 4K `0x17bc000`（23.8 MiB/帧）、`au` 池 3×8 MiB（4K 实测最大 AU 仅 19 KB / 22 KB / 167 KB）；`direct_mem` 峰值 317 / 537 / 473 MB，远低于 12 GiB 上限。4K 没有出现"池不足"形态，`config` 与 `QueryDecoderMemoryInfo` 均一次通过。
+- VP9 4K 的 `level` 走 `height>1088 → 51`（AVC 式 ×10）：真机 ABI 接受 51 并完整解出 2700 AU，说明 4K 下 51 合法且够用，不需要给 VP9 加 153 分支（VP9 无 `general_level_idc`，153 从未被该服务验证过）。
+- 颜色判读（与 1080p 同结论）：Main10 PQ 直通表现为"黄偏橙、青变浅、红/蓝先截顶"，同帧与 8bit 对比：黄 `(254,253,1)→(253,149,0)`、青 `(0,253,255)→(0,207,254)`、品红/蓝保持 `(255,0,227)`/`(0,0,254)`；色相顺序与灰阶方向正确、无 R/B 互换，P010 平面与 UV 半平面偏移无误。TV 侧仍未做 HDR10 元数据/真 BT.2020 输出，因此是"PQ 直通"而非"HDR 观感"。
+
+### 11.6 真实 B 站 HEVC DASH 回归（含 B 帧 reorder、两次清晰度切换）
+
+样本 `BV1MSHY6eEq9` / cid `42417522439`（`hvc1` DASH，`video_delay=4 has_b_frames=4`）。options 只有 `WILIWILI_TEST_BV` 加两条 trace（**不设** `WILIWILI_TEST_VDEC`/`WILIWILI_VDEC_PLAY`，走默认 `user mode=0` AUTO，能力门才会打印）：`/tmp/opt-real-auto.txt`。
+
+**先复现的回归（本轮已修）**：同一 BV 在 `max_level=123` 下 AU0 立即 `decode rc=-2128805118`（`0x811D0302 OVERSIZE_DECODE`，`accepted=1`），随后 AU1 `0x811D0303`，`FALLBACK_A before first frame`。`demux ready ... level=150` 是根因：B 站 1080p HEVC 声明 **L5.0（150）**，而上一版 `play_codec_level` 只按高度给 1080p→123。`max_level` 是**上限**，流的 SPS 超过它就第一个 AU 被拒。修法：HEVC 取"高度下限"与"demuxer 声明 level"中较大者，仍只用 ABI 已验证的 123/150/153（`play_codec_level`）；同时 `demux ready` 增打 `level=%d`、`decode-drain` 增打 pre-drain `rc`，这两条日志正是本轮区分"配置被拒"与"池不足"的入口（原日志两者都不打印）。
+
+| 会话 | 轨道 | config | 结果 |
+|---|---|---|---|
+| 1080P（默认档） | `1920x1080 level=150` | `level=150 max=1920x1088 depth=8 dpb=-1`，`frame_size=0x334000 direct_mem=179863552` | `auto-gate=pass codec=hevc(974921) size=1920x1080 depth=8 raw_bits=0 coded_bits=24 reorder=1`；`first-presented=696 ms`；`stop summary inputs=144 accepted=143 outputs=139 presented=475 dropped=0 errors=0 order_errors=0 failovers=0` |
+| 720P（OSD 切一次） | `1280x720 level=120` | `level=123 max=1280x720`，`frame_size=0x154000 direct_mem=86605824` | 新会话 `stop summary inputs=660 accepted=659 outputs=655 presented=1305 dropped=0 errors=0 order_errors=0 failovers=0` |
+| 480P（OSD 再切一次） | `852x480 level=120` | `level=123 max=864x480`，`frame_size=0xb8000 direct_mem=69926912` | 末条 `presented=3120 ... limit=8 peak=5 pending=5 dropped=0 errors=0 order_errors=0`，播到片尾 `eof=1 inputs=2096` |
+
+- 切清晰度方式：`options` 打开画质下拉（1080P / 720P / 480P / 360P，`×`=确定）→ `down` → `cross`。两次切换均**无崩溃、无假死、无 spinner**，画面继续推进；每级切换都按新轨道重建 decoder（`demux ready`→`config`→`decoder ready` 各一条，`start source` 换成不同 CDN 主机与 bw 参数）。
+- 全程 8 条 health 全零、**0 次 `FALLBACK_A`**；B 帧 reorder 下 `order_errors=0`，`pending` 稳定在 `limit=8` 内（`peak=5`），`inputs≈accepted≈outputs`（差值是在途帧）。
+- 截图：`/tmp/real-pre.png`（1080P）、`/tmp/real-menu.png`（画质下拉）、`/tmp/real-720p.png`、`/tmp/real-480p.png`；日志 `/tmp/run-real-hevc-final.log`（三段 `stop summary` + 切换序列）。
+- 说明：本账号非大会员，1080P 是可得最高档；"1080P→4K"在真实流上**未验证**（无 4K 轨道），4K 只由 §11.5 的本地流覆盖。失败样本留档：把 `t-4k-vp9` 写成 `.mp4`（404）时是 `open-input failed rc=-875574520` → `FALLBACK_A reason=startup-failure`，回退干净（`/tmp/run-4k-vp9.log` 首版）。
+- 提交前按 `clang-format` 只格式化改动行段（纯空白），随后重建并与最终包一次复验：`build Oct 22 2026 15:42:44` 上 4K HEVC8 复跑 `level=153 inputs=2700 accepted=2700 outputs=2700 dropped=0 eof=1`、真实流复跑（本轮已切到 480P 并记住该档）`auto-gate=pass ... dropped=0 errors=0 order_errors=0`，两次均 0 次 `FALLBACK_A`（`/tmp/run-postfmt-hevc8.log`、`/tmp/run-postfmt-real.log`）。
