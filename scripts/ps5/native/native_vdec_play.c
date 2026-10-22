@@ -619,9 +619,12 @@ static int play_param_depth(const AVCodecParameters *par) {
  * 4.1/5.0/5.1 for 1080p/1440p/2160p. FFmpeg's own level idc is used whenever
  * the demuxer knows it, because a wrong ceiling is a create-time failure. */
 static uint32_t play_codec_level(uint32_t codec, int height, int ffmpeg_level) {
+    /* HEVC: the decoder only accepts the ABI's level set (123/150/153 for
+     * 1080/1440/2160). FFmpeg reports e.g. 120 (L4.0), which the instance
+     * rejects at the first Decode call even though CreateDecoder succeeds. */
+    if (codec == VDEC_PLAY_CODEC_HEVC) return height > 1440 ? 153 : height > 1080 ? 150 : 123;
     if (ffmpeg_level > 0) return (uint32_t)ffmpeg_level;
     switch (codec) {
-    case VDEC_PLAY_CODEC_HEVC: return height > 1440 ? 153 : height > 1080 ? 150 : 123;
     case VDEC_PLAY_CODEC_AVC: return height > 1080 ? 52 : 51;
     default: return 0;
     }
