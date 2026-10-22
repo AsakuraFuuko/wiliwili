@@ -45,6 +45,7 @@ extern "C" int wiliwili_vdec_play_enabled(void);
 extern "C" int wiliwili_vdec_play_start(const char *url, int start_seconds);
 extern "C" void wiliwili_vdec_play_add_backup_url(const char *url);
 extern "C" int wiliwili_vdec_play_is_active(void);
+extern "C" int wiliwili_vdec_play_source_overridden(void);
 extern "C" void wiliwili_vdec_play_stop(void);
 extern "C" int wiliwili_vdec_play_has_presented(void);
 extern "C" int wiliwili_vdec_play_draw(double playback_time, double speed, int paused, int view_x, int view_y, int view_w,
@@ -555,6 +556,17 @@ VideoView::VideoView() {
                  * never owns the file, so it never applies one. */
                 const int64_t current  = mpvCore->video_progress;
                 const bool hint_useful = current <= 2 || p > current + 2;
+                /* A test override swaps the C-path media for a local clip, so the
+                 * B站 resume point addresses nothing in it: seeking to it lands past
+                 * EOF, the decoder gets no IDR and the session drops to A before the
+                 * first frame. Ignore the hint so both mpv and the decoder start at 0. */
+#if defined(PS5_NATIVE_APP)
+                if (wiliwili_vdec_play_source_overridden()) {
+                    wiliwili_boot_log("app: last-time ignored override");
+                    this->setLastPlayedPosition(0);
+                    return;
+                }
+#endif
                 if (this->fullscreen_mirror || !hint_useful) {
                     char line[160];
                     std::snprintf(line, sizeof(line), "app: last-time ignored p=%lld current=%lld mirror=%d",

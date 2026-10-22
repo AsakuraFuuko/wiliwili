@@ -677,3 +677,49 @@ M1 已保留 `videodec2_probe.c` 的既有 P0/PTS 门控，并新增 `WILIWILI_T
 
 - 4K H.264、4K HEVC、2K(2560×1440) HEVC、HEVC Main10（10bit SDR 与 HDR10/PQ）、VP9、mid-stream 分辨率变化：本地测试流已生成（`/tmp/vdec-media/`，见 10.4），待主机轮次。
 - 小窗/全屏/EOF 定格截图与 `direct_mem` 峰值：随上项一并采集。
+
+## 11. C 路 HEVC8 / HEVC Main10（P010/HDR）/ VP9 打通（2026-10-22）
+
+上一批把 `inputs=0` 归因为"片源太短被续播 seek 推到片尾"。本批先在代码里把这个假 EOF 钉死，再逐条打通三类码流；全部真机取证在同一份 build 上重跑一遍。
+
+### 11.1 假 EOF 的真因（不是片源长度）
+
+日志形态：`read#54 rc=-541478725`（`AVERROR_EOF`）→ `inputs=0` → `FALLBACK_A reason=stream-count-mismatch rc=-9019`。
+
+- 触发链：`video_view.cpp` 的 `LAST_TIME` 续播提示 → `mpvCore->seek(960)` → `MPVCore::seek()` 同时调 `wiliwili_vdec_play_seek(960)`。`wiliwili_vdec_play_start()` 只在**启动位置**上忽略了 override（`start position ignored for overridden source`），运行期 seek 仍照发，于是 120 s 的测试流被 seek 到 960 s（越过片尾）→ `avformat_seek_file` 返回 0、随后立刻 EOF，`awaiting true IDR` 永远等不到 → 0 AU。
+- 修法：override（`WILIWILI_VDEC_URL`）生效时，应用层直接丢弃 `LAST_TIME` 提示（`app: last-time ignored override`），mpv 与解码器都从 0 开始；同时 `wiliwili_vdec_play_source_overridden()` 暴露给播放器。**没有改生产语义**：真实 B 站续播点照旧 seek（真越界仍按既有 `seek-demux` 路径回 A）。
+- 排除片长因素：改用 420 s 片源（`test-hevc8-420.mp4` 等）后 `read#` 持续增长、`inputs` 与 `presented` 同步增长（`/tmp/run-hevc8-420.log`：34 s 时 `presented=2040`）。
+
+### 11.2 三类码流的解码阻塞点与修法
+
+| 码流 | 阻塞点（真机证据） | 修法 | 锚点 |
+|---|---|---|---|
+| HEVC 8bit 1080p | `8732ce6` 把 `max_dpb_frames` 从 `-1` 改成 `4` 后，AU0 就 `decode rc=-2128805118`（`0x811D0302`）、`accepted=0 valid=0` —— 与 `notes/02-hwdecode.md` 记的"参考帧多的流整段解不出"完全同一形态 | 恢复 `SCE_VIDEODEC2_AUTO_FRAMES(-1)`：解码器自定参考帧池；`config` 日志改为打印真实值（原来自称 `dpb=-1` 而实际写 4，误导了两轮排查） | `play_setup_decoder` |
+| VP9 1080p | ① `max_level=0`（WebM 无 level 元数据 → ffmpeg 报 -99）⇒ `QueryDecoderMemoryInfo` 直接拒绝，`query_decoder rc` 失败；② 无 BSF 时把整包（superframe）当 AU 送解码器 | ① `play_codec_level` 给 VP9 按高映射 41/51（AVC 式 level×10）；② 挂 `vp9_superframe_split`；③ 用 VP9 未压缩头解析 `show_frame`/`frame_type`（demuxer 的 key flag 对 VP9 不可信），隐藏 alt-ref 帧走"只解不显示"分支 | `play_codec_level` / `play_media_open` / `play_vp9_flags` / `play_submit_au` |
+| VP9 `out.error` | `testsrc2` 生成的 420 s VP9 流在 AU11–AU18 连续 8 帧带 `picture-level error flag`（`rc=0`、`picture_count=1`、画面正常），第 9 个错误判定前旧代码已在 AU11 直接 `FALLBACK_A reason=output-error`（同一帧 `valid=1 error=1`） | 按参考实现（EVO `evo_vdec_native.c` 只把 `rc!=0` 当致命）改为计数 + 限量日志；帧契约（`picture_count/pitch/buffer/slot`）仍全查，真坏帧走既有 `output-contract` 回 A | `play_account_output_locked` |
+| HEVC Main10 | 无新增阻塞：`depth=10 → p010=1`，`pitch_bytes=2*pitch` 契约成立，`p010_enabled` 默认开，PQ(`trc=16`) 走 `video_yuv_p010_hdr`（`ten_bit=1`），非 PQ 的 10bit 走 `p010_to_nv12` 软转 | 保持；本批只补证据 | `play_setup_decoder` / `wiliwili_vdec_play_draw` |
+
+附带修正：AU 环形缓冲改用独立 `au_ring` 计数（隐藏帧不推进 `input_count`，用它可以避免覆盖在途 AU 的码流槽）。
+
+### 11.3 真机证据（build `Oct 22 2026 13:54:38`，主机 `192.168.102.118`，`PPSA99233`）
+
+测试流由本机 ffmpeg 生成，经 `python3 /tmp/vdec-serve.py 8125 /root/workspace/ps5wiliwili/test-media`（支持 Range）提供；options 见 `/tmp/opt-hevc8-eof.txt`、`/tmp/opt-hevc10pq.txt`、`/tmp/opt-vp9.txt`。
+
+| 码流 | 测试流 | config / decoder ready | first-frame | EOF | 汇总 |
+|---|---|---|---|---|---|
+| HEVC 8bit 1080p | `test-1080p-hevc8-long.mp4`（120 s） | `profile=1 level=123 max=1920x1088 depth=8 dpb=-1`；`p010=off frame_size=0x334000 direct_mem=113016832` | `frame=1920x1088 pitch=2048 path=nv12`，`elapsed_ms=286` | `inputs=3600 outputs=3598`，`EOF parked final frame` | `presented=8640 dropped=0 eof=1 inputs=3600 accepted=3600 outputs=3600 errors=0 order_errors=0` |
+| HEVC Main10 HDR10(PQ) | `test-hevc10-pq-90.mp4`（90 s，`zscale` 真 PQ/BT.2020、`trc=16`） | `profile=2 level=123 depth=10 dpb=-1`；`p010=native frame_size=0x5fc000 p010_pool=0x0 direct_mem=164675584` | `frame=1920x1088 pitch=1920 pitch_bytes=3840 p010=1 path=p010-native ten_bit=1 trc=16`，`elapsed_ms=123` | `inputs=2700 outputs=2698` | `presented=6600 dropped=0 eof=1 inputs=2700 accepted=2700 outputs=2700 errors=0 order_errors=0` |
+| VP9 Profile0 1080p | `test-1080p-vp9-long.webm`（120 s） | `profile=0 level=41 max=1920x1088 depth=8 dpb=-1 bsf=vp9_superframe_split` | `frame=1920x1080 pitch=2048 path=nv12`，`elapsed_ms=111` | `inputs=3600 outputs=3600` | `presented=8640 dropped=0 eof=1 inputs=3600 accepted=3600 outputs=3600 errors=0 order_errors=0` |
+
+- AGC health（三类各取末条）：`dcb_full=0 ring_fail=0 tex_fail=0`、`timeouts=0`、`vo_rc=0`、`presents=600`；全程 **0 次 `FALLBACK_A`**。
+- 定格截图：`/tmp/run-hevc8-eof.png`（120 s 片尾计时 119 的彩条）、`/tmp/run-hevc10-eof.png`（PQ 彩条，色相顺序正确、无通道互换）、`/tmp/run-vp9-eof.png`。
+- 连续播放（420 s 片源，用于排除假 EOF）：`/tmp/run-hevc8-420.log`（34 s `presented=2040`）、`/tmp/run-hevc10-420.log`、`/tmp/run-vp9-420.log`（32 s `presented=2160`，早期 AU11–18 共 8 个 `picture-error tolerated` 后归零）。注意 `test-1080p-vp9-long.webm`（smptebars）无此类 flag，`errors=0` —— 这类 flag 与编码器/码流内容相关，不是配置错误。
+- 1080p60 补充（同一 build）：HEVC 8bit `test-hevc8-1080p60.mp4`（20 s）`level=123` 依旧通过——`presented=2040 inputs=1200 accepted=1200 outputs=1200 dropped=0 errors=0`；VP9 `test-vp9-1080p60.webm`（libvpx realtime 丢帧后实含 942 帧）`level=41` 通过——`inputs=942 outputs=942 dropped=0 errors=4（前 4 帧 picture-error，已容忍）`。故本批不引入按帧率提升 level 的映射（表内 123/41 对 1080p60 足够）。
+- 颜色判读：P010-native 输出为 PQ 信号直通（`ten_bit=1 trc=16`），与 8bit SDR 渲染相比中间调/黄色按 PQ 曲线变化（黄偏橙、青变浅），色相顺序与灰阶方向正确，说明 P010 平面/pitch 与 UV 半平面偏移无误；TV 侧 HDR 元数据未做，故不是"BT.2020 观感"，但管线本身正确。
+
+### 11.4 未验证 / 已知限制
+
+- 4K HEVC、4K HEVC Main10、4K VP9 本轮**未跑**（本轮只用 1080p 流；4K 的 `max_level` 映射与 P010 池大小仍需真机）。
+- 10bit SDR（`trc!=16`）走 `p010_to_nv12` 软转路径本轮没有独立测试流（`test-4k-hevc10-hdr.mp4` 仅 6 s）。
+- VP9 的隐藏帧（`show_frame=0`）分支在已测流里**未触发**（`vp9_superframe_split` 输出全部 `hidden=0`，`hidden-au` 计数 0）；该分支按 EVO 实现编写，只有代码路径可信度。
+- 真 B 站 VP9/HEVC 流（带 B 帧 reorder、分段 CDN、多清晰度切换）本轮仍用本地测试流代替；VP9 的 `vp9_superframe_split` 在真实 B 站流上是否出现隐藏帧、`picture-error` 频率如何，需线上回归。

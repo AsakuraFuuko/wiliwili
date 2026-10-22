@@ -235,6 +235,11 @@ typedef struct {
     uint64_t start_wall_us, first_present_us;
     int first_presented;
     uint64_t advanced_count, dropped_count, error_count, order_error_count;
+    uint64_t picture_error_count;
+    /* Advances on every Decode call, including the hidden VP9 frames that never
+     * touch input_count, so their bitstream buffer cannot land on one a
+     * submitted AU is still using. */
+    uint64_t au_ring;
     uint64_t direct_mem_peak;
     uint64_t last_demux_wait_us, max_demux_wait_us, demux_read_count;
     uint64_t last_slot_wait_us, max_slot_wait_us, slot_wait_count;
@@ -623,6 +628,11 @@ static uint32_t play_codec_level(uint32_t codec, int height, int ffmpeg_level) {
      * 1080/1440/2160). FFmpeg reports e.g. 120 (L4.0), which the instance
      * rejects at the first Decode call even though CreateDecoder succeeds. */
     if (codec == VDEC_PLAY_CODEC_HEVC) return height > 1440 ? 153 : height > 1080 ? 150 : 123;
+    /* VP9 carries no general_level_idc the service would accept: a WebM
+     * without level metadata reports -99 and the ABI takes an AVC-style
+     * level x10 (41 = 4.1 for 1080p, 51 = 5.1 for the 4K surface). A zero
+     * ceiling is what made QueryDecoderMemoryInfo refuse every VP9 stream. */
+    if (codec == VDEC_PLAY_CODEC_VP9) return height > 1088 ? 51 : 41;
     if (ffmpeg_level > 0) return (uint32_t)ffmpeg_level;
     switch (codec) {
     case VDEC_PLAY_CODEC_AVC: return height > 1080 ? 52 : 51;
@@ -682,6 +692,34 @@ static void play_decoder_close(VdecPlayDecoder *d) {
     if (d->compute_queue) sceVideodec2ReleaseComputeQueue(d->compute_queue);
     play_free_direct(&d->compute);
     memset(d, 0, sizeof(*d));
+}
+
+/* MSB-first bit reader for the VP9 uncompressed header. */
+static int play_bit_read(const uint8_t *data, int size, int *position) {
+    const int bit = (*position)++;
+    if (bit < 0 || (bit >> 3) >= size) return 0;
+    return (data[bit >> 3] >> (7 - (bit & 7))) & 1;
+}
+
+typedef struct {
+    int show;     /* the coded frame is displayed */
+    int keyframe; /* frame_type == KEY_FRAME, i.e. a random-access point */
+} VdecPlayVp9Flags;
+
+/* VP9 shown/keyframe flags from the uncompressed header (spec 6.2). The
+ * demuxer's key flag is not reliable for VP9, and the splitter drops the PTS
+ * on hidden alt-ref frames instead of marking them. */
+static VdecPlayVp9Flags play_vp9_flags(const uint8_t *data, int size) {
+    VdecPlayVp9Flags flags = {1, 0};
+    if (!data || size <= 0) return flags;
+    int position = 0;
+    if (play_bit_read(data, size, &position) != 1 || play_bit_read(data, size, &position) != 0) return flags;
+    const int profile = play_bit_read(data, size, &position) | (play_bit_read(data, size, &position) << 1);
+    if (profile == 3) (void)play_bit_read(data, size, &position);
+    if (play_bit_read(data, size, &position)) return flags; /* show_existing_frame displays a reference */
+    flags.keyframe = play_bit_read(data, size, &position) == 0;
+    flags.show     = play_bit_read(data, size, &position);
+    return flags;
 }
 
 typedef struct {
@@ -831,11 +869,20 @@ static int play_output_slot(const VdecPlaySession *s, const VdecPlayOutput *out)
 
 static int play_account_output_locked(VdecPlaySession *s, int input_slot, const VdecPlayOutput *out,
                                       int *output_slot) {
+    /* out.error is the decoder's per-picture error flag, not a call failure:
+     * VP9 raises it on frames it reconstructed with a concealed block while
+     * still returning rc==0 and a complete frame (the first eight AUs of a
+     * clean 1080p VP9 file do exactly that, then never again). Failing the
+     * session on it dropped the whole C path at AU 11; the reference
+     * implementation presents the frame and treats only rc!=0 as fatal. The
+     * frame contract below still rejects anything unusable, so a genuinely
+     * broken decode ends up in A through output-contract instead. */
     if (out->error) {
         ++s->error_count;
-        play_release_slot_locked(s, input_slot);
-        play_fail_locked(s, "output-error", out->error);
-        return -1;
+        ++s->picture_error_count;
+        if (s->picture_error_count <= 3 || s->picture_error_count % 300u == 0)
+            play_logf("vdec-play: picture-error tolerated count=%llu flag=%d valid=%d picture_count=%d",
+                      (unsigned long long)s->picture_error_count, out->error, out->valid, out->picture_count);
     }
     if (!out->valid) {
         play_release_slot_locked(s, input_slot);
@@ -878,10 +925,8 @@ static int play_account_output_locked(VdecPlaySession *s, int input_slot, const 
         return -2;
     }
     const int pitch_invalid = p010 ? out->pitch_bytes != out->pitch * 2u : out->pitch_bytes != out->pitch;
-    const int invalid = out->error || out->picture_count != 1 || out->codec != s->decoder.codec ||
-                        out->pitch < out->width || pitch_invalid || out->buffer == NULL ||
-                        out->buffer_size < required || slot < 0;
-    if (invalid) {
+    if (out->picture_count != 1 || out->codec != s->decoder.codec || out->pitch < out->width || pitch_invalid ||
+        out->buffer == NULL || out->buffer_size < required || slot < 0) {
         play_release_slot_locked(s, input_slot);
         play_fail_locked(s, "output-contract", -9002);
         return -1;
@@ -1026,15 +1071,19 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par, int wi
     config.max_level = (uint32_t)level;
     config.max_width = max_width;
     config.max_height = max_height;
-    config.max_dpb_frames = 4;
+    /* -1 is SCE_VIDEODEC2_AUTO_FRAMES: the decoder self-sizes the reference
+     * pool. A fixed 4 fails every AU with 0x811D0302 on streams that keep more
+     * references (HEVC with a deep reorder buffer), which is the "picture stays
+     * white, dec=-2128805118 every frame" report in notes/02-hwdecode.md. */
+    config.max_dpb_frames = -1;
     config.pipeline_depth = 1;
     config.compute_queue = (uint64_t)s->decoder.compute_queue;
     config.cpu_affinity = 0x3f;
     config.cpu_priority = 700;
     config.optimize_progressive = 1;
-    play_logf("vdec-play: config codec=%u(%s) profile=%u level=%u max=%dx%d visible=%dx%d depth=%d dpb=-1 depth=1",
+    play_logf("vdec-play: config codec=%u(%s) profile=%u level=%u max=%dx%d visible=%dx%d depth=%d dpb=%d depth=%u",
               codec, play_codec_name(codec), config.profile, config.max_level, config.max_width, config.max_height,
-              visible_width, visible_height, depth);
+              visible_width, visible_height, depth, (int)config.max_dpb_frames, config.pipeline_depth);
 
     VdecPlayMemory memory;
     memset(&memory, 0, sizeof(memory));
@@ -1102,9 +1151,8 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par, int wi
 
 #if defined(PS5_NATIVE_APP) && defined(BOREALIS_USE_AGC)
 static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, int size, int64_t pts90k, int is_flush,
-                            int flush_index, uint64_t au_index) {
-    uint8_t *au =
-        (uint8_t *)s->decoder.au_pool.address + (size_t)(s->input_count % VDEC_PLAY_SLOTS) * VDEC_PLAY_AU_BYTES;
+                            int flush_index, uint64_t au_index, int hidden) {
+    uint8_t *au = (uint8_t *)s->decoder.au_pool.address + (size_t)(s->au_ring++ % VDEC_PLAY_SLOTS) * VDEC_PLAY_AU_BYTES;
     if (!is_flush) {
         if (!data || size <= 0 || (uint64_t)size > VDEC_PLAY_AU_BYTES) {
             pthread_mutex_lock(&s->mutex);
@@ -1226,6 +1274,21 @@ static int play_decode_call(VdecPlaySession *s, int slot, const uint8_t *data, i
     /* Some firmware revisions leave FrameBuffer.accepted=0 while the AU is
      * buffered; rc==0 is the stable accepted-input signal. */
     if (!is_flush) ++s->accepted_count;
+    if (hidden) {
+        /* A hidden VP9 alt-ref frame must be decoded because later frames
+         * reference it, but it is not a displayable picture: take whatever it
+         * produced, hand the slots straight back and never pair it with a
+         * pending PTS (that would shift every following frame's timestamp). */
+        const int hidden_slot = output.valid && output.picture_count == 1 ? play_output_slot(s, &output) : -1;
+        if (s->trace_au)
+            play_logf("vdec-play: hidden-au valid=%d picture_count=%d accepted=%u slot=%d", output.valid,
+                      output.picture_count, frame.accepted, hidden_slot);
+        if (output.valid) ++s->output_count;
+        if (hidden_slot >= 0 && hidden_slot != slot) play_release_slot_locked(s, hidden_slot);
+        play_release_slot_locked(s, slot);
+        pthread_mutex_unlock(&s->mutex);
+        return 0;
+    }
     int output_slot = -1;
     const int account = play_account_output_locked(s, slot, &output, &output_slot);
     VdecPlayAuContext *context = play_context_for_index_locked(s, au_index);
@@ -1254,7 +1317,7 @@ static int play_flush(VdecPlaySession *s) {
         const int slot = play_wait_for_frame_slot(s);
         if (slot == -2) return VDEC_PLAY_RESULT_SEEK;
         if (slot < 0) return -1;
-        const int result = play_decode_call(s, slot, NULL, 0, 0, 1, i, UINT64_MAX);
+        const int result = play_decode_call(s, slot, NULL, 0, 0, 1, i, UINT64_MAX, 0);
         if (result == VDEC_PLAY_RESULT_SEEK || result == VDEC_PLAY_RESULT_RECONFIGURE) return result;
         if (result < 0) return -1;
         if (result == 0) {
@@ -1275,18 +1338,30 @@ static int play_flush(VdecPlaySession *s) {
     return -1;
 }
 
-static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int64_t raw_pts,
-                          int64_t raw_dts, AVRational time_base, int keyframe) {
-    if (!data || size <= 0 || raw_pts == AV_NOPTS_VALUE) {
+static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int64_t raw_pts, int64_t raw_dts,
+                          AVRational time_base, int keyframe, int hidden) {
+    if (!data || size <= 0 || (!hidden && raw_pts == AV_NOPTS_VALUE)) {
         play_fail(s, "missing-display-pts", -9012);
         return -1;
     }
-    const int64_t source_pts = av_rescale_q(raw_pts, time_base, (AVRational){1, 90000});
+    const int64_t source_pts   = hidden ? 0 : av_rescale_q(raw_pts, time_base, (AVRational){1, 90000});
     const VdecPlayNalFlags nal = play_scan_nals(data, size, s->decoder.codec);
     pthread_mutex_lock(&s->mutex);
     if (s->seek_requested) {
         pthread_mutex_unlock(&s->mutex);
         return VDEC_PLAY_RESULT_SEEK;
+    }
+    if (hidden) {
+        /* A hidden VP9 alt-ref frame carries no display timestamp and must not
+         * touch the timeline, the IDR wait or the pending window: decode it for
+         * the reference chain and let play_decode_call drop its output. */
+        pthread_mutex_unlock(&s->mutex);
+        const int hidden_slot = play_wait_for_frame_slot(s);
+        if (hidden_slot == -2) return VDEC_PLAY_RESULT_SEEK;
+        if (hidden_slot < 0) return -1;
+        const int hidden_decoded = play_decode_call(s, hidden_slot, data, size, 0, 0, -1, UINT64_MAX, 1);
+        if (hidden_decoded == VDEC_PLAY_RESULT_RECONFIGURE) return VDEC_PLAY_RESULT_RECONFIGURE;
+        return hidden_decoded < 0 ? -1 : VDEC_PLAY_RESULT_OK;
     }
     const int new_vps = nal.has_vps && !s->vps_seen;
     const int new_sps = nal.has_sps && !s->sps_seen;
@@ -1379,7 +1454,7 @@ static int play_submit_au(VdecPlaySession *s, const uint8_t *data, int size, int
         context->slot_state = s->slots[slot].state;
     }
     pthread_mutex_unlock(&s->mutex);
-    const int decoded = play_decode_call(s, slot, data, size, pts90k, 0, -1, input_index);
+    const int decoded = play_decode_call(s, slot, data, size, pts90k, 0, -1, input_index, hidden);
     if (decoded == VDEC_PLAY_RESULT_RECONFIGURE) return VDEC_PLAY_RESULT_RECONFIGURE;
     return decoded < 0 ? -1 : VDEC_PLAY_RESULT_OK;
 }
@@ -1765,13 +1840,16 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     media->has_b_frames = probe_has_b_frames;
     play_logf("vdec-play: codec probe video_delay=%d has_b_frames=%d delay=%d refs=%d ticks_per_frame=%d",
               media->video_delay, media->has_b_frames, probe_delay, probe_refs, probe_ticks);
-    const char *filter_name = stream->codecpar->codec_id == AV_CODEC_ID_HEVC
-                                  ? "hevc_mp4toannexb"
-                                  : stream->codecpar->codec_id == AV_CODEC_ID_H264 ? "h264_mp4toannexb" : NULL;
-    /* VP9 has no start-code layer: the demuxer already hands us complete
-     * superframes, so this path takes the packet straight to the decoder. */
+    const char *filter_name = stream->codecpar->codec_id == AV_CODEC_ID_HEVC   ? "hevc_mp4toannexb"
+                              : stream->codecpar->codec_id == AV_CODEC_ID_H264 ? "h264_mp4toannexb"
+                              : stream->codecpar->codec_id == AV_CODEC_ID_VP9  ? "vp9_superframe_split"
+                                                                               : NULL;
+    /* VP9 has no start-code layer, but it does compound frames: a superframe
+     * carries a hidden alt-ref plus the shown frame, and the decoder rejects
+     * the packet whole. vp9_superframe_split hands over one coded frame per
+     * packet (the hidden ones arrive without a PTS). */
     const int vp9 = stream->codecpar->codec_id == AV_CODEC_ID_VP9;
-    if (!filter_name && !vp9) {
+    if (!filter_name) {
         play_logf("vdec-play: unsupported codec id=%d", stream->codecpar->codec_id);
         avformat_close_input(&format);
         return -1;
@@ -2106,7 +2184,7 @@ static int play_sequential_seek_skip(VdecPlaySession *s, const AVPacket *packet,
 static int play_route_au(VdecPlaySession *s, VdecPlayMedia *media, const AVPacket *packet) {
     if (play_sequential_seek_skip(s, packet, media->time_base)) return VDEC_PLAY_RESULT_OK;
     return play_submit_au(s, packet->data, packet->size, packet->pts, packet->dts, media->time_base,
-                          (packet->flags & AV_PKT_FLAG_KEY) != 0);
+                          (packet->flags & AV_PKT_FLAG_KEY) != 0, 0);
 }
 
 static void play_wait_if_paused(VdecPlaySession *s);
@@ -2251,8 +2329,20 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
                 av_packet_unref(filtered);
                 continue;
             }
+            /* vp9_superframe_split emits the hidden alt-ref frame without a PTS,
+             * and the VP9 header says show_frame=0 as well: decode it for the
+             * reference chain, never for presentation. Its header is also the
+             * only trustworthy keyframe signal for VP9. */
+            const int vp9_frame = media->codec == VDEC_PLAY_CODEC_VP9;
+            const VdecPlayVp9Flags vp9 =
+                vp9_frame ? play_vp9_flags(filtered->data, filtered->size) : (VdecPlayVp9Flags){1, 0};
+            const int hidden            = filtered->pts == AV_NOPTS_VALUE || (vp9_frame && !vp9.show);
+            const int filtered_keyframe = vp9_frame ? vp9.keyframe : (filtered->flags & AV_PKT_FLAG_KEY) != 0;
+            if (s->trace_au && vp9_frame)
+                play_logf("vdec-play: vp9 frame pts=%lld size=%d show=%d key=%d hidden=%d", (long long)filtered->pts,
+                          filtered->size, vp9.show, vp9.keyframe, hidden);
             const int submit = play_submit_au(s, filtered->data, filtered->size, filtered->pts, filtered->dts,
-                                              media->time_base, (filtered->flags & AV_PKT_FLAG_KEY) != 0);
+                                              media->time_base, filtered_keyframe, hidden);
             av_packet_unref(filtered);
             if (submit == VDEC_PLAY_RESULT_SEEK || submit == VDEC_PLAY_RESULT_RECONFIGURE) {
                 result = submit;
@@ -2966,6 +3056,13 @@ int wiliwili_vdec_play_is_active(void) {
     pthread_mutex_unlock(&s->mutex);
     return active;
 }
+/* True when WILIWILI_VDEC_URL replaces the B站 media with a local clip. The
+ * resume point then addresses nothing in the clip, so the app drops the
+ * LAST_TIME hint instead of seeking both mpv and the decoder past EOF. */
+int wiliwili_vdec_play_source_overridden(void) {
+    const char *override_url = getenv("WILIWILI_VDEC_URL");
+    return override_url != NULL && override_url[0] != '\0';
+}
 int wiliwili_vdec_play_has_presented(void) {
     VdecPlaySession *s = &g_vdec_play;
     pthread_mutex_lock(&s->mutex);
@@ -3240,6 +3337,7 @@ int wiliwili_vdec_play_start(const char *url, int start_seconds) {
     return 0;
 }
 void wiliwili_vdec_play_add_backup_url(const char *url) { (void)url; }
+int wiliwili_vdec_play_source_overridden(void) { return 0; }
 int wiliwili_vdec_play_seek(double seconds) {
     (void)seconds;
     return 0;
