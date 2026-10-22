@@ -567,6 +567,21 @@ VideoView::VideoView() {
                     return;
                 }
 #endif
+                /* A history resume point outlives the media it addresses: a short
+                 * clip (or a rendition shorter than the one the hint was recorded
+                 * against) parks the seek past EOF, and the C path answers
+                 * "demux EOF" with a FALLBACK_A before the first frame. The C
+                 * path clamps too; dropping the hint here also keeps mpv's
+                 * timeline and the app audio track from seeking off the end. */
+                const double known_duration = real_duration > 0 ? (double)real_duration : mpvCore->duration;
+                if (known_duration > 2.0 && (double)p >= known_duration - 2.0) {
+                    char line[160];
+                    std::snprintf(line, sizeof(line), "app: last-time clamp p=%lld duration=%.3f", (long long)p,
+                                  known_duration);
+                    wiliwili_boot_log(line);
+                    this->setLastPlayedPosition(0);
+                    return;
+                }
                 if (this->fullscreen_mirror || !hint_useful) {
                     char line[160];
                     std::snprintf(line, sizeof(line), "app: last-time ignored p=%lld current=%lld mirror=%d",

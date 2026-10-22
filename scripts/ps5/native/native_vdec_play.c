@@ -47,6 +47,10 @@ enum {
     VDEC_PLAY_MAX_FLUSH = 32,
     VDEC_PLAY_BACKUP_CAP         = 4,
     VDEC_PLAY_SEEK_PRESENT_TIMEOUT_MS = 500,
+    /* A seek target is clamped to `duration - tail`: a target past the end makes
+     * avformat_seek_file() hand back EOF on the first read, which the failover
+     * turns into FALLBACK_A before a single frame is decoded. */
+    VDEC_PLAY_SEEK_TAIL_MS = 1500,
     VDEC_PLAY_PREBUFFER_PACKETS = 48,
     VDEC_PLAY_PREBUFFER_MAX_MS = 4000,
     VDEC_PLAY_PREBUFFER_MAX_BYTES = 16 * 1024 * 1024,
@@ -215,6 +219,10 @@ typedef struct {
     int current_slot, ready_queue[VDEC_PLAY_SLOTS], ready_count, present_pending;
     int reconfigure_requested, reconfigure_width, reconfigure_height;
     double seek_seconds;
+    /* Container duration of the open media in microseconds (0 = unknown). Owned
+     * by the decode worker and published atomically for the seek API, which runs
+     * on the UI thread and cannot see the worker's VdecPlayMedia. */
+    int64_t media_duration_us;
     int sequential_seek;
     int64_t sequential_seek_pts90k;
     uint64_t seek_generation;
@@ -1783,6 +1791,29 @@ static int play_load_bili_cookie(char *cookie, size_t capacity) {
     return fields;
 }
 
+/* Container duration of the media currently open on the decode worker, in
+ * seconds; 0 when the container does not advertise one. */
+static double play_media_duration_seconds(const VdecPlayMedia *media) {
+    if (media == NULL || media->format == NULL) return 0.0;
+    if (media->format->duration != AV_NOPTS_VALUE && media->format->duration > 0)
+        return (double)media->format->duration / (double)AV_TIME_BASE;
+    if (media->stream != NULL && media->stream->duration != AV_NOPTS_VALUE && media->stream->duration > 0)
+        return (double)media->stream->duration * av_q2d(media->stream->time_base);
+    return 0.0;
+}
+
+/* Clamp a seek target to just before the end of a known-duration media. The
+ * B站 history resume point addresses the whole video, so on a short clip (or a
+ * different rendition than the one playing) it can land past EOF, where the
+ * first read returns AVERROR_EOF and the session fails over to A. An unknown
+ * duration keeps the target untouched. */
+static double play_clamp_seek_seconds(double seconds, double duration) {
+    if (!isfinite(duration) || duration <= 0.0) return seconds;
+    const double tail  = (double)VDEC_PLAY_SEEK_TAIL_MS / 1000.0;
+    const double limit = duration > tail ? duration - tail : 0.0;
+    return seconds > limit ? limit : seconds;
+}
+
 static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     AVFormatContext *format = avformat_alloc_context();
     if (!format) {
@@ -1896,6 +1927,10 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     media->stream = stream;
     media->time_base = stream->time_base;
     media->codec = play_codec_type(stream->codecpar->codec_id);
+    /* Publish the duration before the first seek can arrive: it is the only bound
+     * the UI-thread seek API has on a stream only this worker opens. */
+    __atomic_store_n(&s->media_duration_us, (int64_t)llround(play_media_duration_seconds(media) * 1000000.0),
+                     __ATOMIC_RELEASE);
     media->nal_length_size = 4;
     if (stream->codecpar->extradata && stream->codecpar->extradata_size >= 5) {
         const int length_offset = stream->codecpar->codec_id == AV_CODEC_ID_HEVC ? 21 : 4;
@@ -1905,13 +1940,13 @@ static int play_media_open(VdecPlaySession *s, VdecPlayMedia *media) {
     }
     play_logf(
         "vdec-play: demux ready stream=%d codec=%s size=%dx%d fps=%d/%d profile=%d level=%d format=%d bits=%d "
-        "depth=%d trc=%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d",
+        "depth=%d trc=%d timebase=%d/%d tag=0x%x extradata=%d nal_len=%d bsf=%s reorder=%d duration=%.3f",
         stream_index, play_codec_name(media->codec), stream->codecpar->width, stream->codecpar->height,
         stream->avg_frame_rate.num, stream->avg_frame_rate.den, stream->codecpar->profile, stream->codecpar->level,
         stream->codecpar->format, stream->codecpar->bits_per_raw_sample, play_param_depth(stream->codecpar),
         media->color_trc, media->time_base.num, media->time_base.den, stream->codecpar->codec_tag,
         stream->codecpar->extradata_size, media->nal_length_size, filter_name ? filter_name : "none",
-        media->has_reorder);
+        media->has_reorder, play_media_duration_seconds(media));
     return 0;
 }
 static int play_prebuffer_network(VdecPlaySession *s, VdecPlayMedia *media, AVPacket *input) {
@@ -2270,7 +2305,7 @@ static int play_media_loop(VdecPlaySession *s, VdecPlayMedia *media) {
         if (read_rc == AVERROR_EOF) {
             pthread_mutex_lock(&s->mutex);
             s->source_eof = 1;
-            const uint64_t inputs = s->input_count;
+            const uint64_t inputs  = s->input_count;
             const uint64_t outputs = s->output_count;
             pthread_mutex_unlock(&s->mutex);
             play_logf("vdec-play: demux EOF inputs=%llu outputs=%llu", (unsigned long long)inputs,
@@ -2451,6 +2486,13 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     const uint64_t request_generation = s->seek_request_generation;
     s->seek_in_progress               = 1;
     seconds                           = s->seek_seconds;
+    /* The worker owns the media handle, so re-clamp here as well: start_seconds,
+     * the recreate resume and the clock-jump writer never pass through the seek
+     * API, and a media reopen can change the duration it reports. */
+    const double duration  = play_media_duration_seconds(media);
+    const double requested = seconds;
+    seconds                = play_clamp_seek_seconds(seconds, duration);
+    if (seconds != requested) s->seek_seconds = seconds;
     reopen_media                      = s->source_eof || s->reopen_media;
     eof_replay                        = s->source_eof && seconds == 0.0;
     if (s->output_count > 0 || s->input_count > 0) current_pts90k = s->last_pts - s->timeline_origin_pts;
@@ -2461,6 +2503,9 @@ static int play_restart_after_seek(VdecPlaySession *s, VdecPlayMedia *media) {
     const int eof_present_pending = eof_replay && s->present_pending;
     const int cancelled           = play_stop_requested(s) || s->fallback;
     pthread_mutex_unlock(&s->mutex);
+    if (seconds != requested)
+        play_logf("vdec-play: seek clamped (worker) requested=%.3f target=%.3f duration=%.3f", requested, seconds,
+                  duration);
     if (cancelled) return -1;
     if (eof_present_pending) {
         /* An explicit seek from the parked EOF frame still needs the borrowed AGC frame
@@ -2835,6 +2880,9 @@ static void play_reset_state_locked(VdecPlaySession *s) {
     s->trace_au = 0;
     s->trace_latency            = 0;
     s->seek_seconds = 0.0;
+    /* The next video's media is not open yet; a stale duration would clamp its
+     * first seek against the previous clip. */
+    __atomic_store_n(&s->media_duration_us, 0, __ATOMIC_RELEASE);
     s->seek_generation = 0;
     s->seek_request_generation = 0;
     s->seek_in_progress = 0;
@@ -3052,6 +3100,12 @@ int wiliwili_vdec_play_seek(double seconds) {
         pthread_mutex_unlock(&s->mutex);
         return 0;
     }
+    /* Clamp here, not only in the worker: the caller (mpv/UI) has no duration
+     * bound either, and a past-EOF target is what turned a resume point into
+     * "demux EOF -> FALLBACK_A" on short clips. */
+    const double requested = seconds;
+    const double duration  = (double)__atomic_load_n(&s->media_duration_us, __ATOMIC_ACQUIRE) / 1000000.0;
+    seconds                = play_clamp_seek_seconds(seconds, duration);
     s->seek_seconds = seconds;
     s->last_clock_pts = INT64_MIN;
     s->last_clock_input_pts = INT64_MIN;
@@ -3061,7 +3115,10 @@ int wiliwili_vdec_play_seek(double seconds) {
     ++s->seek_request_generation;
     pthread_cond_broadcast(&s->condition);
     pthread_mutex_unlock(&s->mutex);
-    play_logf("vdec-play: seek requested target=%.3f", seconds);
+    if (seconds != requested)
+        play_logf("vdec-play: seek clamped requested=%.3f target=%.3f duration=%.3f", requested, seconds, duration);
+    else
+        play_logf("vdec-play: seek requested target=%.3f", seconds);
     return 1;
 }
 

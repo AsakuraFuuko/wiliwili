@@ -70,6 +70,9 @@ extern int32_t sceAudioOutClose(int32_t handle);
  * sound after the last frame when the file ends. */
 #define AUDIO_DECODE_AHEAD 4
 #define AUDIO_CHANNELS 2
+/* A seek target is clamped this far before the stream end: an at/past-EOF
+ * target decodes into EOF, which parks the port and silences the video. */
+#define AUDIO_SEEK_TAIL_SECONDS 0.5
 
 enum {
     AUDIO_BACKEND_NONE = 0,
@@ -779,6 +782,15 @@ static int audio_open_input(AudioSession *s, double start_seconds, int seek_only
                   s->sample_rate, s->channels, s->time_base, s->duration, s->stream_count);
     }
 
+    /* The video resume point can sit past this stream's end (short clip, or a
+     * rendition shorter than the hint): an at/past-EOF start decodes into EOF,
+     * which parks the port and silences the video it belongs to. */
+    if (s->duration > 0.0 && start_seconds > s->duration - AUDIO_SEEK_TAIL_SECONDS) {
+        const double clamped = s->duration > AUDIO_SEEK_TAIL_SECONDS ? s->duration - AUDIO_SEEK_TAIL_SECONDS : 0.0;
+        audio_log("audio: start clamped requested=%.3f target=%.3f duration=%.3f", start_seconds, clamped, s->duration);
+        start_seconds = clamped;
+    }
+
     if (start_seconds > 0.0 && s->fmt != NULL && s->stream_index >= 0) {
         const int64_t ts = (int64_t)llround(start_seconds / s->time_base);
         const int rc     = avformat_seek_file(s->fmt, s->stream_index, INT64_MIN, ts, INT64_MAX, 0);
@@ -1247,6 +1259,12 @@ int wiliwili_audio_seek(double seconds) {
     if (!s->active || !isfinite(seconds)) return 0;
     if (seconds < 0.0) seconds = 0.0;
     pthread_mutex_lock(&s->mutex);
+    /* Same bound as the video path: a resume/scrub target past the end decodes
+     * straight into EOF, which parks the port and leaves the video silent. */
+    const double requested = seconds;
+    const double duration  = s->duration;
+    if (duration > 0.0 && seconds > duration - AUDIO_SEEK_TAIL_SECONDS)
+        seconds = duration > AUDIO_SEEK_TAIL_SECONDS ? duration - AUDIO_SEEK_TAIL_SECONDS : 0.0;
     s->seek_target           = seconds;
     s->seek_pending          = 1;
     s->drift_ignore_until_us = audio_now_us() + 4000000ull;
@@ -1257,6 +1275,8 @@ int wiliwili_audio_seek(double seconds) {
     s->clock_valid = 0;
     pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->mutex);
+    if (seconds != requested)
+        audio_log("audio: seek clamped requested=%.3f target=%.3f duration=%.3f", requested, seconds, duration);
     return 1;
 }
 
