@@ -962,7 +962,25 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par, int wi
     const int max_height = play_align16(visible_height);
     const int depth      = play_param_depth(par);
     int profile          = par->profile;
-    if (profile < 0) profile = codec == VDEC_PLAY_CODEC_HEVC ? 1 : codec == VDEC_PLAY_CODEC_AVC ? 100 : 0;
+    /* The demuxer can hand back a garbage profile before the first SPS is
+     * parsed (e.g. 578 from a freshly probed MP4). The decoder rejects the
+     * whole config on an unknown profile, so clamp to the verified ABI set. */
+    if (codec == VDEC_PLAY_CODEC_AVC) {
+        switch (profile) {
+            case 66:
+            case 77:
+            case 88:
+            case 100:
+            case 110:
+            case 122:
+            case 244: break;
+            default: profile = 100; break;
+        }
+    } else if (codec == VDEC_PLAY_CODEC_HEVC) {
+        if (profile != 1 && profile != 2) profile = 1;
+    } else if (profile < 0) {
+        profile = 0;
+    }
     /* A recreated instance can differ from what codecpar still describes, so
      * only trust the demuxer's level when the dimensions agree. */
     const int par_level = visible_width == par->width && visible_height == par->height ? par->level : 0;
@@ -1005,7 +1023,7 @@ static int play_setup_decoder(VdecPlaySession *s, AVCodecParameters *par, int wi
     config.max_level = (uint32_t)level;
     config.max_width = max_width;
     config.max_height = max_height;
-    config.max_dpb_frames = -1;
+    config.max_dpb_frames = 4;
     config.pipeline_depth = 1;
     config.compute_queue = (uint64_t)s->decoder.compute_queue;
     config.cpu_affinity = 0x3f;
@@ -2889,6 +2907,11 @@ int wiliwili_vdec_play_start(const char *requested_url, int start_seconds) {
 
 void wiliwili_vdec_play_add_backup_url(const char *url) {
     if (!wiliwili_vdec_play_enabled() || url == NULL || url[0] == '\0') return;
+    /* A test override replaces the media with a synthetic clip; the B站 backup
+     * URLs describe a different rendition (codec/size), so registering them turns
+     * every reopen/seek into a codec-mismatch failover to the A route. */
+    const char *override_url = getenv("WILIWILI_VDEC_URL");
+    if (override_url != NULL && override_url[0] != '\0') return;
     VdecPlaySession *s = &g_vdec_play;
     pthread_mutex_lock(&s->mutex);
     if (s->active && play_add_backup_url_locked(s, url))
